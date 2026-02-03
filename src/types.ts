@@ -25,7 +25,8 @@ export const RoomPrefixes = {
   TOKEN: 't:',           // Token data
   FEED: 'f:',            // Token feed/trades
   TOKEN_DETAILS: 'td:',  // Token details
-  SUBSCRIBERS: 's:',     // Viewer count
+  SUBSCRIBERS: 's:',     // Subscribers (not viewer count)
+  EYES: 'e-',            // Viewer count (eyes watching)
   EVENTS: 'e:',          // Token events
   KOL_TX: 'kol_tx:',     // KOL transactions
   PUMP_CTO: 'pump-cto:', // Pump.fun CTO
@@ -60,5 +61,13 @@ export interface AxiomConfig {
   reconnectDelay?: number;
   maxReconnectAttempts?: number;
 }
+
+// WebSocket endpoints
+export const WS_ENDPOINTS = {
+  // Main trading data clusters
+  CLUSTER: 'wss://cluster9.axiom.trade/',
+  // Viewer count (eyes) server
+  EUCALYPTUS: 'wss://eucalyptus.axiom.trade/ws',
+} as const;
 
 export type MessageHandler = (data: unknown, room?: string) => void;

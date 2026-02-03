@@ -223,6 +223,18 @@ export class AxiomClient extends EventEmitter {
     this.joinRoom(GlobalRooms.ANNOUNCEMENT);
   }
 
+  // Subscribe to viewer count (eyes) for a token
+  // NOTE: This requires connecting to wss://eucalyptus.axiom.trade/ws
+  subscribeToViewerCount(tokenAddress: string): void {
+    const room = `${RoomPrefixes.EYES}${tokenAddress}`;
+    this.joinRoom(room);
+  }
+
+  unsubscribeFromViewerCount(tokenAddress: string): void {
+    const room = `${RoomPrefixes.EYES}${tokenAddress}`;
+    this.leaveRoom(room);
+  }
+
   disconnect(): void {
     this.stopPing();
     this.reconnectAttempts = this.config.maxReconnectAttempts; // Prevent reconnect
