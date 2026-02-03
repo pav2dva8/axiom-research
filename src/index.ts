@@ -1,14 +1,41 @@
 import { AxiomClient } from './client';
 import { RoomPrefixes } from './types';
+import * as fs from 'fs';
+import * as path from 'path';
 
 // Example token address from the URL you shared
 const EXAMPLE_TOKEN = '6csTBsNJD6q1Y8NnW5GgAXEs64vs37mvtargSmHcxySG';
 
+// Load cookies from .env file or environment variable
+function loadCookies(): string {
+  // Try environment variable first
+  if (process.env.AXIOM_COOKIES) {
+    return process.env.AXIOM_COOKIES;
+  }
+
+  // Try .env file
+  const envPath = path.join(process.cwd(), '.env');
+  if (fs.existsSync(envPath)) {
+    const envContent = fs.readFileSync(envPath, 'utf-8');
+    const match = envContent.match(/AXIOM_COOKIES=(.+)/);
+    if (match) {
+      return match[1].trim();
+    }
+  }
+
+  console.warn('[Warning] No cookies found. Set AXIOM_COOKIES in .env file or environment.');
+  console.warn('[Warning] Get cookies from browser: F12 -> Application -> Cookies -> axiom.trade');
+  console.warn('[Warning] Copy all cookies as: name1=value1; name2=value2; ...\n');
+  return '';
+}
+
 async function main() {
+  const cookies = loadCookies();
+
   const client = new AxiomClient({
     // You can try different clusters: cluster1, cluster2, ..., cluster9
     wsUrl: 'wss://cluster9.axiom.trade/',
-  });
+  }, cookies);
 
   // Event handlers
   client.on('connected', () => {

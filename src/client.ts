@@ -23,10 +23,12 @@ export class AxiomClient extends EventEmitter {
   private reconnectAttempts = 0;
   private subscribedRooms: Set<string> = new Set();
   private isConnecting = false;
+  private cookies: string;
 
-  constructor(config: AxiomConfig = {}) {
+  constructor(config: AxiomConfig = {}, cookies: string = '') {
     super();
     this.config = { ...DEFAULT_CONFIG, ...config };
+    this.cookies = cookies;
   }
 
   async connect(): Promise<void> {
@@ -39,12 +41,16 @@ export class AxiomClient extends EventEmitter {
     return new Promise((resolve, reject) => {
       console.log(`[AxiomClient] Connecting to ${this.config.wsUrl}...`);
 
-      this.ws = new WebSocket(this.config.wsUrl, {
-        headers: {
-          'Origin': 'https://axiom.trade',
-          'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36',
-        },
-      });
+      const headers: Record<string, string> = {
+        'Origin': 'https://axiom.trade',
+        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36',
+      };
+
+      if (this.cookies) {
+        headers['Cookie'] = this.cookies;
+      }
+
+      this.ws = new WebSocket(this.config.wsUrl, { headers });
 
       this.ws.on('open', () => {
         console.log('[AxiomClient] Connected!');
