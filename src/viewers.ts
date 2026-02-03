@@ -22,16 +22,16 @@ function loadCookies(): string {
 async function main() {
   console.log('=== Axiom Viewer Count Monitor ===\n');
   console.log(`Token: ${TOKEN}`);
-  console.log(`WebSocket: ${WS_ENDPOINTS.EUCALYPTUS}\n`);
+  console.log(`WebSocket: ${WS_ENDPOINTS.CLUSTER}\n`);
 
   const cookies = loadCookies();
   if (!cookies) {
     console.warn('[Warning] No cookies found. Run "npm run login" first.\n');
   }
 
-  // Connect to eucalyptus server for viewer count
+  // Connect to cluster server (viewer count works on clusters too)
   const client = new AxiomClient({
-    wsUrl: WS_ENDPOINTS.EUCALYPTUS,
+    wsUrl: WS_ENDPOINTS.CLUSTER,
   }, cookies);
 
   client.on('connected', () => {
