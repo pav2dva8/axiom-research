@@ -96,9 +96,10 @@ export async function getNonce(walletAddress: string): Promise<string> {
     throw new Error(`Failed to get nonce: ${response.status} ${response.statusText}`);
   }
 
-  const data = await response.json();
-  console.log('[Auth] Received nonce:', data.nonce);
-  return data.nonce;
+  // API returns nonce as plain text, not JSON
+  const nonce = await response.text();
+  console.log('[Auth] Received nonce:', nonce);
+  return nonce;
 }
 
 /**
