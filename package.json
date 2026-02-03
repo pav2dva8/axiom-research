@@ -6,9 +6,15 @@
   "scripts": {
     "build": "tsc",
     "start": "node dist/index.js",
-    "dev": "tsx src/index.ts"
+    "dev": "tsx src/index.ts",
+    "login": "tsx src/login.ts"
   },
-  "keywords": ["axiom", "websocket", "solana", "trading"],
+  "keywords": [
+    "axiom",
+    "websocket",
+    "solana",
+    "trading"
+  ],
   "license": "MIT",
   "devDependencies": {
     "@types/node": "^20.11.0",
@@ -17,6 +23,9 @@
     "typescript": "^5.3.3"
   },
   "dependencies": {
+    "@solana/web3.js": "^1.98.4",
+    "bs58": "^6.0.0",
+    "tweetnacl": "^1.0.3",
     "ws": "^8.16.0"
   }
 }
