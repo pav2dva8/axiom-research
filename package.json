@@ -8,6 +8,7 @@
     "start": "node dist/index.js",
     "dev": "tsx src/index.ts",
     "login": "tsx src/login.ts",
+    "signup": "tsx src/login.ts --signup",
     "viewers": "tsx src/viewers.ts"
   },
   "keywords": [

@@ -124,13 +124,15 @@ export function buildSignMessage(nonce: string): string {
 
 /**
  * Step 3: Verify wallet with signature
+ * @param allowRegistration - true for signup (new account), false for login (existing account)
  */
 export async function verifyWallet(
   walletAddress: string,
   nonce: string,
-  signature: string
+  signature: string,
+  allowRegistration: boolean = false
 ): Promise<AuthTokens> {
-  console.log('[Auth] Verifying wallet...');
+  console.log(`[Auth] Verifying wallet (${allowRegistration ? 'signup' : 'login'})...`);
 
   const response = await fetch(`${API_BASE}/verify-wallet-v2`, {
     method: 'POST',
@@ -142,7 +144,7 @@ export async function verifyWallet(
     body: JSON.stringify({
       walletAddress,
       allowLinking: false,
-      allowRegistration: true, // Allow new account creation
+      allowRegistration, // false = login only, true = allow signup
       forAddCredential: false,
       isVerify: false,
       nonce,
@@ -192,8 +194,10 @@ export async function verifyWallet(
 
 /**
  * Full authentication flow
+ * @param wallet - Wallet info
+ * @param allowRegistration - true for signup, false for login
  */
-export async function authenticate(wallet: WalletInfo): Promise<AuthTokens> {
+export async function authenticate(wallet: WalletInfo, allowRegistration: boolean = false): Promise<AuthTokens> {
   // Step 1: Get nonce
   const nonce = await getNonce(wallet.publicKey);
 
@@ -202,9 +206,25 @@ export async function authenticate(wallet: WalletInfo): Promise<AuthTokens> {
   const signature = signMessage(message, wallet.secretKey);
 
   // Step 3: Verify wallet
-  const tokens = await verifyWallet(wallet.publicKey, nonce, signature);
+  const tokens = await verifyWallet(wallet.publicKey, nonce, signature, allowRegistration);
 
   return tokens;
+}
+
+/**
+ * Login with existing Axiom account
+ */
+export async function login(wallet: WalletInfo): Promise<AuthTokens> {
+  console.log('[Auth] Logging in with existing account...');
+  return authenticate(wallet, false);
+}
+
+/**
+ * Signup for new Axiom account
+ */
+export async function signup(wallet: WalletInfo): Promise<AuthTokens> {
+  console.log('[Auth] Signing up for new account...');
+  return authenticate(wallet, true);
 }
 
 /**
