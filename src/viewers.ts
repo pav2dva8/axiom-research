@@ -37,7 +37,11 @@ async function main() {
   client.on('connected', () => {
     console.log('Connected to Axiom!\n');
 
-    // Subscribe to viewer count
+    // Subscribe to ALL token rooms (like browser does)
+    // This might be required to count as a "viewer"
+    client.subscribeToToken(TOKEN);
+
+    // Also subscribe to viewer count room
     client.subscribeToViewerCount(TOKEN);
   });
 
