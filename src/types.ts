@@ -64,10 +64,15 @@ export interface AxiomConfig {
 
 // WebSocket endpoints
 export const WS_ENDPOINTS = {
-  // Main trading data clusters
-  CLUSTER: 'wss://cluster9.axiom.trade/',
-  // Viewer count (eyes) server
+  // Main trading data clusters (cluster8 observed in browser)
+  CLUSTER: 'wss://cluster8.axiom.trade/',
+  CLUSTER9: 'wss://cluster9.axiom.trade/',
+  // Viewer count (eyes) server for SOL
   EUCALYPTUS: 'wss://eucalyptus.axiom.trade/ws',
+  // Viewer count (eyes) server for BNB
+  EUCALYPTUS_BNB: 'wss://eucalyptus-bnb.axiom.trade/ws',
+  // Friends/social server (pings with ".")
+  FRIENDS: 'wss://friends.axiom.trade/ws',
 } as const;
 
 export type MessageHandler = (data: unknown, room?: string) => void;
