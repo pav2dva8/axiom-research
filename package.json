@@ -10,7 +10,8 @@
     "login": "tsx src/login.ts",
     "signup": "tsx src/login.ts --signup",
     "viewers": "tsx src/viewers.ts",
-    "viewer-bot": "tsx src/ui/cli.ts"
+    "viewer-bot": "tsx src/ui/cli.ts",
+    "viewer-ui": "tsx src/ui/server.ts"
   },
   "keywords": [
     "axiom",

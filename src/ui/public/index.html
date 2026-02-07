@@ -1,0 +1,654 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Axiom Viewer Bot</title>
+  <style>
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+    }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      background: #0a0a0f;
+      color: #e0e0e0;
+      min-height: 100vh;
+      padding: 20px;
+    }
+
+    .container {
+      max-width: 900px;
+      margin: 0 auto;
+    }
+
+    header {
+      text-align: center;
+      margin-bottom: 30px;
+      padding: 20px;
+      background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+      border-radius: 12px;
+      border: 1px solid #2a2a4a;
+    }
+
+    header h1 {
+      font-size: 28px;
+      color: #00d4ff;
+      margin-bottom: 8px;
+    }
+
+    header p {
+      color: #888;
+      font-size: 14px;
+    }
+
+    .status-bar {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 15px;
+      margin-bottom: 25px;
+    }
+
+    .status-card {
+      background: #1a1a2e;
+      padding: 20px;
+      border-radius: 10px;
+      text-align: center;
+      border: 1px solid #2a2a4a;
+    }
+
+    .status-card .value {
+      font-size: 36px;
+      font-weight: bold;
+      color: #00d4ff;
+    }
+
+    .status-card .label {
+      font-size: 12px;
+      color: #888;
+      text-transform: uppercase;
+      margin-top: 5px;
+    }
+
+    .status-card.active .value {
+      color: #00ff88;
+    }
+
+    .status-card.pending .value {
+      color: #ffaa00;
+    }
+
+    .panel {
+      background: #1a1a2e;
+      border-radius: 12px;
+      padding: 25px;
+      margin-bottom: 20px;
+      border: 1px solid #2a2a4a;
+    }
+
+    .panel h2 {
+      font-size: 18px;
+      margin-bottom: 20px;
+      color: #fff;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+
+    .panel h2 .icon {
+      font-size: 20px;
+    }
+
+    .form-row {
+      display: flex;
+      gap: 15px;
+      margin-bottom: 15px;
+      align-items: flex-end;
+    }
+
+    .form-group {
+      flex: 1;
+    }
+
+    .form-group label {
+      display: block;
+      font-size: 12px;
+      color: #888;
+      margin-bottom: 6px;
+      text-transform: uppercase;
+    }
+
+    input, select {
+      width: 100%;
+      padding: 12px 15px;
+      border: 1px solid #3a3a5a;
+      border-radius: 8px;
+      background: #0a0a1a;
+      color: #fff;
+      font-size: 14px;
+    }
+
+    input:focus, select:focus {
+      outline: none;
+      border-color: #00d4ff;
+    }
+
+    button {
+      padding: 12px 25px;
+      border: none;
+      border-radius: 8px;
+      font-size: 14px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: all 0.2s;
+    }
+
+    button:disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
+    }
+
+    .btn-primary {
+      background: linear-gradient(135deg, #00d4ff 0%, #0099cc 100%);
+      color: #000;
+    }
+
+    .btn-primary:hover:not(:disabled) {
+      transform: translateY(-2px);
+      box-shadow: 0 4px 15px rgba(0, 212, 255, 0.3);
+    }
+
+    .btn-success {
+      background: linear-gradient(135deg, #00ff88 0%, #00cc6a 100%);
+      color: #000;
+    }
+
+    .btn-success:hover:not(:disabled) {
+      transform: translateY(-2px);
+      box-shadow: 0 4px 15px rgba(0, 255, 136, 0.3);
+    }
+
+    .btn-danger {
+      background: linear-gradient(135deg, #ff4466 0%, #cc3355 100%);
+      color: #fff;
+    }
+
+    .btn-danger:hover:not(:disabled) {
+      transform: translateY(-2px);
+      box-shadow: 0 4px 15px rgba(255, 68, 102, 0.3);
+    }
+
+    .btn-secondary {
+      background: #3a3a5a;
+      color: #fff;
+    }
+
+    .token-info {
+      background: #0a0a1a;
+      padding: 15px;
+      border-radius: 8px;
+      margin-top: 15px;
+      display: none;
+    }
+
+    .token-info.visible {
+      display: block;
+    }
+
+    .token-info .ticker {
+      font-size: 20px;
+      font-weight: bold;
+      color: #00d4ff;
+    }
+
+    .token-info .name {
+      color: #888;
+      font-size: 14px;
+    }
+
+    .strategy-tabs {
+      display: flex;
+      gap: 10px;
+      margin-bottom: 20px;
+    }
+
+    .strategy-tab {
+      flex: 1;
+      padding: 15px;
+      background: #0a0a1a;
+      border: 2px solid #3a3a5a;
+      border-radius: 8px;
+      cursor: pointer;
+      text-align: center;
+      transition: all 0.2s;
+    }
+
+    .strategy-tab:hover {
+      border-color: #5a5a7a;
+    }
+
+    .strategy-tab.active {
+      border-color: #00d4ff;
+      background: rgba(0, 212, 255, 0.1);
+    }
+
+    .strategy-tab .title {
+      font-weight: 600;
+      margin-bottom: 5px;
+    }
+
+    .strategy-tab .desc {
+      font-size: 12px;
+      color: #888;
+    }
+
+    .strategy-options {
+      display: none;
+    }
+
+    .strategy-options.visible {
+      display: block;
+    }
+
+    .log {
+      background: #0a0a1a;
+      border-radius: 8px;
+      padding: 15px;
+      max-height: 200px;
+      overflow-y: auto;
+      font-family: 'Monaco', 'Menlo', monospace;
+      font-size: 12px;
+    }
+
+    .log-entry {
+      padding: 4px 0;
+      border-bottom: 1px solid #1a1a2e;
+    }
+
+    .log-entry .time {
+      color: #666;
+      margin-right: 10px;
+    }
+
+    .log-entry.success {
+      color: #00ff88;
+    }
+
+    .log-entry.error {
+      color: #ff4466;
+    }
+
+    .log-entry.info {
+      color: #00d4ff;
+    }
+
+    .progress-bar {
+      height: 4px;
+      background: #3a3a5a;
+      border-radius: 2px;
+      margin-top: 10px;
+      overflow: hidden;
+      display: none;
+    }
+
+    .progress-bar.visible {
+      display: block;
+    }
+
+    .progress-bar .fill {
+      height: 100%;
+      background: linear-gradient(90deg, #00d4ff, #00ff88);
+      width: 0%;
+      transition: width 0.3s;
+    }
+
+    .connection-status {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 12px;
+    }
+
+    .connection-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: #ff4466;
+    }
+
+    .connection-dot.connected {
+      background: #00ff88;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <header>
+      <h1>🤖 Axiom Viewer Bot</h1>
+      <p>Increase viewer count on any token</p>
+      <div class="connection-status" style="justify-content: center; margin-top: 10px;">
+        <div class="connection-dot" id="connectionDot"></div>
+        <span id="connectionText">Connecting...</span>
+      </div>
+    </header>
+
+    <div class="status-bar">
+      <div class="status-card">
+        <div class="value" id="accountCount">0</div>
+        <div class="label">Accounts</div>
+      </div>
+      <div class="status-card active">
+        <div class="value" id="activeViewers">0</div>
+        <div class="label">Active Viewers</div>
+      </div>
+      <div class="status-card pending">
+        <div class="value" id="pendingViewers">0</div>
+        <div class="label">Pending</div>
+      </div>
+    </div>
+
+    <!-- Accounts Panel -->
+    <div class="panel">
+      <h2><span class="icon">👥</span> Account Management</h2>
+      <div class="form-row">
+        <div class="form-group">
+          <label>Number of accounts to create</label>
+          <input type="number" id="createAccountCount" value="10" min="1" max="100">
+        </div>
+        <button class="btn-primary" id="createAccountsBtn">Create Accounts</button>
+        <button class="btn-danger" id="deleteAccountsBtn">Delete All</button>
+      </div>
+      <div class="progress-bar" id="accountProgress">
+        <div class="fill" id="accountProgressFill"></div>
+      </div>
+    </div>
+
+    <!-- Viewers Panel -->
+    <div class="panel">
+      <h2><span class="icon">👁️</span> Start Viewers</h2>
+
+      <div class="form-group" style="margin-bottom: 20px;">
+        <label>Pair Address (from Axiom URL)</label>
+        <input type="text" id="pairAddress" placeholder="e.g. 6csTBsNJD6q1Y8NnW5GgAXEs64vs37mvtargSmHcxySG">
+      </div>
+
+      <div class="token-info" id="tokenInfo">
+        <span class="ticker" id="tokenTicker">-</span>
+        <span class="name" id="tokenName">-</span>
+      </div>
+
+      <div class="strategy-tabs">
+        <div class="strategy-tab active" data-strategy="immediate">
+          <div class="title">⚡ Immediate</div>
+          <div class="desc">Add viewers instantly</div>
+        </div>
+        <div class="strategy-tab" data-strategy="gradual">
+          <div class="title">📈 Gradual</div>
+          <div class="desc">Add viewers over time</div>
+        </div>
+      </div>
+
+      <!-- Immediate Options -->
+      <div class="strategy-options visible" id="immediateOptions">
+        <div class="form-row">
+          <div class="form-group">
+            <label>Number of viewers</label>
+            <input type="number" id="immediateCount" value="10" min="1">
+          </div>
+          <button class="btn-success" id="startImmediateBtn">Start Viewers</button>
+        </div>
+      </div>
+
+      <!-- Gradual Options -->
+      <div class="strategy-options" id="gradualOptions">
+        <div class="form-row">
+          <div class="form-group">
+            <label>Viewers per interval</label>
+            <input type="number" id="gradualCount" value="3" min="1">
+          </div>
+          <div class="form-group">
+            <label>Interval (seconds)</label>
+            <input type="number" id="gradualInterval" value="5" min="1">
+          </div>
+          <button class="btn-success" id="startGradualBtn">Start Gradual</button>
+        </div>
+      </div>
+
+      <div style="margin-top: 15px;">
+        <button class="btn-danger" id="stopViewersBtn">Stop All Viewers</button>
+      </div>
+    </div>
+
+    <!-- Log Panel -->
+    <div class="panel">
+      <h2><span class="icon">📋</span> Activity Log</h2>
+      <div class="log" id="log"></div>
+    </div>
+  </div>
+
+  <script>
+    // State
+    let ws = null;
+    let selectedStrategy = 'immediate';
+
+    // Elements
+    const connectionDot = document.getElementById('connectionDot');
+    const connectionText = document.getElementById('connectionText');
+    const accountCount = document.getElementById('accountCount');
+    const activeViewers = document.getElementById('activeViewers');
+    const pendingViewers = document.getElementById('pendingViewers');
+    const log = document.getElementById('log');
+
+    // Connect WebSocket
+    function connectWebSocket() {
+      const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+      ws = new WebSocket(`${protocol}//${window.location.host}`);
+
+      ws.onopen = () => {
+        connectionDot.classList.add('connected');
+        connectionText.textContent = 'Connected';
+        addLog('Connected to server', 'success');
+      };
+
+      ws.onclose = () => {
+        connectionDot.classList.remove('connected');
+        connectionText.textContent = 'Disconnected';
+        addLog('Disconnected from server', 'error');
+        setTimeout(connectWebSocket, 3000);
+      };
+
+      ws.onmessage = (event) => {
+        const msg = JSON.parse(event.data);
+        handleMessage(msg);
+      };
+    }
+
+    function handleMessage(msg) {
+      switch (msg.type) {
+        case 'status':
+          accountCount.textContent = msg.data.accounts;
+          activeViewers.textContent = msg.data.activeViewers;
+          pendingViewers.textContent = msg.data.pendingViewers;
+          break;
+        case 'account-created':
+          updateProgress('accountProgress', msg.data.created, msg.data.total);
+          break;
+        case 'gradual-complete':
+          addLog('Gradual mode complete - all accounts connected', 'success');
+          break;
+      }
+    }
+
+    function addLog(message, type = 'info') {
+      const time = new Date().toLocaleTimeString();
+      const entry = document.createElement('div');
+      entry.className = `log-entry ${type}`;
+      entry.innerHTML = `<span class="time">${time}</span>${message}`;
+      log.insertBefore(entry, log.firstChild);
+      if (log.children.length > 50) {
+        log.removeChild(log.lastChild);
+      }
+    }
+
+    function updateProgress(id, current, total) {
+      const bar = document.getElementById(id);
+      const fill = document.getElementById(id + 'Fill');
+      bar.classList.add('visible');
+      fill.style.width = `${(current / total) * 100}%`;
+      if (current >= total) {
+        setTimeout(() => bar.classList.remove('visible'), 1000);
+      }
+    }
+
+    // API calls
+    async function createAccounts() {
+      const count = parseInt(document.getElementById('createAccountCount').value);
+      if (count <= 0) return;
+
+      document.getElementById('createAccountsBtn').disabled = true;
+      addLog(`Creating ${count} accounts...`, 'info');
+
+      try {
+        const res = await fetch('/api/accounts/create', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ count })
+        });
+        const data = await res.json();
+        addLog(`Created ${data.created} accounts`, 'success');
+      } catch (err) {
+        addLog(`Error: ${err.message}`, 'error');
+      }
+
+      document.getElementById('createAccountsBtn').disabled = false;
+    }
+
+    async function deleteAccounts() {
+      if (!confirm('Delete all accounts?')) return;
+
+      try {
+        await fetch('/api/accounts', { method: 'DELETE' });
+        addLog('All accounts deleted', 'success');
+      } catch (err) {
+        addLog(`Error: ${err.message}`, 'error');
+      }
+    }
+
+    async function fetchTokenInfo() {
+      const pairAddress = document.getElementById('pairAddress').value.trim();
+      if (!pairAddress) return;
+
+      try {
+        const res = await fetch(`/api/token-info?pairAddress=${pairAddress}`);
+        const data = await res.json();
+        if (data.ticker) {
+          document.getElementById('tokenTicker').textContent = data.ticker;
+          document.getElementById('tokenName').textContent = data.name;
+          document.getElementById('tokenInfo').classList.add('visible');
+        }
+      } catch (err) {
+        // Ignore
+      }
+    }
+
+    async function startImmediate() {
+      const pairAddress = document.getElementById('pairAddress').value.trim();
+      const count = parseInt(document.getElementById('immediateCount').value);
+
+      if (!pairAddress) {
+        addLog('Please enter a pair address', 'error');
+        return;
+      }
+
+      document.getElementById('startImmediateBtn').disabled = true;
+      addLog(`Starting ${count} viewers...`, 'info');
+
+      try {
+        const res = await fetch('/api/viewers/start', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ pairAddress, mode: 'immediate', count })
+        });
+        const data = await res.json();
+        if (data.tokenInfo) {
+          document.getElementById('tokenTicker').textContent = data.tokenInfo.ticker;
+          document.getElementById('tokenName').textContent = data.tokenInfo.name;
+          document.getElementById('tokenInfo').classList.add('visible');
+        }
+        addLog(`${data.connected} viewers now active on ${data.tokenInfo?.ticker || 'token'}`, 'success');
+      } catch (err) {
+        addLog(`Error: ${err.message}`, 'error');
+      }
+
+      document.getElementById('startImmediateBtn').disabled = false;
+    }
+
+    async function startGradual() {
+      const pairAddress = document.getElementById('pairAddress').value.trim();
+      const viewersPerInterval = parseInt(document.getElementById('gradualCount').value);
+      const intervalSeconds = parseInt(document.getElementById('gradualInterval').value);
+
+      if (!pairAddress) {
+        addLog('Please enter a pair address', 'error');
+        return;
+      }
+
+      document.getElementById('startGradualBtn').disabled = true;
+      addLog(`Starting gradual mode: ${viewersPerInterval} viewers every ${intervalSeconds}s`, 'info');
+
+      try {
+        const res = await fetch('/api/viewers/start', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ pairAddress, mode: 'gradual', viewersPerInterval, intervalSeconds })
+        });
+        const data = await res.json();
+        if (data.tokenInfo) {
+          document.getElementById('tokenTicker').textContent = data.tokenInfo.ticker;
+          document.getElementById('tokenName').textContent = data.tokenInfo.name;
+          document.getElementById('tokenInfo').classList.add('visible');
+        }
+        addLog(`Gradual mode started on ${data.tokenInfo?.ticker || 'token'}`, 'success');
+      } catch (err) {
+        addLog(`Error: ${err.message}`, 'error');
+      }
+
+      document.getElementById('startGradualBtn').disabled = false;
+    }
+
+    async function stopViewers() {
+      try {
+        await fetch('/api/viewers/stop', { method: 'POST' });
+        addLog('All viewers stopped', 'success');
+      } catch (err) {
+        addLog(`Error: ${err.message}`, 'error');
+      }
+    }
+
+    // Event listeners
+    document.getElementById('createAccountsBtn').addEventListener('click', createAccounts);
+    document.getElementById('deleteAccountsBtn').addEventListener('click', deleteAccounts);
+    document.getElementById('startImmediateBtn').addEventListener('click', startImmediate);
+    document.getElementById('startGradualBtn').addEventListener('click', startGradual);
+    document.getElementById('stopViewersBtn').addEventListener('click', stopViewers);
+    document.getElementById('pairAddress').addEventListener('blur', fetchTokenInfo);
+
+    // Strategy tabs
+    document.querySelectorAll('.strategy-tab').forEach(tab => {
+      tab.addEventListener('click', () => {
+        document.querySelectorAll('.strategy-tab').forEach(t => t.classList.remove('active'));
+        tab.classList.add('active');
+
+        selectedStrategy = tab.dataset.strategy;
+        document.getElementById('immediateOptions').classList.toggle('visible', selectedStrategy === 'immediate');
+        document.getElementById('gradualOptions').classList.toggle('visible', selectedStrategy === 'gradual');
+      });
+    });
+
+    // Initialize
+    connectWebSocket();
+  </script>
+</body>
+</html>
