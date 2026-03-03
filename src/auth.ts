@@ -3,8 +3,22 @@ import bs58 from 'bs58';
 import nacl from 'tweetnacl';
 import * as fs from 'fs';
 import * as path from 'path';
+import nodeFetch, { RequestInit } from 'node-fetch';
+import { AbortController } from 'abort-controller';
 
 const API_BASE = 'https://api2.axiom.trade';
+const FETCH_TIMEOUT = 15000; // 15 seconds timeout
+
+// Use node-fetch for proxy support with timeout
+const fetchWithProxy = (url: string, options?: RequestInit & { agent?: any }) => {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), FETCH_TIMEOUT);
+
+  return nodeFetch(url, {
+    ...options,
+    signal: controller.signal as any,
+  } as any).finally(() => clearTimeout(timeout));
+};
 
 export interface AuthTokens {
   accessToken: string;
@@ -76,10 +90,10 @@ export function loadWalletFromPrivateKey(privateKeyBase58: string): WalletInfo {
 /**
  * Step 1: Get nonce from Axiom API
  */
-export async function getNonce(walletAddress: string): Promise<string> {
-  console.log('[Auth] Requesting nonce for wallet:', walletAddress);
+export async function getNonce(walletAddress: string, agent?: any): Promise<string> {
+  console.log('[Auth] Requesting nonce for wallet:', walletAddress, agent ? '(via proxy)' : '');
 
-  const response = await fetch(`${API_BASE}/wallet-nonce`, {
+  const response = await fetchWithProxy(`${API_BASE}/wallet-nonce`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
@@ -90,6 +104,7 @@ export async function getNonce(walletAddress: string): Promise<string> {
       walletAddress,
       v: Date.now(),
     }),
+    agent,
   });
 
   if (!response.ok) {
@@ -130,11 +145,12 @@ export async function verifyWallet(
   walletAddress: string,
   nonce: string,
   signature: string,
-  allowRegistration: boolean = false
+  allowRegistration: boolean = false,
+  agent?: any
 ): Promise<AuthTokens> {
   console.log(`[Auth] Verifying wallet (${allowRegistration ? 'signup' : 'login'})...`);
 
-  const response = await fetch(`${API_BASE}/verify-wallet-v2`, {
+  const response = await fetchWithProxy(`${API_BASE}/verify-wallet-v2`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
@@ -152,6 +168,7 @@ export async function verifyWallet(
       signature,
       v: Date.now(),
     }),
+    agent,
   });
 
   if (!response.ok) {
@@ -159,8 +176,8 @@ export async function verifyWallet(
     throw new Error(`Failed to verify wallet: ${response.status} ${response.statusText} - ${errorText}`);
   }
 
-  // Extract cookies from response
-  const setCookieHeaders = response.headers.getSetCookie?.() || [];
+  // Extract cookies from response (node-fetch uses raw() method)
+  const setCookieHeaders = (response.headers as any).raw?.()?.['set-cookie'] || response.headers.getSetCookie?.() || [];
   console.log('[Auth] Set-Cookie headers:', setCookieHeaders.length);
 
   let accessToken = '';
@@ -196,17 +213,18 @@ export async function verifyWallet(
  * Full authentication flow
  * @param wallet - Wallet info
  * @param allowRegistration - true for signup, false for login
+ * @param agent - optional proxy agent
  */
-export async function authenticate(wallet: WalletInfo, allowRegistration: boolean = false): Promise<AuthTokens> {
+export async function authenticate(wallet: WalletInfo, allowRegistration: boolean = false, agent?: any): Promise<AuthTokens> {
   // Step 1: Get nonce
-  const nonce = await getNonce(wallet.publicKey);
+  const nonce = await getNonce(wallet.publicKey, agent);
 
   // Step 2: Build and sign message
   const message = buildSignMessage(nonce);
   const signature = signMessage(message, wallet.secretKey);
 
   // Step 3: Verify wallet
-  const tokens = await verifyWallet(wallet.publicKey, nonce, signature, allowRegistration);
+  const tokens = await verifyWallet(wallet.publicKey, nonce, signature, allowRegistration, agent);
 
   return tokens;
 }
@@ -214,17 +232,17 @@ export async function authenticate(wallet: WalletInfo, allowRegistration: boolea
 /**
  * Login with existing Axiom account
  */
-export async function login(wallet: WalletInfo): Promise<AuthTokens> {
+export async function login(wallet: WalletInfo, agent?: any): Promise<AuthTokens> {
   console.log('[Auth] Logging in with existing account...');
-  return authenticate(wallet, false);
+  return authenticate(wallet, false, agent);
 }
 
 /**
  * Signup for new Axiom account
  */
-export async function signup(wallet: WalletInfo): Promise<AuthTokens> {
+export async function signup(wallet: WalletInfo, agent?: any): Promise<AuthTokens> {
   console.log('[Auth] Signing up for new account...');
-  return authenticate(wallet, true);
+  return authenticate(wallet, true, agent);
 }
 
 /**
