@@ -226,6 +226,11 @@ export class ViewerService extends EventEmitter {
   isGradualRunning(): boolean {
     return this.gradualTimer !== null;
   }
+
+  isAccountConnected(accountId: number): boolean {
+    const conn = this.connections.get(accountId);
+    return conn?.connected === true && conn.ws.readyState === WebSocket.OPEN;
+  }
 }
 
 export const viewerService = new ViewerService();

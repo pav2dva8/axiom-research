@@ -6,7 +6,9 @@
 
 import * as fs from 'fs';
 import * as path from 'path';
-import { getOrCreateWallet, signup, login, type AuthTokens } from '../auth';
+import { Keypair } from '@solana/web3.js';
+import { getOrCreateWallet, signup, login, type AuthTokens, type WalletInfo } from '../auth';
+import type { ProxyManager } from './proxy-manager';
 
 export interface StoredAccount {
   id: number;
@@ -62,17 +64,28 @@ export class AccountManager {
     return [...this.accounts];
   }
 
-  async createAccount(): Promise<StoredAccount | null> {
+  async createAccount(proxyManager?: ProxyManager): Promise<StoredAccount | null> {
     const id = this.accounts.length + 1;
     const walletPath = path.join(ACCOUNTS_DIR, `wallet_${id}.json`);
     const tokensPath = path.join(ACCOUNTS_DIR, `tokens_${id}.json`);
+
+    // Get next available proxy
+    let proxy = null;
+    let agent = undefined;
+
+    if (proxyManager) {
+      proxy = proxyManager.getNextAvailableProxy();
+      if (proxy) {
+        agent = proxyManager.getAgent(proxy);
+      }
+    }
 
     try {
       // Create wallet
       const wallet = getOrCreateWallet(walletPath);
 
-      // Signup
-      const tokens = await signup(wallet);
+      // Signup with optional proxy
+      const tokens = await signup(wallet, agent);
 
       // Save tokens
       fs.writeFileSync(tokensPath, JSON.stringify(tokens, null, 2));
@@ -86,10 +99,16 @@ export class AccountManager {
       this.accounts.push(account);
       this.saveIndex();
 
+      console.log(`[AccountManager] Account ${id} created${proxy ? ` via ${proxy.host}` : ''}`);
       return account;
     } catch (err: any) {
+      // Mark proxy as used/bad on error - move to next
+      if (proxy && proxyManager) {
+        proxyManager.markProxyUsed(proxy);
+      }
+
       console.error(`Failed to create account: ${err.message}`);
-      return null;
+      throw err; // Re-throw to let caller handle
     }
   }
 
@@ -180,6 +199,67 @@ export class AccountManager {
     }
     this.accounts = [];
     this.saveIndex();
+  }
+
+  /**
+   * Re-login an account using its wallet (when tokens expired)
+   */
+  async reloginAccount(id: number): Promise<boolean> {
+    const walletPath = path.join(ACCOUNTS_DIR, `wallet_${id}.json`);
+    const tokensPath = path.join(ACCOUNTS_DIR, `tokens_${id}.json`);
+
+    if (!fs.existsSync(walletPath)) {
+      console.error(`[AccountManager] Wallet not found for account ${id}`);
+      return false;
+    }
+
+    try {
+      // Load wallet
+      const walletData = JSON.parse(fs.readFileSync(walletPath, 'utf-8'));
+      const secretKey = Uint8Array.from(walletData.secretKey);
+      const keypair = Keypair.fromSecretKey(secretKey);
+
+      const wallet: WalletInfo = {
+        publicKey: keypair.publicKey.toBase58(),
+        secretKey,
+        keypair,
+      };
+
+      // Re-login
+      console.log(`[AccountManager] Re-logging in account ${id}...`);
+      const tokens = await login(wallet);
+
+      // Save new tokens
+      fs.writeFileSync(tokensPath, JSON.stringify(tokens, null, 2));
+      console.log(`[AccountManager] Account ${id} re-logged in successfully`);
+
+      return true;
+    } catch (err: any) {
+      console.error(`[AccountManager] Failed to re-login account ${id}: ${err.message}`);
+      return false;
+    }
+  }
+
+  /**
+   * Re-login all accounts
+   */
+  async reloginAllAccounts(onProgress?: (done: number, total: number) => void): Promise<number> {
+    let success = 0;
+    const total = this.accounts.length;
+
+    for (let i = 0; i < this.accounts.length; i++) {
+      const account = this.accounts[i];
+      const result = await this.reloginAccount(account.id);
+      if (result) success++;
+      onProgress?.(i + 1, total);
+
+      // Rate limit
+      if (i < this.accounts.length - 1) {
+        await new Promise(r => setTimeout(r, 1000));
+      }
+    }
+
+    return success;
   }
 }
 
