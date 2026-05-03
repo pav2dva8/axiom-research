@@ -6,16 +6,24 @@ import * as path from 'path';
 import nodeFetch, { RequestInit } from 'node-fetch';
 import { AbortController } from 'abort-controller';
 
+
 const API_BASE = 'https://api2.axiom.trade';
 const FETCH_TIMEOUT = 15000; // 15 seconds timeout
+const BROWSER_USER_AGENT =
+  'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36';
 
-// Use node-fetch for proxy support with timeout
-const fetchWithProxy = (url: string, options?: RequestInit & { agent?: any }) => {
+const fetchWithTimeout = (url: string, options?: RequestInit) => {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), FETCH_TIMEOUT);
 
+  const headers: Record<string, string> = {
+    'User-Agent': BROWSER_USER_AGENT,
+    ...(options?.headers as Record<string, string> || {}),
+  };
+
   return nodeFetch(url, {
     ...options,
+    headers,
     signal: controller.signal as any,
   } as any).finally(() => clearTimeout(timeout));
 };
@@ -90,21 +98,24 @@ export function loadWalletFromPrivateKey(privateKeyBase58: string): WalletInfo {
 /**
  * Step 1: Get nonce from Axiom API
  */
-export async function getNonce(walletAddress: string, agent?: any): Promise<string> {
-  console.log('[Auth] Requesting nonce for wallet:', walletAddress, agent ? '(via proxy)' : '');
+export async function getNonce(walletAddress: string, cfCookies?: string): Promise<string> {
+  console.log('[Auth] Requesting nonce for wallet:', walletAddress);
 
-  const response = await fetchWithProxy(`${API_BASE}/wallet-nonce`, {
+  const headers: Record<string, string> = {
+    'Content-Type': 'application/json',
+    'Origin': 'https://axiom.trade',
+    'Referer': 'https://axiom.trade/',
+  };
+  if (cfCookies) {
+    headers['Cookie'] = cfCookies;
+  }
+
+  const response = await fetchWithTimeout(`${API_BASE}/wallet-nonce`, {
     method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'Origin': 'https://axiom.trade',
-      'Referer': 'https://axiom.trade/',
-    },
+    headers,
     body: JSON.stringify({
       walletAddress,
-      v: Date.now(),
     }),
-    agent,
   });
 
   if (!response.ok) {
@@ -139,36 +150,40 @@ export function buildSignMessage(nonce: string): string {
 
 /**
  * Step 3: Verify wallet with signature
- * @param allowRegistration - true for signup (new account), false for login (existing account)
  */
 export async function verifyWallet(
   walletAddress: string,
   nonce: string,
   signature: string,
   allowRegistration: boolean = false,
-  agent?: any
+  turnstileToken?: string,
+  cfCookies?: string,
 ): Promise<AuthTokens> {
   console.log(`[Auth] Verifying wallet (${allowRegistration ? 'signup' : 'login'})...`);
 
-  const response = await fetchWithProxy(`${API_BASE}/verify-wallet-v2`, {
+  const headers: Record<string, string> = {
+    'Content-Type': 'application/json',
+    'Origin': 'https://axiom.trade',
+    'Referer': 'https://axiom.trade/',
+  };
+  if (cfCookies) {
+    headers['Cookie'] = cfCookies;
+  }
+
+  const response = await fetchWithTimeout(`${API_BASE}/verify-wallet-v2`, {
     method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'Origin': 'https://axiom.trade',
-      'Referer': 'https://axiom.trade/',
-    },
+    headers,
     body: JSON.stringify({
       walletAddress,
       allowLinking: false,
-      allowRegistration, // false = login only, true = allow signup
+      allowRegistration,
       forAddCredential: false,
       isVerify: false,
       nonce,
       referrer: null,
       signature,
-      v: Date.now(),
+      turnstileToken: turnstileToken || null,
     }),
-    agent,
   });
 
   if (!response.ok) {
@@ -177,7 +192,7 @@ export async function verifyWallet(
   }
 
   // Extract cookies from response (node-fetch uses raw() method)
-  const setCookieHeaders = (response.headers as any).raw?.()?.['set-cookie'] || response.headers.getSetCookie?.() || [];
+  const setCookieHeaders = (response.headers as any).raw?.()?.['set-cookie'] || (response.headers as any).getSetCookie?.() || [];
   console.log('[Auth] Set-Cookie headers:', setCookieHeaders.length);
 
   let accessToken = '';
@@ -209,40 +224,42 @@ export async function verifyWallet(
   };
 }
 
-/**
- * Full authentication flow
- * @param wallet - Wallet info
- * @param allowRegistration - true for signup, false for login
- * @param agent - optional proxy agent
- */
-export async function authenticate(wallet: WalletInfo, allowRegistration: boolean = false, agent?: any): Promise<AuthTokens> {
-  // Step 1: Get nonce
-  const nonce = await getNonce(wallet.publicKey, agent);
-
-  // Step 2: Build and sign message
+async function authenticate(
+  wallet: WalletInfo,
+  allowRegistration: boolean,
+  cfCookies?: string,
+  turnstileToken?: string,
+): Promise<AuthTokens> {
+  const nonce = await getNonce(wallet.publicKey, cfCookies);
   const message = buildSignMessage(nonce);
   const signature = signMessage(message, wallet.secretKey);
-
-  // Step 3: Verify wallet
-  const tokens = await verifyWallet(wallet.publicKey, nonce, signature, allowRegistration, agent);
-
-  return tokens;
+  return verifyWallet(
+    wallet.publicKey, nonce, signature, allowRegistration, turnstileToken, cfCookies,
+  );
 }
 
 /**
  * Login with existing Axiom account
  */
-export async function login(wallet: WalletInfo, agent?: any): Promise<AuthTokens> {
+export async function login(
+  wallet: WalletInfo,
+  cfCookies?: string,
+  turnstileToken?: string,
+): Promise<AuthTokens> {
   console.log('[Auth] Logging in with existing account...');
-  return authenticate(wallet, false, agent);
+  return authenticate(wallet, false, cfCookies, turnstileToken);
 }
 
 /**
  * Signup for new Axiom account
  */
-export async function signup(wallet: WalletInfo, agent?: any): Promise<AuthTokens> {
+export async function signup(
+  wallet: WalletInfo,
+  cfCookies?: string,
+  turnstileToken?: string,
+): Promise<AuthTokens> {
   console.log('[Auth] Signing up for new account...');
-  return authenticate(wallet, true, agent);
+  return authenticate(wallet, true, cfCookies, turnstileToken);
 }
 
 /**
