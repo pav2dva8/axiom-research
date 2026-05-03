@@ -11,7 +11,9 @@
     "signup": "tsx src/login.ts --signup",
     "viewers": "tsx src/viewers.ts",
     "viewer-bot": "tsx src/ui/cli.ts",
-    "viewer-ui": "tsx src/ui/server.ts"
+    "viewer-ui": "tsx src/ui/server.ts",
+    "build:web": "vite build --config src/ui/web/vite.config.ts",
+    "dev:web": "vite --config src/ui/web/vite.config.ts"
   },
   "keywords": [
     "axiom",
@@ -22,17 +24,36 @@
   "license": "MIT",
   "devDependencies": {
     "@types/node": "^20.11.0",
+    "@types/react": "^19.2.14",
+    "@types/react-dom": "^19.2.3",
     "@types/ws": "^8.5.10",
+    "@vitejs/plugin-react": "^6.0.1",
+    "autoprefixer": "^10.5.0",
+    "postcss": "^8.5.13",
+    "tailwindcss": "^3.4.19",
     "tsx": "^4.7.0",
-    "typescript": "^5.3.3"
+    "typescript": "^5.3.3",
+    "vite": "^8.0.10"
   },
   "dependencies": {
+    "@radix-ui/react-scroll-area": "^1.2.10",
+    "@radix-ui/react-separator": "^1.1.8",
+    "@radix-ui/react-slot": "^1.2.4",
     "@solana/web3.js": "^1.98.4",
     "@types/node-fetch": "^2.6.13",
     "abort-controller": "^3.0.0",
     "bs58": "^6.0.0",
+    "class-variance-authority": "^0.7.1",
+    "clsx": "^2.1.1",
     "https-proxy-agent": "^7.0.6",
+    "lucide-react": "^1.14.0",
     "node-fetch": "^2.7.0",
+    "playwright": "^1.58.2",
+    "playwright-extra": "^4.3.6",
+    "puppeteer-extra-plugin-stealth": "^2.11.2",
+    "react": "^19.2.5",
+    "react-dom": "^19.2.5",
+    "tailwind-merge": "^3.5.0",
     "tweetnacl": "^1.0.3",
     "ws": "^8.16.0"
   }
