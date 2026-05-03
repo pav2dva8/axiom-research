@@ -1,12 +1,14 @@
 /**
  * Viewer Service
  *
- * Manages WebSocket connections to friends server for viewer count
+ * Manages WebSocket connections to friends server for viewer count.
+ * Uses browser-based WS connections (via BrowserSession) to bypass CF TLS fingerprint checks.
+ * Each connection uses per-account auth cookies set before the WS handshake.
  */
 
-import WebSocket from 'ws';
 import { EventEmitter } from 'events';
 import type { LoadedAccount } from './account-manager';
+import type { BrowserSession } from '../browser-auth';
 
 export interface TokenInfo {
   pairAddress: string;
@@ -19,27 +21,25 @@ export interface TokenInfo {
   price: number;
 }
 
-export interface ViewerConnection {
-  accountId: number;
-  ws: WebSocket;
-  connected: boolean;
-}
-
 export interface ViewerStrategy {
   type: 'immediate' | 'gradual';
-  immediateCount?: number;      // For immediate: how many viewers to add at once
-  gradualCount?: number;        // For gradual: viewers per interval
-  gradualIntervalMs?: number;   // For gradual: interval in ms
+  immediateCount?: number;
+  gradualCount?: number;
+  gradualIntervalMs?: number;
 }
 
 export class ViewerService extends EventEmitter {
-  private connections: Map<number, ViewerConnection> = new Map();
+  private browserSession: BrowserSession | null = null;
+  private connectedViewers: Map<number, number> = new Map(); // accountId -> browserId
   private tokenInfo: TokenInfo | null = null;
-  private gradualTimer: NodeJS.Timeout | null = null;
-  private pendingAccounts: LoadedAccount[] = [];
 
   constructor() {
     super();
+  }
+
+  setBrowserSession(session: BrowserSession | null): void {
+    this.browserSession = session;
+    console.log('[Viewer] Browser session', session ? 'set' : 'cleared');
   }
 
   async fetchTokenInfo(pairAddress: string): Promise<TokenInfo | null> {
@@ -58,7 +58,7 @@ export class ViewerService extends EventEmitter {
         return null;
       }
 
-      const data = await response.json();
+      const data = await response.json() as any;
 
       return {
         pairAddress,
@@ -79,157 +79,52 @@ export class ViewerService extends EventEmitter {
     this.tokenInfo = tokenInfo;
   }
 
-  private connectAccount(account: LoadedAccount): Promise<boolean> {
-    return new Promise((resolve) => {
-      if (!this.tokenInfo) {
-        resolve(false);
-        return;
-      }
-
-      const ws = new WebSocket('wss://friends.axiom.trade/ws', {
-        headers: {
-          'Origin': 'https://axiom.trade',
-          'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36',
-          'Cookie': account.cookies,
-        }
-      });
-
-      const timeout = setTimeout(() => {
-        ws.close();
-        resolve(false);
-      }, 10000);
-
-      ws.on('open', () => {
-        clearTimeout(timeout);
-
-        // Start ping
-        const pingInterval = setInterval(() => {
-          if (ws.readyState === WebSocket.OPEN) {
-            ws.send('.');
-          } else {
-            clearInterval(pingInterval);
-          }
-        }, 1000);
-
-        // Send pageUpdate
-        const pageUpdate = {
-          type: 'pageUpdate',
-          page: 'meme',
-          subpage: this.tokenInfo,
-          chain: 'sol'
-        };
-        ws.send(JSON.stringify(pageUpdate));
-
-        this.connections.set(account.id, {
-          accountId: account.id,
-          ws,
-          connected: true
-        });
-
-        this.emit('viewer-connected', account.id);
-        resolve(true);
-      });
-
-      ws.on('close', () => {
-        clearTimeout(timeout);
-        const conn = this.connections.get(account.id);
-        if (conn) {
-          conn.connected = false;
-        }
-        this.connections.delete(account.id);
-        this.emit('viewer-disconnected', account.id);
-      });
-
-      ws.on('error', () => {
-        clearTimeout(timeout);
-        resolve(false);
-      });
-    });
-  }
-
-  async startImmediate(accounts: LoadedAccount[], count: number): Promise<number> {
-    const toConnect = accounts.slice(0, count);
-    let connected = 0;
-
-    for (const account of toConnect) {
-      const success = await this.connectAccount(account);
-      if (success) {
-        connected++;
-        this.emit('progress', connected, count);
-      }
-      await new Promise(r => setTimeout(r, 100));
+  private async connectAccount(account: LoadedAccount): Promise<boolean> {
+    if (!this.tokenInfo || !this.browserSession) {
+      console.log(`[Viewer] Cannot connect account ${account.id}: no ${!this.tokenInfo ? 'token info' : 'browser session'}`);
+      return false;
     }
 
+    try {
+      const viewerId = await this.browserSession.connectViewer(
+        account.accessToken,
+        account.refreshToken,
+        this.tokenInfo,
+      );
+      this.connectedViewers.set(account.id, viewerId);
+      console.log(`[Viewer] Account ${account.id} connected as viewer ${viewerId}`);
+      this.emit('viewer-connected', account.id);
+      return true;
+    } catch (err: any) {
+      console.log(`[Viewer] Account ${account.id} failed:`, err.message);
+      return false;
+    }
+  }
+
+  async connectAll(accounts: LoadedAccount[], delayMs: number = 100): Promise<number> {
+    let connected = 0;
+    for (const account of accounts) {
+      if (this.connectedViewers.has(account.id)) continue;
+      const success = await this.connectAccount(account);
+      if (success) connected++;
+      await new Promise(r => setTimeout(r, delayMs));
+    }
     return connected;
   }
 
-  startGradual(accounts: LoadedAccount[], countPerInterval: number, intervalMs: number): void {
-    this.pendingAccounts = [...accounts];
-
-    const addViewers = async () => {
-      const toAdd = this.pendingAccounts.splice(0, countPerInterval);
-
-      if (toAdd.length === 0) {
-        this.stopGradual();
-        this.emit('gradual-complete');
-        return;
-      }
-
-      for (const account of toAdd) {
-        await this.connectAccount(account);
-        await new Promise(r => setTimeout(r, 50));
-      }
-
-      this.emit('gradual-tick', this.getActiveCount(), this.pendingAccounts.length);
-    };
-
-    // Add first batch immediately
-    addViewers();
-
-    // Then continue at interval
-    this.gradualTimer = setInterval(addViewers, intervalMs);
-  }
-
-  stopGradual(): void {
-    if (this.gradualTimer) {
-      clearInterval(this.gradualTimer);
-      this.gradualTimer = null;
-    }
-    this.pendingAccounts = [];
-  }
-
   disconnectAll(): void {
-    this.stopGradual();
-
-    for (const [, conn] of this.connections) {
-      if (conn.ws.readyState === WebSocket.OPEN) {
-        conn.ws.close();
-      }
+    if (this.browserSession) {
+      this.browserSession.disconnectAllViewers().catch(() => {});
     }
-    this.connections.clear();
+    this.connectedViewers.clear();
   }
 
   getActiveCount(): number {
-    let count = 0;
-    for (const [, conn] of this.connections) {
-      if (conn.connected && conn.ws.readyState === WebSocket.OPEN) {
-        count++;
-      }
-    }
-    return count;
-  }
-
-  getPendingCount(): number {
-    return this.pendingAccounts.length;
-  }
-
-  isGradualRunning(): boolean {
-    return this.gradualTimer !== null;
+    return this.connectedViewers.size;
   }
 
   isAccountConnected(accountId: number): boolean {
-    const conn = this.connections.get(accountId);
-    return conn?.connected === true && conn.ws.readyState === WebSocket.OPEN;
+    return this.connectedViewers.has(accountId);
   }
 }
 

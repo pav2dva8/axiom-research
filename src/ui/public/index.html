@@ -15,7 +15,7 @@
       overflow: hidden;
     }
     .container { max-width: 900px; margin: 0 auto; height: 100%; display: flex; flex-direction: column; }
-    .status-bar { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; margin-bottom: 10px; }
+    .status-bar { display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px; margin-bottom: 10px; }
     .status-card {
       background: #1a1a2e;
       padding: 10px;
@@ -26,7 +26,6 @@
     .status-card .value { font-size: 24px; font-weight: bold; color: #00d4ff; }
     .status-card .label { font-size: 10px; color: #888; text-transform: uppercase; }
     .status-card.active .value { color: #00ff88; }
-    .status-card.pending .value { color: #ffaa00; }
     .panel {
       background: #1a1a2e;
       border-radius: 8px;
@@ -42,7 +41,6 @@
     input:focus { outline: none; border-color: #00d4ff; }
     button { padding: 8px 14px; border: none; border-radius: 6px; font-size: 12px; font-weight: 600; cursor: pointer; white-space: nowrap; }
     button:disabled { opacity: 0.5; cursor: not-allowed; }
-    .btn-primary { background: linear-gradient(135deg, #00d4ff 0%, #0099cc 100%); color: #000; }
     .btn-success { background: linear-gradient(135deg, #00ff88 0%, #00cc6a 100%); color: #000; }
     .btn-danger { background: linear-gradient(135deg, #ff4466 0%, #cc3355 100%); color: #fff; }
     .btn-secondary { background: #3a3a5a; color: #fff; }
@@ -51,13 +49,6 @@
     .token-info.visible { display: block; }
     .token-info .ticker { font-size: 14px; font-weight: bold; color: #00d4ff; }
     .token-info .name { color: #888; font-size: 12px; margin-left: 8px; }
-    .strategy-row { display: flex; gap: 12px; align-items: center; margin-bottom: 8px; padding: 8px; background: #0a0a1a; border-radius: 6px; }
-    .strategy-row.disabled { opacity: 0.4; }
-    .strategy-row label { font-size: 11px; color: #888; text-transform: uppercase; }
-    .strategy-row input[type="number"] { width: 60px; }
-    .strategy-row input[type="checkbox"] { width: 16px; height: 16px; accent-color: #00d4ff; }
-    .strategy-label { min-width: 70px; font-weight: 600; font-size: 12px; }
-    .max-hint { font-size: 10px; color: #666; margin-left: auto; }
     .log-panel { flex: 1; min-height: 0; display: flex; flex-direction: column; }
     .log-panel .panel { flex: 1; display: flex; flex-direction: column; margin-bottom: 0; }
     .log { flex: 1; background: #0a0a1a; border-radius: 6px; padding: 8px; overflow-y: auto; font-family: 'Monaco', 'Menlo', monospace; font-size: 11px; }
@@ -66,16 +57,6 @@
     .log-entry.success { color: #00ff88; }
     .log-entry.error { color: #ff4466; }
     .log-entry.info { color: #00d4ff; }
-    .progress-bar { height: 3px; background: #3a3a5a; border-radius: 2px; margin-top: 8px; overflow: hidden; display: none; }
-    .progress-bar.visible { display: block; }
-    .progress-bar .fill { height: 100%; background: linear-gradient(90deg, #00d4ff, #00ff88); width: 0%; transition: width 0.3s; }
-    .inline-row { display: flex; gap: 10px; align-items: center; }
-    textarea { width: 100%; padding: 8px 10px; border: 1px solid #3a3a5a; border-radius: 6px; background: #0a0a1a; color: #fff; font-size: 11px; font-family: 'Monaco', 'Menlo', monospace; resize: vertical; }
-    textarea:focus { outline: none; border-color: #00d4ff; }
-    .proxy-stats { font-size: 11px; color: #888; margin-top: 6px; }
-    .proxy-stats span { margin-right: 12px; }
-    .proxy-stats .good { color: #00ff88; }
-    .proxy-stats .bad { color: #ff4466; }
   </style>
 </head>
 <body>
@@ -89,87 +70,28 @@
         <div class="value" id="activeViewers">0</div>
         <div class="label">Active</div>
       </div>
-      <div class="status-card pending">
-        <div class="value" id="pendingViewers">0</div>
-        <div class="label">Pending</div>
-      </div>
-    </div>
-
-    <div class="panel">
-      <h2>🌐 Proxies</h2>
-      <textarea id="proxyList" rows="3" placeholder="One proxy per line: host:port or user:pass@host:port"></textarea>
-      <div class="form-row" style="margin-top: 8px;">
-        <button class="btn-secondary btn-sm" id="saveProxiesBtn">Save</button>
-        <button class="btn-primary btn-sm" id="checkProxiesBtn">Check All</button>
-        <div class="proxy-stats" id="proxyStats">
-          <span>Total: <b id="proxyTotal">0</b></span>
-          <span class="good">Good: <b id="proxyGood">0</b></span>
-          <span class="bad">Bad: <b id="proxyBad">0</b></span>
-        </div>
-      </div>
     </div>
 
     <div class="panel">
       <h2>👥 Accounts</h2>
       <div class="form-row">
-        <div class="form-group" style="max-width: 80px;">
-          <input type="number" id="createAccountCount" value="10" min="1" max="100">
-        </div>
-        <button class="btn-primary btn-sm" id="createAccountsBtn">Create</button>
-        <button class="btn-danger btn-sm" id="stopCreateBtn" style="display:none;">Stop</button>
         <button class="btn-secondary btn-sm" id="reloginAccountsBtn">Re-login All</button>
-      </div>
-      <div class="progress-bar" id="accountProgress">
-        <div class="fill" id="accountProgressFill"></div>
-      </div>
-    </div>
-
-    <div class="panel">
-      <h2>🎯 Monitor CA</h2>
-      <div class="form-group" style="margin-bottom: 10px;">
-        <input type="text" id="monitorCA" placeholder="Contract Address (CA) - e.g. ...pump">
-      </div>
-      <div class="monitor-info" id="monitorInfo" style="display:none; font-size: 12px; color: #888; margin-bottom: 10px;">
-        <span>Pair: <span id="derivedPair">-</span></span>
-        <span id="monitorStatusText" style="margin-left: 10px;"></span>
-      </div>
-      <div class="form-row">
-        <button class="btn-primary btn-sm" id="monitorStartBtn">Monitor</button>
-        <button class="btn-danger btn-sm" id="monitorStopBtn" style="display:none;">Stop</button>
+        <button class="btn-danger btn-sm" id="stopReloginBtn" style="display:none">Stop</button>
       </div>
     </div>
 
     <div class="panel">
       <h2>👁️ Viewers</h2>
       <div class="form-group" style="margin-bottom: 10px;">
-        <input type="text" id="pairAddress" placeholder="Pair address from Axiom URL (or use Monitor above)">
+        <input type="text" id="pairAddress" placeholder="Pair address from Axiom URL">
       </div>
       <div class="token-info" id="tokenInfo">
         <span class="ticker" id="tokenTicker">-</span>
         <span class="name" id="tokenName">-</span>
       </div>
-
-      <div class="strategy-row" id="immediateRow">
-        <input type="checkbox" id="immediateEnabled" checked>
-        <span class="strategy-label">⚡ Immediate</span>
-        <label>Viewers</label>
-        <input type="number" id="immediateCount" value="10" min="0">
-        <span class="max-hint" id="immediateMax">max: 0</span>
-      </div>
-
-      <div class="strategy-row" id="gradualRow">
-        <input type="checkbox" id="gradualEnabled" checked>
-        <span class="strategy-label">📈 Gradual</span>
-        <label>Add</label>
-        <input type="number" id="gradualCount" value="3" min="1">
-        <label>every</label>
-        <input type="number" id="gradualInterval" value="5" min="1">
-        <label>sec</label>
-      </div>
-
       <div class="form-row" style="margin-top: 10px;">
         <button class="btn-success" id="startViewersBtn">Start</button>
-        <button class="btn-danger" id="stopViewersBtn">Stop All</button>
+        <button class="btn-danger" id="stopViewersBtn">Stop</button>
       </div>
     </div>
 
@@ -182,96 +104,34 @@
   </div>
 
   <script>
-    // State
     let ws = null;
-    let totalAccounts = 0;
 
-    // Elements
     const accountCountEl = document.getElementById('accountCount');
-    const activeViewers = document.getElementById('activeViewers');
-    const pendingViewers = document.getElementById('pendingViewers');
+    const activeViewersEl = document.getElementById('activeViewers');
     const log = document.getElementById('log');
 
-    // Connect WebSocket
     function connectWebSocket() {
       const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
       ws = new WebSocket(`${protocol}//${window.location.host}`);
 
-      ws.onopen = () => {
-        addLog('Connected to server', 'success');
-      };
-
+      ws.onopen = () => addLog('Connected to server', 'success');
       ws.onclose = () => {
         addLog('Disconnected from server', 'error');
         setTimeout(connectWebSocket, 3000);
       };
-
-      ws.onmessage = (event) => {
-        const msg = JSON.parse(event.data);
-        handleMessage(msg);
-      };
+      ws.onmessage = (event) => handleMessage(JSON.parse(event.data));
     }
 
     function handleMessage(msg) {
       switch (msg.type) {
         case 'status':
-          totalAccounts = msg.data.accounts;
           accountCountEl.textContent = msg.data.accounts;
-          activeViewers.textContent = msg.data.activeViewers;
-          pendingViewers.textContent = msg.data.pendingViewers;
-          updateMaxHints();
+          activeViewersEl.textContent = msg.data.activeViewers;
           break;
-        case 'account-created':
-          updateProgress('accountProgress', msg.data.created, msg.data.total);
-          break;
-        case 'account-error':
-          addLog(`Account creation failed: ${msg.data.error}`, 'error');
-          break;
-        case 'gradual-complete':
-          addLog('Gradual mode complete - all accounts connected', 'success');
-          break;
-        case 'proxy-status':
-          document.getElementById('proxyTotal').textContent = msg.data.total;
-          document.getElementById('proxyGood').textContent = msg.data.good;
-          document.getElementById('proxyBad').textContent = msg.data.bad;
-          break;
-        case 'proxy-check-result':
-          addLog(`Proxy ${msg.data.proxy}: ${msg.data.ok ? 'OK' : 'FAILED'}`, msg.data.ok ? 'success' : 'error');
-          break;
-        case 'monitor-status':
-          if (msg.data.status === 'monitoring') {
-            document.getElementById('monitorStatusText').textContent = '⏳ Waiting for token...';
-            document.getElementById('monitorStatusText').style.color = '#f0ad4e';
-          } else if (msg.data.status === 'found') {
-            document.getElementById('monitorStatusText').textContent = '✅ Token found!';
-            document.getElementById('monitorStatusText').style.color = '#5cb85c';
-            document.getElementById('pairAddress').value = msg.data.pairAddress;
-            addLog(`Token found! CA: ${msg.data.ca.slice(0,8)}...`, 'success');
-            // Reset buttons
-            document.getElementById('monitorStartBtn').style.display = '';
-            document.getElementById('monitorStopBtn').style.display = 'none';
-          } else if (msg.data.status === 'stopped') {
-            document.getElementById('monitorStatusText').textContent = '';
-          }
-          break;
-        case 'monitor-check':
-          // Silent check, could add a pulse indicator here
-          break;
-        case 'monitor-started-viewers':
-          addLog(`Auto-started viewers on ${msg.data.tokenInfo?.ticker || 'token'}`, 'success');
-          document.getElementById('tokenTicker').textContent = msg.data.tokenInfo?.ticker || '-';
-          document.getElementById('tokenName').textContent = msg.data.tokenInfo?.name || '-';
-          document.getElementById('tokenInfo').classList.add('visible');
+        case 'relogin-progress':
+          addLog(`[${msg.data.done}/${msg.data.total}] ${msg.data.message}`, 'info');
           break;
       }
-    }
-
-    function updateMaxHints() {
-      const active = parseInt(activeViewers.textContent) || 0;
-      const pending = parseInt(pendingViewers.textContent) || 0;
-      const available = totalAccounts - active - pending;
-      document.getElementById('immediateMax').textContent = `max: ${available}`;
-      document.getElementById('immediateCount').max = available;
     }
 
     function addLog(message, type = 'info') {
@@ -285,60 +145,9 @@
       }
     }
 
-    function updateProgress(id, current, total) {
-      const bar = document.getElementById(id);
-      const fill = document.getElementById(id + 'Fill');
-      bar.classList.add('visible');
-      fill.style.width = `${(current / total) * 100}%`;
-      if (current >= total) {
-        setTimeout(() => bar.classList.remove('visible'), 1000);
-      }
-    }
-
-    // API calls
-    let createAbortController = null;
-
-    async function createAccounts() {
-      const count = parseInt(document.getElementById('createAccountCount').value);
-      if (count <= 0) return;
-
-      document.getElementById('createAccountsBtn').style.display = 'none';
-      document.getElementById('stopCreateBtn').style.display = '';
-      addLog(`Creating ${count} accounts...`, 'info');
-
-      createAbortController = new AbortController();
-
-      try {
-        const res = await fetch('/api/accounts/create', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ count }),
-          signal: createAbortController.signal
-        });
-        const data = await res.json();
-        addLog(`Created ${data.created} accounts`, 'success');
-      } catch (err) {
-        if (err.name === 'AbortError') {
-          addLog('Account creation stopped', 'info');
-          await fetch('/api/accounts/stop', { method: 'POST' });
-        } else {
-          addLog(`Error: ${err.message}`, 'error');
-        }
-      }
-
-      createAbortController = null;
-      document.getElementById('createAccountsBtn').style.display = '';
-      document.getElementById('stopCreateBtn').style.display = 'none';
-    }
-
-    function stopCreateAccounts() {
-      if (createAbortController) {
-        createAbortController.abort();
-      }
-    }
-
     async function reloginAccounts() {
       document.getElementById('reloginAccountsBtn').disabled = true;
+      document.getElementById('stopReloginBtn').style.display = 'inline-block';
       addLog('Re-logging in all accounts...', 'info');
 
       try {
@@ -350,12 +159,17 @@
       }
 
       document.getElementById('reloginAccountsBtn').disabled = false;
+      document.getElementById('stopReloginBtn').style.display = 'none';
+    }
+
+    async function stopRelogin() {
+      await fetch('/api/accounts/relogin/stop', { method: 'POST' });
+      addLog('Stopping re-login...', 'info');
     }
 
     async function fetchTokenInfo() {
       const pairAddress = document.getElementById('pairAddress').value.trim();
       if (!pairAddress) return;
-
       try {
         const res = await fetch(`/api/token-info?pairAddress=${pairAddress}`);
         const data = await res.json();
@@ -364,26 +178,13 @@
           document.getElementById('tokenName').textContent = data.name;
           document.getElementById('tokenInfo').classList.add('visible');
         }
-      } catch (err) {
-        // Ignore
-      }
+      } catch {}
     }
 
     async function startViewers() {
       const pairAddress = document.getElementById('pairAddress').value.trim();
-      const immediateEnabled = document.getElementById('immediateEnabled').checked;
-      const gradualEnabled = document.getElementById('gradualEnabled').checked;
-      const immediateCount = parseInt(document.getElementById('immediateCount').value) || 0;
-      const gradualCount = parseInt(document.getElementById('gradualCount').value) || 3;
-      const gradualInterval = parseInt(document.getElementById('gradualInterval').value) || 5;
-
       if (!pairAddress) {
         addLog('Please enter a pair address', 'error');
-        return;
-      }
-
-      if (!immediateEnabled && !gradualEnabled) {
-        addLog('Please enable at least one strategy', 'error');
         return;
       }
 
@@ -393,14 +194,7 @@
         const res = await fetch('/api/viewers/start', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            pairAddress,
-            immediateEnabled,
-            immediateCount,
-            gradualEnabled,
-            gradualCount,
-            gradualInterval
-          })
+          body: JSON.stringify({ pairAddress }),
         });
         const data = await res.json();
         if (data.tokenInfo) {
@@ -408,11 +202,7 @@
           document.getElementById('tokenName').textContent = data.tokenInfo.name;
           document.getElementById('tokenInfo').classList.add('visible');
         }
-
-        let msg = '';
-        if (data.immediateConnected > 0) msg += `${data.immediateConnected} immediate`;
-        if (data.gradualStarted) msg += (msg ? ' + ' : '') + 'gradual mode';
-        addLog(`Started: ${msg} on ${data.tokenInfo?.ticker || 'token'}`, 'success');
+        addLog(`Started ${data.connected} viewers on ${data.tokenInfo?.ticker || 'token'}`, 'success');
       } catch (err) {
         addLog(`Error: ${err.message}`, 'error');
       }
@@ -429,135 +219,13 @@
       }
     }
 
-    // Proxy functions
-    async function saveProxies() {
-      const proxies = document.getElementById('proxyList').value.trim();
-      try {
-        const res = await fetch('/api/proxies', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ proxies })
-        });
-        const data = await res.json();
-        addLog(`Saved ${data.count} proxies`, 'success');
-      } catch (err) {
-        addLog(`Error saving proxies: ${err.message}`, 'error');
-      }
-    }
-
-    async function loadProxies() {
-      try {
-        const res = await fetch('/api/proxies');
-        const data = await res.json();
-        document.getElementById('proxyList').value = data.proxies || '';
-        document.getElementById('proxyTotal').textContent = data.total || 0;
-        document.getElementById('proxyGood').textContent = data.good || 0;
-        document.getElementById('proxyBad').textContent = data.bad || 0;
-      } catch (err) {
-        // Ignore
-      }
-    }
-
-    async function checkProxies() {
-      document.getElementById('checkProxiesBtn').disabled = true;
-      addLog('Checking proxies...', 'info');
-      try {
-        const res = await fetch('/api/proxies/check', { method: 'POST' });
-        const data = await res.json();
-        addLog(`Checked ${data.total} proxies: ${data.good} good, ${data.bad} bad`, 'success');
-      } catch (err) {
-        addLog(`Error: ${err.message}`, 'error');
-      }
-      document.getElementById('checkProxiesBtn').disabled = false;
-    }
-
-    // Monitor functions
-    async function startMonitor() {
-      const ca = document.getElementById('monitorCA').value.trim();
-      if (!ca) {
-        addLog('Please enter a CA', 'error');
-        return;
-      }
-
-      const immediateCount = document.getElementById('immediateEnabled').checked
-        ? parseInt(document.getElementById('immediateCount').value) : 0;
-      const gradualCount = document.getElementById('gradualEnabled').checked
-        ? parseInt(document.getElementById('gradualCount').value) : 0;
-      const gradualInterval = parseInt(document.getElementById('gradualInterval').value);
-
-      try {
-        const res = await fetch('/api/monitor/start', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ ca, immediateCount, gradualCount, gradualInterval })
-        });
-        const data = await res.json();
-        if (data.error) {
-          addLog(`Error: ${data.error}`, 'error');
-          return;
-        }
-        document.getElementById('derivedPair').textContent = data.pairAddress;
-        document.getElementById('monitorInfo').style.display = 'block';
-        document.getElementById('monitorStartBtn').style.display = 'none';
-        document.getElementById('monitorStopBtn').style.display = '';
-        addLog(`Monitoring CA: ${ca.slice(0,8)}... → Pair: ${data.pairAddress.slice(0,8)}...`, 'info');
-      } catch (err) {
-        addLog(`Error: ${err.message}`, 'error');
-      }
-    }
-
-    async function stopMonitor() {
-      try {
-        await fetch('/api/monitor/stop', { method: 'POST' });
-        document.getElementById('monitorStartBtn').style.display = '';
-        document.getElementById('monitorStopBtn').style.display = 'none';
-        document.getElementById('monitorStatusText').textContent = '';
-        addLog('Monitor stopped', 'info');
-      } catch (err) {
-        addLog(`Error: ${err.message}`, 'error');
-      }
-    }
-
-    // Derive pair on CA input blur
-    async function derivePairFromCA() {
-      const ca = document.getElementById('monitorCA').value.trim();
-      if (!ca) return;
-      try {
-        const res = await fetch(`/api/derive-pair?ca=${ca}`);
-        const data = await res.json();
-        if (data.pairAddress) {
-          document.getElementById('derivedPair').textContent = data.pairAddress;
-          document.getElementById('monitorInfo').style.display = 'block';
-        }
-      } catch (err) {
-        // ignore
-      }
-    }
-
-    // Event listeners
-    document.getElementById('saveProxiesBtn').addEventListener('click', saveProxies);
-    document.getElementById('checkProxiesBtn').addEventListener('click', checkProxies);
-    document.getElementById('createAccountsBtn').addEventListener('click', createAccounts);
-    document.getElementById('stopCreateBtn').addEventListener('click', stopCreateAccounts);
     document.getElementById('reloginAccountsBtn').addEventListener('click', reloginAccounts);
+    document.getElementById('stopReloginBtn').addEventListener('click', stopRelogin);
     document.getElementById('startViewersBtn').addEventListener('click', startViewers);
     document.getElementById('stopViewersBtn').addEventListener('click', stopViewers);
     document.getElementById('pairAddress').addEventListener('blur', fetchTokenInfo);
-    document.getElementById('monitorStartBtn').addEventListener('click', startMonitor);
-    document.getElementById('monitorStopBtn').addEventListener('click', stopMonitor);
-    document.getElementById('monitorCA').addEventListener('blur', derivePairFromCA);
 
-    // Toggle strategy row styling
-    document.getElementById('immediateEnabled').addEventListener('change', (e) => {
-      document.getElementById('immediateRow').classList.toggle('disabled', !e.target.checked);
-    });
-    document.getElementById('gradualEnabled').addEventListener('change', (e) => {
-      document.getElementById('gradualRow').classList.toggle('disabled', !e.target.checked);
-    });
-
-    // Initialize
     connectWebSocket();
-    loadProxies();
   </script>
 </body>
 </html>

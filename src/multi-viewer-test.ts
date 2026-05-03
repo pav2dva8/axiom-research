@@ -82,7 +82,7 @@ class EucalyptusViewer {
         // Join viewer room
         const room = `e-${this.token}`;
         console.log(`[${this.auth.name}] Joining room: ${room}`);
-        this.ws.send(JSON.stringify({ action: 'join', room }));
+        this.ws!.send(JSON.stringify({ action: 'join', room }));
 
         resolve();
       });

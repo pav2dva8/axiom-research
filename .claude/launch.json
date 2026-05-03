@@ -1,0 +1,24 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "Main Client (dev)",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": ["run", "dev"],
+      "port": null
+    },
+    {
+      "name": "Viewer UI",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": ["run", "viewer-ui"],
+      "port": 3847,
+      "autoPort": false
+    },
+    {
+      "name": "Viewer Bot (CLI)",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": ["run", "viewer-bot"],
+      "port": null
+    }
+  ]
+}

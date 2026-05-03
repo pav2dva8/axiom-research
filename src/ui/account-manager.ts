@@ -7,8 +7,8 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { Keypair } from '@solana/web3.js';
-import { getOrCreateWallet, signup, login, type AuthTokens, type WalletInfo } from '../auth';
-import type { ProxyManager } from './proxy-manager';
+import { login, type AuthTokens, type WalletInfo } from '../auth';
+import type { BrowserSession } from '../browser-auth';
 
 export interface StoredAccount {
   id: number;
@@ -62,73 +62,6 @@ export class AccountManager {
 
   listAccounts(): StoredAccount[] {
     return [...this.accounts];
-  }
-
-  async createAccount(proxyManager?: ProxyManager): Promise<StoredAccount | null> {
-    const id = this.accounts.length + 1;
-    const walletPath = path.join(ACCOUNTS_DIR, `wallet_${id}.json`);
-    const tokensPath = path.join(ACCOUNTS_DIR, `tokens_${id}.json`);
-
-    // Get next available proxy
-    let proxy = null;
-    let agent = undefined;
-
-    if (proxyManager) {
-      proxy = proxyManager.getNextAvailableProxy();
-      if (proxy) {
-        agent = proxyManager.getAgent(proxy);
-      }
-    }
-
-    try {
-      // Create wallet
-      const wallet = getOrCreateWallet(walletPath);
-
-      // Signup with optional proxy
-      const tokens = await signup(wallet, agent);
-
-      // Save tokens
-      fs.writeFileSync(tokensPath, JSON.stringify(tokens, null, 2));
-
-      // Add to index
-      const account: StoredAccount = {
-        id,
-        publicKey: wallet.publicKey,
-        createdAt: new Date().toISOString(),
-      };
-      this.accounts.push(account);
-      this.saveIndex();
-
-      console.log(`[AccountManager] Account ${id} created${proxy ? ` via ${proxy.host}` : ''}`);
-      return account;
-    } catch (err: any) {
-      // Mark proxy as used/bad on error - move to next
-      if (proxy && proxyManager) {
-        proxyManager.markProxyUsed(proxy);
-      }
-
-      console.error(`Failed to create account: ${err.message}`);
-      throw err; // Re-throw to let caller handle
-    }
-  }
-
-  async createAccounts(count: number, onProgress?: (created: number, total: number) => void): Promise<number> {
-    let created = 0;
-
-    for (let i = 0; i < count; i++) {
-      const account = await this.createAccount();
-      if (account) {
-        created++;
-      }
-      onProgress?.(created, count);
-
-      // Rate limit
-      if (i < count - 1) {
-        await new Promise(r => setTimeout(r, 1000));
-      }
-    }
-
-    return created;
   }
 
   loadAccount(id: number): LoadedAccount | null {
@@ -204,7 +137,7 @@ export class AccountManager {
   /**
    * Re-login an account using its wallet (when tokens expired)
    */
-  async reloginAccount(id: number): Promise<boolean> {
+  async reloginAccount(id: number, browserSession?: BrowserSession): Promise<boolean> {
     const walletPath = path.join(ACCOUNTS_DIR, `wallet_${id}.json`);
     const tokensPath = path.join(ACCOUNTS_DIR, `tokens_${id}.json`);
 
@@ -225,9 +158,11 @@ export class AccountManager {
         keypair,
       };
 
-      // Re-login
+      // Re-login: use browser session if available (handles CF + Turnstile), else try direct
       console.log(`[AccountManager] Re-logging in account ${id}...`);
-      const tokens = await login(wallet);
+      const tokens = browserSession
+        ? await browserSession.loginAccount(wallet)
+        : await login(wallet);
 
       // Save new tokens
       fs.writeFileSync(tokensPath, JSON.stringify(tokens, null, 2));
@@ -236,30 +171,83 @@ export class AccountManager {
       return true;
     } catch (err: any) {
       console.error(`[AccountManager] Failed to re-login account ${id}: ${err.message}`);
-      return false;
+      throw err;
     }
   }
 
   /**
-   * Re-login all accounts
+   * Re-login all accounts using a shared browser session
    */
-  async reloginAllAccounts(onProgress?: (done: number, total: number) => void): Promise<number> {
+  private stopRelogin = false;
+  private reloginSession: BrowserSession | undefined;
+
+  stopReloginAll(): void {
+    this.stopRelogin = true;
+    if (this.reloginSession) {
+      this.reloginSession.close().catch(() => {});
+      this.reloginSession = undefined;
+    }
+  }
+
+  async reloginAllAccounts(
+    onProgress?: (done: number, total: number, message: string) => void,
+  ): Promise<number> {
+    const { openBrowserSession } = await import('../browser-auth');
+
+    this.stopRelogin = false;
     let success = 0;
     const total = this.accounts.length;
 
-    for (let i = 0; i < this.accounts.length; i++) {
-      const account = this.accounts[i];
-      const result = await this.reloginAccount(account.id);
-      if (result) success++;
-      onProgress?.(i + 1, total);
+    try {
+      onProgress?.(0, total, 'Opening browser — complete the Cloudflare challenge...');
+      this.reloginSession = await openBrowserSession();
+      onProgress?.(0, total, 'Browser ready. Logging in accounts...');
 
-      // Rate limit
-      if (i < this.accounts.length - 1) {
-        await new Promise(r => setTimeout(r, 1000));
+      for (let i = 0; i < this.accounts.length; i++) {
+        if (this.stopRelogin) {
+          onProgress?.(i, total, 'Stopped by user');
+          break;
+        }
+
+        const account = this.accounts[i];
+        onProgress?.(i, total, `Logging in account ${account.id}...`);
+
+        let error = '';
+        const result = await this.reloginAccount(account.id, this.reloginSession).catch(err => {
+          // Extract clean error from verbose playwright messages
+          const msg = err.message || '';
+          const match = msg.match(/Error: (.+?)(?:\n|$)/);
+          error = match ? match[1] : msg.split('\n')[0];
+          return false;
+        });
+        if (result) success++;
+        onProgress?.(i + 1, total, result
+          ? `Account ${account.id} OK (${success}/${i + 1})`
+          : `Account ${account.id} FAIL: ${error} (${success}/${i + 1})`);
+
+        if (i < this.accounts.length - 1 && !this.stopRelogin) {
+          await new Promise(r => setTimeout(r, 500));
+        }
       }
+    } catch (err: any) {
+      console.error(`[AccountManager] Browser session error: ${err.message}`);
+      onProgress?.(0, total, `Browser error: ${err.message}`);
+      // Close session on error
+      await this.reloginSession?.close();
+      this.reloginSession = undefined;
     }
+    // NOTE: session stays open for viewer WS connections
 
     return success;
+  }
+
+  getBrowserSession(): BrowserSession | undefined {
+    return this.reloginSession;
+  }
+
+  async closeBrowserSession(): Promise<void> {
+    await this.reloginSession?.close();
+    this.reloginSession = undefined;
   }
 }
 
