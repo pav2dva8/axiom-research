@@ -19,6 +19,12 @@
       "runtimeExecutable": "npm",
       "runtimeArgs": ["run", "viewer-bot"],
       "port": null
+    },
+    {
+      "name": "Web Frontend (Vite)",
+      "runtimeExecutable": "/Users/pavlo/.nvm/versions/node/v22.22.2/bin/node",
+      "runtimeArgs": ["node_modules/.bin/vite", "--config", "src/ui/web/vite.config.ts"],
+      "port": 5173
     }
   ]
 }

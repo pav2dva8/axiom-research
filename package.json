@@ -12,8 +12,11 @@
     "viewers": "tsx src/viewers.ts",
     "viewer-bot": "tsx src/ui/cli.ts",
     "viewer-ui": "tsx src/ui/server.ts",
+    "dev:server": "tsx src/ui/server.ts",
     "build:web": "vite build --config src/ui/web/vite.config.ts",
-    "dev:web": "vite --config src/ui/web/vite.config.ts"
+    "dev:web": "vite --config src/ui/web/vite.config.ts",
+    "probe": "tsx src/probe-token-page.ts",
+    "probe-diff": "tsx src/diff-user-state.ts"
   },
   "keywords": [
     "axiom",
@@ -36,9 +39,11 @@
     "vite": "^8.0.10"
   },
   "dependencies": {
+    "@radix-ui/react-checkbox": "^1.3.3",
     "@radix-ui/react-scroll-area": "^1.2.10",
     "@radix-ui/react-separator": "^1.1.8",
     "@radix-ui/react-slot": "^1.2.4",
+    "@radix-ui/react-tabs": "^1.1.13",
     "@solana/web3.js": "^1.98.4",
     "@types/node-fetch": "^2.6.13",
     "abort-controller": "^3.0.0",

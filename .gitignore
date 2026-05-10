@@ -3,8 +3,14 @@ dist/
 *.log
 .env
 .DS_Store
+.idea/
+.vscode/
+*.iml
 wallet.json
 wallet-*.json
 wallets/
 accounts/
 proxies.json
+keys.txt
+keys*.txt
+probe-logs/

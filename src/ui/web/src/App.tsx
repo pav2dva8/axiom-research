@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState, useCallback } from 'react';
-import { StatusBar } from '@/components/StatusBar';
-import { AccountsPanel } from '@/components/AccountsPanel';
-import { ViewersPanel } from '@/components/ViewersPanel';
+import { Tabs, TabsList, TabsTrigger, TabsContent } from '@/components/ui/tabs';
+import { RunTab } from '@/components/RunTab';
+import { AccountsTab } from '@/components/AccountsTab';
 import { LogPanel, type LogEntry } from '@/components/LogPanel';
 
 interface Status {
@@ -14,6 +14,7 @@ let logIdCounter = 0;
 export default function App() {
   const [status, setStatus] = useState<Status>({ accounts: 0, activeViewers: 0 });
   const [logEntries, setLogEntries] = useState<LogEntry[]>([]);
+  const [accountsRefreshTick, setAccountsRefreshTick] = useState(0);
   const wsRef = useRef<WebSocket | null>(null);
 
   const addLog = useCallback((message: string, type: LogEntry['type'] = 'info') => {
@@ -23,13 +24,15 @@ export default function App() {
       message,
       type,
     };
-    setLogEntries((prev) => [...prev.slice(-99), entry]);
+    setLogEntries((prev) => [...prev.slice(-199), entry]);
   }, []);
+
+  const refreshAccounts = useCallback(() => setAccountsRefreshTick((t) => t + 1), []);
 
   useEffect(() => {
     function connect() {
       const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-      const ws = new WebSocket(`${protocol}//${window.location.host}`);
+      const ws = new WebSocket(`${protocol}//${window.location.host}/ws`);
       wsRef.current = ws;
 
       ws.onopen = () => addLog('Connected to server', 'success');
@@ -42,19 +45,51 @@ export default function App() {
         if (msg.type === 'status') {
           setStatus({ accounts: msg.data.accounts, activeViewers: msg.data.activeViewers });
         } else if (msg.type === 'relogin-progress') {
-          addLog(`[${msg.data.done}/${msg.data.total}] ${msg.data.message}`, 'info');
+          addLog(msg.data.message, 'info');
+          if (msg.data.done === msg.data.total) refreshAccounts();
+        } else if (msg.type === 'accounts-changed') {
+          refreshAccounts();
         }
       };
     }
     connect();
     return () => wsRef.current?.close();
-  }, [addLog]);
+  }, [addLog, refreshAccounts]);
 
   return (
-    <div className="flex flex-col h-screen max-w-2xl mx-auto p-3 gap-3">
-      <StatusBar accounts={status.accounts} activeViewers={status.activeViewers} />
-      <AccountsPanel onLog={addLog} />
-      <ViewersPanel onLog={addLog} />
+    <div className="flex h-screen flex-col bg-background text-foreground">
+      <header className="flex items-center justify-between border-b border-border px-4 py-3">
+        <div className="flex items-baseline gap-2">
+          <span className="font-semibold tracking-tight">axiom-viewer</span>
+          <span className="text-xs text-muted-foreground">research</span>
+        </div>
+        <div className="flex items-center gap-4 font-mono text-xs">
+          <span className="text-muted-foreground">
+            accounts <span className="text-foreground">{status.accounts}</span>
+          </span>
+          <span className="text-muted-foreground">
+            active <span className="text-foreground">{status.activeViewers}</span>
+          </span>
+        </div>
+      </header>
+
+      <main className="flex min-h-0 flex-1 flex-col overflow-hidden">
+        <Tabs defaultValue="run" className="flex min-h-0 flex-1 flex-col">
+          <div className="border-b border-border px-4 py-2">
+            <TabsList>
+              <TabsTrigger value="run">Run</TabsTrigger>
+              <TabsTrigger value="accounts">Accounts</TabsTrigger>
+            </TabsList>
+          </div>
+          <TabsContent value="run" className="m-0 flex-1 overflow-auto p-4">
+            <RunTab onLog={addLog} />
+          </TabsContent>
+          <TabsContent value="accounts" className="m-0 flex-1 overflow-auto p-4">
+            <AccountsTab onLog={addLog} refreshTick={accountsRefreshTick} onChanged={refreshAccounts} />
+          </TabsContent>
+        </Tabs>
+      </main>
+
       <LogPanel entries={logEntries} />
     </div>
   );
