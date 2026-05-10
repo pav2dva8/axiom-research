@@ -15,4 +15,4 @@ keys.txt
 keys*.txt
 probe-logs/
 .claude/
-.idea/
+docs/
