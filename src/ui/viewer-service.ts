@@ -105,7 +105,7 @@ export class ViewerService extends EventEmitter {
           // Tiny pause so the server commits the bootstrap before the WS
           // handshake. Real client takes ~150-300 ms between the burst and
           // joining cluster9.
-          await new Promise(r => setTimeout(r, 200 + Math.floor(Math.random() * 250)));
+          await new Promise(r => setTimeout(r, 50 + Math.floor(Math.random() * 50)));
         } catch (e: any) {
           console.log(`[Viewer] ${account.publicKey.slice(0, 8)} bootstrap failed: ${e.message}`);
           // Continue anyway — bootstrap failure shouldn't block a connect attempt.
@@ -133,11 +133,11 @@ export class ViewerService extends EventEmitter {
 
   /**
    * Connect each account in shuffled order, with a random gap between starts
-   * (default 0.8–2.5s) so all accounts don't slam the WS handshake at once.
+   * (default 0.1–0.3s) so all accounts don't slam the WS handshake at once.
    */
   async connectAll(accounts: LoadedAccount[], opts: ConnectAllOptions = {}): Promise<number> {
-    const minGap = opts.minGapMs ?? 800;
-    const maxGap = opts.maxGapMs ?? 2500;
+    const minGap = opts.minGapMs ?? 100;
+    const maxGap = opts.maxGapMs ?? 300;
     const shouldShuffle = opts.shuffle ?? true;
     const order = shouldShuffle ? shuffle(accounts) : [...accounts];
 
@@ -145,12 +145,12 @@ export class ViewerService extends EventEmitter {
     for (let i = 0; i < order.length; i++) {
       const account = order[i];
       if (this.connectedViewers.has(account.publicKey)) continue;
-      const success = await this.connectAccount(account);
-      if (success) connected++;
-      if (i < order.length - 1) {
+      if (i > 0) {
         const gap = minGap + Math.floor(Math.random() * Math.max(1, maxGap - minGap));
         await new Promise(r => setTimeout(r, gap));
       }
+      const success = await this.connectAccount(account);
+      if (success) connected++;
     }
     return connected;
   }

@@ -67,6 +67,7 @@ export function AccountsTab({ onLog, refreshTick, onChanged }: Props) {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ publicKey, selected }),
       });
+      onChanged();
     } catch (err: any) {
       onLog(`Select failed: ${err.message}`, 'error');
       fetchAccounts();

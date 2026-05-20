@@ -199,6 +199,13 @@ export class AccountManager {
     this.writeSelection(cur);
   }
 
+  /** Replace the current selection with the given public keys (unknown keys ignored). */
+  setSelection(publicKeys: string[]): void {
+    this.refreshKeys();
+    const valid = new Set(publicKeys.filter((pk) => this.keyCache.has(pk)));
+    this.writeSelection(valid);
+  }
+
   // ─── tokens cache ──────────────────────────────────────────────────────
 
   private tokenPath(publicKey: string): string {
@@ -241,6 +248,16 @@ export class AccountManager {
   getAccountCount(): number {
     this.refreshKeys();
     return this.keyCache.size;
+  }
+
+  getSelectedCount(): number {
+    this.refreshKeys();
+    const selected = this.readSelection();
+    let count = 0;
+    for (const pk of selected) {
+      if (this.keyCache.has(pk)) count++;
+    }
+    return count;
   }
 
   /** All accounts derived from keys.txt, with status + selection merged. */

@@ -308,22 +308,12 @@ export async function openBrowserSession(): Promise<BrowserSession> {
         }
 
         clusterWs.onopen = () => {
-          // Stagger room joins by 30-120 ms each to avoid a synchronized burst
-          // and to look more like a human-driven page render.
-          let i = 0;
-          function joinNext() {
-            if (i >= tokenRooms.length) {
-              console.log('[viewer ' + id + '] cluster9 joined ' + tokenRooms.length + ' rooms (e-' + pairAddress.slice(0, 6) + '...)');
-              clusterOpen = true;
-              tryResolve();
-              return;
-            }
-            if (clusterWs.readyState !== 1) return;
-            clusterWs.send(JSON.stringify({ action: 'join', room: tokenRooms[i++] }));
-            const gap = 30 + Math.floor(Math.random() * 90);
-            setTimeout(joinNext, gap);
+          for (const room of tokenRooms) {
+            clusterWs.send(JSON.stringify({ action: 'join', room }));
           }
-          joinNext();
+          console.log('[viewer ' + id + '] cluster9 joined ' + tokenRooms.length + ' rooms (e-' + pairAddress.slice(0, 6) + '...)');
+          clusterOpen = true;
+          tryResolve();
         };
         clusterWs.onmessage = (e) => {
           // Surface viewer-count broadcasts so we can confirm we're being counted

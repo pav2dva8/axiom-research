@@ -6,13 +6,14 @@ import { LogPanel, type LogEntry } from '@/components/LogPanel';
 
 interface Status {
   accounts: number;
+  selected: number;
   activeViewers: number;
 }
 
 let logIdCounter = 0;
 
 export default function App() {
-  const [status, setStatus] = useState<Status>({ accounts: 0, activeViewers: 0 });
+  const [status, setStatus] = useState<Status>({ accounts: 0, selected: 0, activeViewers: 0 });
   const [logEntries, setLogEntries] = useState<LogEntry[]>([]);
   const [accountsRefreshTick, setAccountsRefreshTick] = useState(0);
   const wsRef = useRef<WebSocket | null>(null);
@@ -29,6 +30,25 @@ export default function App() {
 
   const refreshAccounts = useCallback(() => setAccountsRefreshTick((t) => t + 1), []);
 
+  const syncAccountsSummary = useCallback(async () => {
+    try {
+      const res = await fetch('/api/accounts');
+      const data = await res.json();
+      if (!Array.isArray(data)) return;
+      setStatus((s) => ({
+        ...s,
+        accounts: data.length,
+        selected: data.filter((a) => a.selected).length,
+      }));
+    } catch {
+      // ignore — WS status will retry
+    }
+  }, []);
+
+  useEffect(() => {
+    syncAccountsSummary();
+  }, [syncAccountsSummary, accountsRefreshTick]);
+
   useEffect(() => {
     function connect() {
       const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -43,7 +63,12 @@ export default function App() {
       ws.onmessage = (event) => {
         const msg = JSON.parse(event.data);
         if (msg.type === 'status') {
-          setStatus({ accounts: msg.data.accounts, activeViewers: msg.data.activeViewers });
+          setStatus((s) => ({
+            ...s,
+            accounts: msg.data.accounts ?? s.accounts,
+            selected: msg.data.selected ?? s.selected,
+            activeViewers: msg.data.activeViewers ?? s.activeViewers,
+          }));
         } else if (msg.type === 'relogin-progress') {
           addLog(msg.data.message, 'info');
           if (msg.data.done === msg.data.total) refreshAccounts();
@@ -65,7 +90,7 @@ export default function App() {
         </div>
         <div className="flex items-center gap-4 font-mono text-xs">
           <span className="text-muted-foreground">
-            accounts <span className="text-foreground">{status.accounts}</span>
+            selected <span className="text-foreground">{status.selected}/{status.accounts}</span>
           </span>
           <span className="text-muted-foreground">
             active <span className="text-foreground">{status.activeViewers}</span>
@@ -81,8 +106,8 @@ export default function App() {
               <TabsTrigger value="accounts">Accounts</TabsTrigger>
             </TabsList>
           </div>
-          <TabsContent value="run" className="m-0 flex-1 overflow-auto p-4">
-            <RunTab onLog={addLog} />
+          <TabsContent value="run" forceMount className="m-0 flex-1 overflow-auto p-4 data-[state=inactive]:hidden">
+            <RunTab onLog={addLog} refreshTick={accountsRefreshTick} onAccountsChanged={refreshAccounts} />
           </TabsContent>
           <TabsContent value="accounts" className="m-0 flex-1 overflow-auto p-4">
             <AccountsTab onLog={addLog} refreshTick={accountsRefreshTick} onChanged={refreshAccounts} />
