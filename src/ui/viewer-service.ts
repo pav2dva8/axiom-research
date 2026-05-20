@@ -133,11 +133,13 @@ export class ViewerService extends EventEmitter {
 
   /**
    * Connect each account in shuffled order, with a random gap between starts
-   * (default 0.1–0.3s) so all accounts don't slam the WS handshake at once.
+   * (default 0.2–0.5s) so all accounts don't slam the WS handshake at once.
    */
   async connectAll(accounts: LoadedAccount[], opts: ConnectAllOptions = {}): Promise<number> {
-    const minGap = opts.minGapMs ?? 100;
-    const maxGap = opts.maxGapMs ?? 300;
+    const rawMin = opts.minGapMs ?? 200;
+    const rawMax = opts.maxGapMs ?? 500;
+    const minGap = Math.max(0, Math.floor(rawMin));
+    const maxGap = Math.max(minGap, Math.floor(rawMax));
     const shouldShuffle = opts.shuffle ?? true;
     const order = shouldShuffle ? shuffle(accounts) : [...accounts];
 

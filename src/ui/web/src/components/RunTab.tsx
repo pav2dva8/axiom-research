@@ -28,6 +28,8 @@ interface Props {
 }
 
 const BASE58 = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
+const DEFAULT_MIN_GAP_MS = 20;
+const DEFAULT_MAX_GAP_MS = 50;
 
 /**
  * Heuristic: pump.fun token CAs always end with "pump"; pair addresses don't.
@@ -66,6 +68,8 @@ export function RunTab({ onLog, refreshTick, onAccountsChanged }: Props) {
   const [running, setRunning] = useState(false);
   const [busy, setBusy] = useState(false);
   const [pasting, setPasting] = useState(false);
+  const [minGapMs, setMinGapMs] = useState<number>(DEFAULT_MIN_GAP_MS);
+  const [maxGapMs, setMaxGapMs] = useState<number>(DEFAULT_MAX_GAP_MS);
 
   const fetchAccounts = useCallback(async () => {
     try {
@@ -156,10 +160,16 @@ export function RunTab({ onLog, refreshTick, onAccountsChanged }: Props) {
         "success",
       );
 
+      const safeMin = Math.max(0, Math.floor(minGapMs));
+      const safeMax = Math.max(safeMin, Math.floor(maxGapMs));
       const startRes = await fetch("/api/viewers/start", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ pairAddress: t.pairAddress }),
+        body: JSON.stringify({
+          pairAddress: t.pairAddress,
+          minGapMs: safeMin,
+          maxGapMs: safeMax,
+        }),
       });
       const startData = await startRes.json();
       if (!startRes.ok) {
@@ -240,6 +250,60 @@ export function RunTab({ onLog, refreshTick, onAccountsChanged }: Props) {
               <span className="ml-2">Stop</span>
             </Button>
           )}
+        </div>
+      </div>
+
+      <div className="flex flex-col gap-2">
+        <label className="text-xs font-medium uppercase tracking-wider text-muted-foreground">
+          Delay between viewers (ms)
+        </label>
+        <div className="flex items-center gap-2">
+          <Input
+            type="number"
+            min={0}
+            step={50}
+            value={Number.isFinite(minGapMs) ? minGapMs : ""}
+            onChange={(e) => {
+              const v = e.target.value === "" ? 0 : Number(e.target.value);
+              setMinGapMs(Number.isFinite(v) ? Math.max(0, v) : 0);
+            }}
+            onBlur={() => {
+              if (maxGapMs < minGapMs) setMaxGapMs(minGapMs);
+            }}
+            disabled={running || busy}
+            className="font-mono"
+            aria-label="Minimum delay"
+          />
+          <span className="text-xs text-muted-foreground">to</span>
+          <Input
+            type="number"
+            min={0}
+            step={50}
+            value={Number.isFinite(maxGapMs) ? maxGapMs : ""}
+            onChange={(e) => {
+              const v = e.target.value === "" ? 0 : Number(e.target.value);
+              setMaxGapMs(Number.isFinite(v) ? Math.max(0, v) : 0);
+            }}
+            onBlur={() => {
+              if (maxGapMs < minGapMs) setMaxGapMs(minGapMs);
+            }}
+            disabled={running || busy}
+            className="font-mono"
+            aria-label="Maximum delay"
+          />
+          <Button
+            type="button"
+            variant="ghost"
+            size="sm"
+            onClick={() => {
+              setMinGapMs(DEFAULT_MIN_GAP_MS);
+              setMaxGapMs(DEFAULT_MAX_GAP_MS);
+            }}
+            disabled={running || busy}
+            title="Reset to default 200–500 ms"
+          >
+            Default
+          </Button>
         </div>
       </div>
 

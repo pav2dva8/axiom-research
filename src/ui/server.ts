@@ -264,14 +264,17 @@ async function handleApi(
       return;
     }
 
-    // POST /api/viewers/start  { pairAddress }
+    // POST /api/viewers/start  { pairAddress, minGapMs?, maxGapMs? }
     if (pathname === "/api/viewers/start" && req.method === "POST") {
-      const { pairAddress } = JSON.parse(await readBody(req));
+      const body = JSON.parse(await readBody(req));
+      const { pairAddress, minGapMs, maxGapMs } = body ?? {};
       if (typeof pairAddress !== "string" || !pairAddress.trim()) {
         res.writeHead(400);
         res.end(JSON.stringify({ error: "pairAddress required" }));
         return;
       }
+      const minGapValid = typeof minGapMs === "number" && Number.isFinite(minGapMs) && minGapMs >= 0;
+      const maxGapValid = typeof maxGapMs === "number" && Number.isFinite(maxGapMs) && maxGapMs >= 0;
 
       await ensureBrowserSession();
 
@@ -315,7 +318,10 @@ async function handleApi(
         return;
       }
 
-      const connected = await viewerService.connectAll(accounts);
+      const connected = await viewerService.connectAll(accounts, {
+        ...(minGapValid ? { minGapMs } : {}),
+        ...(maxGapValid ? { maxGapMs } : {}),
+      });
 
       broadcastStatus();
       res.writeHead(200);
