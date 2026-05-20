@@ -2,7 +2,7 @@ import { useCallback, useEffect, useState } from "react";
 import { ClipboardPaste, Loader2, Play, Square } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
-import { Badge } from "@/components/ui/badge";
+import { Checkbox } from "@/components/ui/checkbox";
 import type { LogEntry } from "@/components/LogPanel";
 
 interface ResolvedToken {
@@ -70,6 +70,7 @@ export function RunTab({ onLog, refreshTick, onAccountsChanged }: Props) {
   const [pasting, setPasting] = useState(false);
   const [minGapMs, setMinGapMs] = useState<number>(DEFAULT_MIN_GAP_MS);
   const [maxGapMs, setMaxGapMs] = useState<number>(DEFAULT_MAX_GAP_MS);
+  const [bootstrapDisabled, setBootstrapDisabled] = useState<boolean>(true);
 
   const fetchAccounts = useCallback(async () => {
     try {
@@ -169,6 +170,7 @@ export function RunTab({ onLog, refreshTick, onAccountsChanged }: Props) {
           pairAddress: t.pairAddress,
           minGapMs: safeMin,
           maxGapMs: safeMax,
+          bootstrapDisabled,
         }),
       });
       const startData = await startRes.json();
@@ -307,26 +309,22 @@ export function RunTab({ onLog, refreshTick, onAccountsChanged }: Props) {
         </div>
       </div>
 
+      <label className="flex items-center gap-2 text-xs text-muted-foreground">
+        <Checkbox
+          checked={bootstrapDisabled}
+          onCheckedChange={(v) => setBootstrapDisabled(v === true)}
+          disabled={running || busy}
+        />
+        <span>Skip bootstrap</span>
+      </label>
+
       {token && (
-        <div className="rounded-md border border-border bg-card p-3">
-          <div className="flex items-baseline gap-2">
-            <Badge variant="outline" className="font-mono">
-              {token.ticker}
-            </Badge>
-            <span className="text-sm">{token.name}</span>
-            {token.isMigrated && (
-              <Badge variant="secondary" className="text-[10px]">
-                migrated
-              </Badge>
-            )}
-          </div>
-          <dl className="mt-3 grid grid-cols-2 gap-x-4 gap-y-1 font-mono text-xs">
-            <dt className="text-muted-foreground">pair</dt>
-            <dd className="truncate">{token.pairAddress}</dd>
-            <dt className="text-muted-foreground">token</dt>
-            <dd className="truncate">{token.tokenAddress || "\u2014"}</dd>
-          </dl>
-        </div>
+        <dl className="grid grid-cols-[auto_1fr] gap-x-4 gap-y-1 rounded-md border border-border bg-card p-3 font-mono text-xs">
+          <dt className="text-muted-foreground">pair</dt>
+          <dd className="truncate">{token.pairAddress}</dd>
+          <dt className="text-muted-foreground">token</dt>
+          <dd className="truncate">{token.tokenAddress || "—"}</dd>
+        </dl>
       )}
     </div>
   );

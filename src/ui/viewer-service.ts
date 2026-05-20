@@ -18,6 +18,7 @@ export interface ConnectAllOptions {
   minGapMs?: number;
   maxGapMs?: number;
   shuffle?: boolean;
+  bootstrapDisabled?: boolean;
 }
 
 function shuffle<T>(arr: T[]): T[] {
@@ -34,6 +35,7 @@ export class ViewerService extends EventEmitter {
   private connectedViewers: Map<string, number> = new Map(); // publicKey -> browser viewer id
   private warmedAccounts: Set<string> = new Set(); // publicKeys that have been bootstrapped this process
   private tokenInfo: TokenInfo | null = null;
+  private bootstrapDisabled = false;
 
   constructor() {
     super();
@@ -93,8 +95,10 @@ export class ViewerService extends EventEmitter {
       // First viewer attempt for this account in this process: fire the
       // bootstrap HTTP burst the real client does on page load. Without it
       // the server appears to skip the account when computing e-{pair}
-      // viewer counts (especially for new accounts).
-      if (!this.warmedAccounts.has(account.publicKey)) {
+      // viewer counts (especially for new accounts). UI checkbox toggles
+      // this.bootstrapDisabled so we can A/B test whether the burst is
+      // actually needed (or causing cluster9 1006 drops).
+      if (!this.bootstrapDisabled && !this.warmedAccounts.has(account.publicKey)) {
         try {
           await this.browserSession.bootstrapSession(
             account.publicKey,
@@ -110,6 +114,8 @@ export class ViewerService extends EventEmitter {
           console.log(`[Viewer] ${account.publicKey.slice(0, 8)} bootstrap failed: ${e.message}`);
           // Continue anyway — bootstrap failure shouldn't block a connect attempt.
         }
+      } else if (this.bootstrapDisabled) {
+        console.log(`[Viewer] ${account.publicKey.slice(0, 8)} bootstrap SKIPPED (UI toggle)`);
       }
 
       // Random ping-start jitter (0..1000 ms) so multiple viewers' 1-Hz "."
@@ -142,6 +148,13 @@ export class ViewerService extends EventEmitter {
     const maxGap = Math.max(minGap, Math.floor(rawMax));
     const shouldShuffle = opts.shuffle ?? true;
     const order = shouldShuffle ? shuffle(accounts) : [...accounts];
+    // Toggling the bootstrap flag invalidates prior warm-up, so re-bootstrap
+    // (or skip) every account on this run.
+    const nextBootstrapDisabled = opts.bootstrapDisabled ?? false;
+    if (nextBootstrapDisabled !== this.bootstrapDisabled) {
+      this.warmedAccounts.clear();
+    }
+    this.bootstrapDisabled = nextBootstrapDisabled;
 
     let connected = 0;
     for (let i = 0; i < order.length; i++) {

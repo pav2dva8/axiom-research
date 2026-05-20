@@ -89,6 +89,24 @@ export function AccountsTab({ onLog, refreshTick, onChanged }: Props) {
     onChanged();
   }
 
+  /** Set selection to exactly the accounts matching `predicate`. */
+  async function selectByStatus(predicate: (a: Account) => boolean) {
+    const changes = accounts
+      .map((a) => ({ account: a, next: predicate(a) }))
+      .filter(({ account, next }) => account.selected !== next);
+    setAccounts((prev) => prev.map((a) => ({ ...a, selected: predicate(a) })));
+    await Promise.all(
+      changes.map(({ account, next }) =>
+        fetch('/api/accounts/select', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ publicKey: account.publicKey, selected: next }),
+        }),
+      ),
+    );
+    onChanged();
+  }
+
   async function reloginRow(publicKey: string) {
     setPendingKey(publicKey);
     try {
@@ -148,6 +166,8 @@ export function AccountsTab({ onLog, refreshTick, onChanged }: Props) {
   const selectedCount = accounts.filter((a) => a.selected).length;
   const allSelected = accounts.length > 0 && selectedCount === accounts.length;
   const someSelected = selectedCount > 0 && !allSelected;
+  const loggedInCount = accounts.filter((a) => a.tokenValid).length;
+  const expiredCount = accounts.filter((a) => a.hasTokens && !a.tokenValid).length;
 
   return (
     <div className="mx-auto flex max-w-3xl flex-col gap-4">
@@ -159,6 +179,22 @@ export function AccountsTab({ onLog, refreshTick, onChanged }: Props) {
           </span>
         </div>
         <div className="flex gap-2">
+          <Button
+            size="sm"
+            variant="outline"
+            onClick={() => selectByStatus((a) => a.tokenValid)}
+            disabled={loggedInCount === 0 || bulkRunning}
+          >
+            Logged in ({loggedInCount})
+          </Button>
+          <Button
+            size="sm"
+            variant="outline"
+            onClick={() => selectByStatus((a) => a.hasTokens && !a.tokenValid)}
+            disabled={expiredCount === 0 || bulkRunning}
+          >
+            Expired ({expiredCount})
+          </Button>
           {!bulkRunning ? (
             <Button
               size="sm"

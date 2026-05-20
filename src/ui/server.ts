@@ -78,19 +78,6 @@ async function ensureBrowserSession(): Promise<
   return session;
 }
 
-function tokenInfoFromPairData(pairAddress: string, data: any): TokenInfo {
-  return {
-    pairAddress: data.pairAddress || pairAddress,
-    tokenAddress: data.tokenAddress || data.baseToken?.address || "",
-    ticker: data.ticker || data.baseToken?.symbol || "UNKNOWN",
-    name: data.name || data.baseToken?.name || "Unknown Token",
-    protocol: data.protocol || "Pump V1",
-    isMigrated: data.isMigrated || false,
-    supply: data.supply || data.baseToken?.totalSupply || 1000000000,
-    price: data.price || data.priceUsd || 0,
-  };
-}
-
 async function handleApi(
   req: http.IncomingMessage,
   res: http.ServerResponse,
@@ -215,25 +202,19 @@ async function handleApi(
         pairAddress = derivePumpPair(value);
       }
 
-      // If we still need the pair, or want richer metadata than just the
-      // address, hit Axiom through the CF-bypassed browser.
-      if (!pairAddress || !pairData) {
+      // If we still need the pair, hit Axiom through the CF-bypassed browser.
+      // Skip enrichment via fetchPairInfo — Axiom's pair-info endpoint
+      // frequently 502s and the WS protocol only requires pairAddress.
+      if (!pairAddress) {
         const session = await ensureBrowserSession();
-
-        if (!pairAddress) {
-          if (looksLikeCA(value)) {
-            const resolved = await session.resolvePairFromCa(value);
-            if (resolved?.pairAddress) {
-              pairAddress = resolved.pairAddress;
-              pairData = resolved;
-            }
-          } else {
-            pairAddress = value;
+        if (looksLikeCA(value)) {
+          const resolved = await session.resolvePairFromCa(value);
+          if (resolved?.pairAddress) {
+            pairAddress = resolved.pairAddress;
+            pairData = resolved;
           }
-        }
-
-        if (pairAddress && !pairData) {
-          pairData = await session.fetchPairInfo(pairAddress).catch(() => null);
+        } else {
+          pairAddress = value;
         }
       }
 
@@ -243,10 +224,19 @@ async function handleApi(
         return;
       }
 
-      // pairData may be null (Axiom down). Build minimal tokenInfo from
-      // what we know — the WS protocol only requires pairAddress + chain.
+      // pairData (from resolvePairFromCa) may be null. Build minimal tokenInfo
+      // from what we know — the WS protocol only requires pairAddress + chain.
       const tokenInfo: TokenInfo = pairData
-        ? tokenInfoFromPairData(pairAddress, pairData)
+        ? {
+            pairAddress: pairData.pairAddress || pairAddress,
+            tokenAddress: pairData.tokenAddress || pairData.baseToken?.address || "",
+            ticker: pairData.ticker || pairData.baseToken?.symbol || "UNKNOWN",
+            name: pairData.name || pairData.baseToken?.name || "Unknown Token",
+            protocol: pairData.protocol || "Pump V1",
+            isMigrated: pairData.isMigrated || false,
+            supply: pairData.supply || pairData.baseToken?.totalSupply || 1000000000,
+            price: pairData.price || pairData.priceUsd || 0,
+          }
         : {
             pairAddress,
             tokenAddress: isPumpCa(value) ? value : "",
@@ -264,10 +254,10 @@ async function handleApi(
       return;
     }
 
-    // POST /api/viewers/start  { pairAddress, minGapMs?, maxGapMs? }
+    // POST /api/viewers/start  { pairAddress, minGapMs?, maxGapMs?, bootstrapDisabled? }
     if (pathname === "/api/viewers/start" && req.method === "POST") {
       const body = JSON.parse(await readBody(req));
-      const { pairAddress, minGapMs, maxGapMs } = body ?? {};
+      const { pairAddress, minGapMs, maxGapMs, bootstrapDisabled } = body ?? {};
       if (typeof pairAddress !== "string" || !pairAddress.trim()) {
         res.writeHead(400);
         res.end(JSON.stringify({ error: "pairAddress required" }));
@@ -278,32 +268,21 @@ async function handleApi(
 
       await ensureBrowserSession();
 
-      // /api/resolve normally sets tokenInfo for the same pair. Only refetch
-      // when we don't have anything cached for this pair, and tolerate a
-      // failure (we already have a valid pairAddress, which is all the WS
-      // protocol actually needs).
+      // /api/resolve normally sets tokenInfo for the same pair. If somehow
+      // missing, build a minimal placeholder — the WS protocol only requires
+      // pairAddress + chain.
       const cached = viewerService.getTokenInfo();
       if (!cached || cached.pairAddress !== pairAddress) {
-        const session = viewerService.getBrowserSession();
-        const havePair = session
-          ? await session.fetchPairInfo(pairAddress).catch(() => null)
-          : null;
-        if (havePair) {
-          viewerService.setTokenInfo(
-            tokenInfoFromPairData(pairAddress, havePair),
-          );
-        } else {
-          viewerService.setTokenInfo({
-            pairAddress,
-            tokenAddress: "",
-            ticker: "TOKEN",
-            name: "Token",
-            protocol: "Pump V1",
-            isMigrated: false,
-            supply: 1000000000,
-            price: 0,
-          });
-        }
+        viewerService.setTokenInfo({
+          pairAddress,
+          tokenAddress: "",
+          ticker: "TOKEN",
+          name: "Token",
+          protocol: "Pump V1",
+          isMigrated: false,
+          supply: 1000000000,
+          price: 0,
+        });
       }
 
       const accounts = accountManager.loadSelectedAccounts();
@@ -321,6 +300,7 @@ async function handleApi(
       const connected = await viewerService.connectAll(accounts, {
         ...(minGapValid ? { minGapMs } : {}),
         ...(maxGapValid ? { maxGapMs } : {}),
+        bootstrapDisabled: bootstrapDisabled === true,
       });
 
       broadcastStatus();

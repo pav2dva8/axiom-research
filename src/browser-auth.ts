@@ -24,7 +24,6 @@ const DEBUG_PORT = 9222;
 export interface BrowserSession {
   loginAccount(wallet: WalletInfo): Promise<AuthTokens>;
   getCfData(): Promise<{ cfCookies: string; userAgent: string }>;
-  fetchPairInfo(pairAddress: string): Promise<any | null>;
   resolvePairFromCa(ca: string): Promise<any | null>;
   /**
    * Run the session bootstrap that the real client fires on every page load
@@ -173,6 +172,23 @@ export async function openBrowserSession(): Promise<BrowserSession> {
     }
     console.log('[Probe] done');
   }
+
+  // Shim esbuild/tsx helpers (`__name`, `__publicField`) in every page.
+  // Functions passed to page.evaluate are stringified, and tsx wraps nested
+  // `const x = (...) => ...` arrows with `__name(x, "x")` to preserve
+  // Function.name. Without this shim those calls throw `ReferenceError:
+  // __name is not defined` in the browser context. Passed as raw script
+  // content so esbuild doesn't transform the shim itself.
+  await context.addInitScript({
+    content: `
+      if (typeof globalThis.__name !== 'function') {
+        globalThis.__name = function (fn) { return fn; };
+      }
+      if (typeof globalThis.__publicField !== 'function') {
+        globalThis.__publicField = function (obj, key, value) { obj[key] = value; return value; };
+      }
+    `,
+  });
 
   // Open a single api2 tab for all API calls
   const apiPage = await context.newPage();
@@ -425,37 +441,7 @@ export async function openBrowserSession(): Promise<BrowserSession> {
       return probeEucalyptusMessages(pairAddress, accessToken, refreshToken);
     },
 
-    async fetchPairInfo(pairAddress: string): Promise<any | null> {
-      // Run from the axiom.trade origin (friendsPage) — api9/api2 only set
-      // CORS allow-origin to https://axiom.trade, so calling from api2.axiom.trade
-      // (where apiPage lives) fails CORS and returns null silently.
-      const hosts = ['api9.axiom.trade', 'api2.axiom.trade'];
-      for (const host of hosts) {
-        try {
-          const url = `https://${host}/pair-info?pairAddress=${pairAddress}&v=${Date.now()}`;
-          const result = await friendsPage.evaluate(async (u) => {
-            try {
-              const r = await fetch(u, { credentials: 'include' });
-              if (!r.ok) return { __err: 'status ' + r.status };
-              return await r.json();
-            } catch (e: any) {
-              return { __err: 'fetch ' + (e?.message || String(e)) };
-            }
-          }, url);
-          if (result && !(result as any).__err) {
-            console.log(`[BrowserAuth] fetchPairInfo OK via ${host}, tokenAddress=${(result as any).tokenAddress || 'n/a'}`);
-            return result;
-          }
-          console.log(`[BrowserAuth] fetchPairInfo ${host} -> ${(result as any)?.__err || 'no body'}`);
-        } catch (e: any) {
-          console.log(`[BrowserAuth] fetchPairInfo evaluate error on ${host}:`, e.message);
-        }
-      }
-      console.log('[BrowserAuth] fetchPairInfo returned null for', pairAddress);
-      return null;
-    },
-
-    async loginAccount(wallet: WalletInfo): Promise<AuthTokens> {
+async loginAccount(wallet: WalletInfo): Promise<AuthTokens> {
       console.log('[BrowserAuth] Logging in wallet:', wallet.publicKey);
 
       // 1. Get turnstile token
