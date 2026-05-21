@@ -38,6 +38,13 @@ export class ViewerService extends EventEmitter {
   private warmedAccounts: Set<string> = new Set(); // publicKeys that have been bootstrapped this process
   private tokenInfo: TokenInfo | null = null;
   private bootstrapDisabled = false;
+  // True until we've done one full WS open→close cycle on this browser
+  // session. The very first cluster9 WS on a freshly-opened friendsPage
+  // lands in a state where the server never broadcasts back (eye-room count
+  // never arrives). A throwaway open+close primes the path; the next real
+  // connect works normally. Reset to true whenever a new BrowserSession is
+  // attached.
+  private needsClusterWarmup = true;
 
   constructor() {
     super();
@@ -45,6 +52,7 @@ export class ViewerService extends EventEmitter {
 
   setBrowserSession(session: BrowserSession | null): void {
     this.browserSession = session;
+    this.needsClusterWarmup = true;
   }
 
   getBrowserSession(): BrowserSession | null {
@@ -167,6 +175,29 @@ export class ViewerService extends EventEmitter {
     // does nothing (measured empirically).
     if (this.browserSession) {
       await this.browserSession.ensurePageSlots(concurrency);
+    }
+
+    // First run on this browser session: do a throwaway connect+disconnect
+    // with the first account so the cluster9 WS path is primed. Otherwise
+    // the very first real viewer joins silently — server never broadcasts
+    // the eye-room count back. Mirrors the user's manual stop+start workaround.
+    if (this.needsClusterWarmup && this.browserSession && order.length > 0) {
+      this.needsClusterWarmup = false;
+      const warmAccount = order.find(a => !this.connectedViewers.has(a.publicKey));
+      if (warmAccount) {
+        console.log(`[Viewer] Warming cluster9 path with ${warmAccount.publicKey.slice(0, 8)}...`);
+        const ok = await this.connectAccount(warmAccount, 0).catch(() => false);
+        if (ok) {
+          const id = this.connectedViewers.get(warmAccount.publicKey);
+          this.connectedViewers.delete(warmAccount.publicKey);
+          if (id != null) {
+            await this.browserSession.disconnectViewer(id).catch(() => {});
+          }
+          // Small gap so cluster9 sees the close before we reopen.
+          await new Promise(r => setTimeout(r, 300));
+        }
+        console.log('[Viewer] Warmup done');
+      }
     }
 
     let connected = 0;
