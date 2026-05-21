@@ -17,6 +17,198 @@ import * as os from 'os';
 import type { AuthTokens, WalletInfo } from './auth';
 import { buildSignMessage } from './auth';
 
+/**
+ * Viewer-manager script installed on every page in the context via
+ * `addInitScript`. Exposes:
+ *   - __connectViewerStart(id, tokenInfo, opts) → number (sync)
+ *       Synchronously constructs the cluster9 + friends WebSocket pair so
+ *       cookies are captured at the moment of construction. Stores a Promise
+ *       in `__pendingPromises[id]` that resolves when both handshakes open.
+ *   - __connectViewerAwait(id) → Promise<number>
+ *       Returns the stored Promise so the caller can await handshake
+ *       completion separately (without holding the cookie lock).
+ *   - __disconnectViewer(id), __disconnectAll(), __activeCount()
+ *
+ * Why split start/await? Cookies live on the BrowserContext (global). If
+ * worker A is mid-handshake while worker B sets account-B cookies, A's
+ * handshake would pick up B's identity. Splitting lets us release the
+ * cookie lock the instant `new WebSocket()` has captured cookies.
+ *
+ * Written with `function` declarations (not arrows) so esbuild/tsx don't
+ * wrap nested arrows with `__name(...)` (we shim it anyway, but plain
+ * functions are simpler when the body is stringified).
+ */
+const VIEWER_MANAGER_SCRIPT = `
+(function() {
+  if (typeof window === 'undefined' || window.__viewerManagerInstalled) return;
+  window.__viewerManagerInstalled = true;
+  window.__viewers = {};
+  window.__pendingPromises = {};
+
+  var CLUSTER_URL = 'wss://cluster9.axiom.trade/';
+  var FRIENDS_URL = 'wss://friends.axiom.trade/ws';
+
+  window.__connectViewerStart = function(id, tokenInfo, opts) {
+    opts = opts || {};
+    var pingJitterMs = typeof opts.pingJitterMs === 'number' ? opts.pingJitterMs : Math.floor(Math.random() * 1000);
+    var pairAddress = tokenInfo.pairAddress;
+
+    var resolveFn, rejectFn;
+    var promise = new Promise(function(res, rej) { resolveFn = res; rejectFn = rej; });
+    window.__pendingPromises[id] = promise;
+
+    var clusterWs = new WebSocket(CLUSTER_URL);
+    var friendsWs = new WebSocket(FRIENDS_URL);
+    var timeout = setTimeout(function() { fail('WS timeout'); }, 12000);
+
+    var tokenRooms = [
+      't:'  + pairAddress,
+      'f:'  + pairAddress,
+      'td:' + pairAddress,
+      's:'  + pairAddress,
+      'b-'  + pairAddress,
+      'e-'  + pairAddress
+    ];
+
+    var clusterOpen = false, friendsOpen = false;
+    var settled = false;
+    var friendsPingTimer = 0, clusterPingTimer = 0, friendsPingStart = 0;
+    var tStart = Date.now();
+
+    function killBoth() {
+      try { clusterWs.close(); } catch (_) {}
+      try { friendsWs.close(); } catch (_) {}
+    }
+    function fail(why) {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      killBoth();
+      rejectFn(new Error(why));
+    }
+    function tryResolve() {
+      if (!clusterOpen || !friendsOpen || settled) return;
+      settled = true;
+      clearTimeout(timeout);
+
+      friendsPingStart = setTimeout(function() {
+        friendsPingTimer = setInterval(function() {
+          if (friendsWs.readyState === 1) friendsWs.send('.');
+          else clearInterval(friendsPingTimer);
+        }, 1000);
+      }, pingJitterMs);
+
+      clusterPingTimer = setInterval(function() {
+        if (clusterWs.readyState === 1) clusterWs.send(JSON.stringify({ method: 'ping' }));
+        else clearInterval(clusterPingTimer);
+      }, 30000 + Math.floor(Math.random() * 5000));
+
+      window.__viewers[id] = {
+        clusterWs: clusterWs, friendsWs: friendsWs,
+        friendsPingTimer: friendsPingTimer, clusterPingTimer: clusterPingTimer, friendsPingStart: friendsPingStart,
+        pairAddress: pairAddress
+      };
+      resolveFn(id);
+    }
+
+    clusterWs.onopen = function() {
+      for (var i = 0; i < tokenRooms.length; i++) {
+        clusterWs.send(JSON.stringify({ action: 'join', room: tokenRooms[i] }));
+      }
+      console.log('[viewer ' + id + '] cluster9 joined ' + tokenRooms.length + ' rooms (e-' + pairAddress.slice(0, 6) + '...)');
+      clusterOpen = true;
+      tryResolve();
+    };
+    clusterWs.onmessage = function(e) {
+      try {
+        var msg = JSON.parse(e.data);
+        if (msg.room === 'e-' + pairAddress) {
+          console.log('[viewer ' + id + '] eye-room count = ' + msg.content);
+        }
+      } catch (_) {}
+    };
+    clusterWs.onerror = function() {
+      console.log('[viewer ' + id + '] cluster9 error event');
+    };
+    clusterWs.onclose = function(e) {
+      var dt = Date.now() - tStart;
+      console.log('[viewer ' + id + '] cluster9 closed code=' + e.code + ' clean=' + e.wasClean + ' reason="' + (e.reason || '') + '" after ' + dt + 'ms');
+      var v = window.__viewers[id];
+      if (v) {
+        clearTimeout(v.friendsPingStart);
+        clearInterval(v.friendsPingTimer);
+        clearInterval(v.clusterPingTimer);
+        delete window.__viewers[id];
+      }
+      if (!settled) fail('cluster9 closed code=' + e.code + (e.reason ? ' reason=' + e.reason : ''));
+    };
+
+    friendsWs.onopen = function() {
+      friendsWs.send(JSON.stringify({
+        type: 'pageUpdate',
+        page: 'meme',
+        subpage: tokenInfo,
+        chain: 'sol'
+      }));
+      friendsOpen = true;
+      tryResolve();
+    };
+    friendsWs.onmessage = function(e) {
+      if (e.data === '.') return;
+      try {
+        var msg = JSON.parse(e.data);
+        if (msg.type === 'ping') friendsWs.send(JSON.stringify({ type: 'pong' }));
+      } catch (_) {}
+    };
+    friendsWs.onerror = function() {
+      console.log('[viewer ' + id + '] friends error event');
+    };
+    friendsWs.onclose = function(e) {
+      var dt = Date.now() - tStart;
+      console.log('[viewer ' + id + '] friends closed code=' + e.code + ' clean=' + e.wasClean + ' reason="' + (e.reason || '') + '" after ' + dt + 'ms');
+      if (!settled) fail('friends closed code=' + e.code + (e.reason ? ' reason=' + e.reason : ''));
+    };
+
+    return id;
+  };
+
+  window.__connectViewerAwait = function(id) {
+    var p = window.__pendingPromises[id];
+    delete window.__pendingPromises[id];
+    return p;
+  };
+
+  window.__disconnectViewer = function(id) {
+    var v = window.__viewers[id];
+    if (!v) return;
+    clearTimeout(v.friendsPingStart);
+    clearInterval(v.friendsPingTimer);
+    clearInterval(v.clusterPingTimer);
+    try { v.clusterWs.close(); } catch (_) {}
+    try { v.friendsWs.close(); } catch (_) {}
+    delete window.__viewers[id];
+  };
+
+  window.__disconnectAll = function() {
+    var keys = Object.keys(window.__viewers);
+    for (var i = 0; i < keys.length; i++) {
+      var v = window.__viewers[keys[i]];
+      clearTimeout(v.friendsPingStart);
+      clearInterval(v.friendsPingTimer);
+      clearInterval(v.clusterPingTimer);
+      try { v.clusterWs.close(); } catch (_) {}
+      try { v.friendsWs.close(); } catch (_) {}
+    }
+    window.__viewers = {};
+  };
+
+  window.__activeCount = function() {
+    var vals = Object.keys(window.__viewers).map(function(k) { return window.__viewers[k]; });
+    return vals.filter(function(v) { return v.clusterWs.readyState === 1; }).length;
+  };
+})();
+`;
+
 const TURNSTILE_SITEKEY = '0x4AAAAAACb1mthF4yHVUfUh';
 const API_BASE = 'https://api2.axiom.trade';
 const DEBUG_PORT = 9222;
@@ -33,7 +225,15 @@ export interface BrowserSession {
    */
   bootstrapSession(walletAddress: string, accessToken: string, refreshToken: string): Promise<void>;
   probeEucalyptus(pairAddress: string, accessToken?: string, refreshToken?: string): Promise<void>;
-  connectViewer(accessToken: string, refreshToken: string, tokenInfo: any, pingJitterMs?: number): Promise<number>;
+  /**
+   * Refresh the access token via Axiom's /refresh-access-token endpoint.
+   * Returns new AuthTokens (the refresh token may rotate too). Much faster
+   * than a full login since it doesn't need Turnstile or wallet signing.
+   */
+  refreshAccount(refreshToken: string): Promise<AuthTokens>;
+  /** Grow the friendsPage pool to at least `n` pages so workers can run in parallel. */
+  ensurePageSlots(n: number): Promise<void>;
+  connectViewer(accessToken: string, refreshToken: string, tokenInfo: any, pingJitterMs?: number, slotIndex?: number): Promise<number>;
   disconnectViewer(viewerId: number): Promise<void>;
   disconnectAllViewers(): Promise<void>;
   getActiveViewerCount(): Promise<number>;
@@ -189,6 +389,8 @@ export async function openBrowserSession(): Promise<BrowserSession> {
       }
     `,
   });
+  // Viewer manager auto-installs on every page navigation in this context.
+  await context.addInitScript({ content: VIEWER_MANAGER_SCRIPT });
 
   // Open a single api2 tab for all API calls
   const apiPage = await context.newPage();
@@ -196,223 +398,95 @@ export async function openBrowserSession(): Promise<BrowserSession> {
   await apiPage.waitForTimeout(1000);
   console.log('[BrowserAuth] API page ready');
 
-  // Use axiom.trade as origin page for WS connections (friends server checks Origin header)
-  const friendsPage = await context.newPage();
-  await friendsPage.goto('https://axiom.trade', { waitUntil: 'load', timeout: 30000 }).catch(() => {});
-  await friendsPage.waitForTimeout(1000);
-  console.log('[BrowserAuth] Axiom page ready for WS connections');
-  friendsPage.on('console', msg => {
-    const t = msg.text();
-    if (t.startsWith('[viewer ') || t.startsWith('[viewer]')) console.log('[Browser]', t);
-  });
-
-  // CDP-level WS frame sniffing + handshake/close diagnostics.
-  // Tracking URL per-requestId lets us tag every log line with which server
-  // it came from (cluster9 vs friends) and surface the handshake HTTP status
-  // — which is what tells us "rejected by server" vs "TCP refused" vs "CF".
-  const cdp = await context.newCDPSession(friendsPage);
-  await cdp.send('Network.enable');
+  // Page pool for WS viewer handshakes. Playwright/Chrome serializes
+  // page.evaluate calls on the same page — a single shared page is the
+  // throughput chokepoint at any concurrency > 1. Multiple pages let
+  // evaluates run truly in parallel.
+  //
+  // Pool grows lazily via ensurePageSlots(n). Cookies are still on the
+  // shared BrowserContext, so the addCookies → start → clearCookies
+  // critical section is serialized by a tiny in-process mutex (~10-30ms).
+  // After WS objects are constructed (synchronous), cookies are captured
+  // and the lock is released.
   const wsUrlByReq = new Map<string, string>();
   function tag(reqId: string): string {
     const u = wsUrlByReq.get(reqId) || reqId;
     return u.includes('cluster9') ? 'cluster9' : u.includes('friends') ? 'friends' : u;
   }
-  cdp.on('Network.webSocketCreated', ({ requestId, url }: any) => {
-    wsUrlByReq.set(requestId, url);
-  });
-  cdp.on('Network.webSocketHandshakeResponseReceived', ({ requestId, response }: any) => {
-    const status = response?.status;
-    const statusText = response?.statusText;
-    if (status !== 101) {
-      console.log(`[CDP] ${tag(requestId)} handshake ${status} ${statusText || ''}`);
-    }
-  });
-  cdp.on('Network.webSocketFrameSent', ({ requestId, response }) => {
-    if (response.payloadData) console.log(`[CDP→${tag(requestId)}]`, response.payloadData.slice(0, 300));
-  });
-  cdp.on('Network.webSocketFrameReceived', ({ requestId, response }) => {
-    if (response.payloadData) console.log(`[CDP←${tag(requestId)}]`, response.payloadData.slice(0, 300));
-  });
-  cdp.on('Network.webSocketFrameError', ({ requestId, errorMessage }: any) => {
-    console.log(`[CDP] ${tag(requestId)} frame error: ${errorMessage}`);
-  });
-  cdp.on('Network.webSocketClosed', ({ requestId }) => {
-    console.log(`[CDP] ${tag(requestId)} closed`);
-    wsUrlByReq.delete(requestId);
-  });
-
-  // Inject WS viewer manager into friends page.
-  //
-  // Protocol (reverse-engineered from a real client probe — see probe-logs/):
-  //   - cluster9.axiom.trade is the room-pubsub server. Joining
-  //     room "e-{pairAddress}" both registers the viewer AND subscribes
-  //     to the live count broadcast. Eucalyptus is NOT used for this.
-  //   - friends.axiom.trade gets one "pageUpdate" with the FULL token info
-  //     as `subpage` (not a string). Keepalive is "." every 1s.
-  //   - cluster9 keepalive is {"method":"ping"} every 30s.
-  await friendsPage.evaluate(`(() => {
-    window.__viewers = {};
-    window.__nextId = 0;
-
-    const CLUSTER_URL = 'wss://cluster9.axiom.trade/';
-    const FRIENDS_URL = 'wss://friends.axiom.trade/ws';
-
-    window.__connectViewer = (tokenInfo, opts) => {
-      opts = opts || {};
-      const pingJitterMs = typeof opts.pingJitterMs === 'number' ? opts.pingJitterMs : Math.floor(Math.random() * 1000);
-      return new Promise((resolve, reject) => {
-        const id = ++window.__nextId;
-        const pairAddress = tokenInfo.pairAddress;
-
-        const clusterWs = new WebSocket(CLUSTER_URL);
-        const friendsWs = new WebSocket(FRIENDS_URL);
-        const timeout = setTimeout(() => fail('WS timeout'), 12000);
-
-        // Rooms the real client joins on the meme page. Joining the full set
-        // makes us look like a normal viewer; "e-" is the one that bumps the
-        // count. Order matches the real client.
-        const tokenRooms = [
-          't:'  + pairAddress,
-          'f:'  + pairAddress,
-          'td:' + pairAddress,
-          's:'  + pairAddress,
-          'b-'  + pairAddress,
-          'e-'  + pairAddress,
-        ];
-
-        let clusterOpen = false, friendsOpen = false;
-        let settled = false;
-        let friendsPingTimer = 0, clusterPingTimer = 0, friendsPingStart = 0;
-        const tStart = Date.now();
-        function killBoth() {
-          try { clusterWs.close(); } catch (_) {}
-          try { friendsWs.close(); } catch (_) {}
-        }
-        function fail(why) {
-          if (settled) return;
-          settled = true;
-          clearTimeout(timeout);
-          killBoth();
-          reject(new Error(why));
-        }
-        function tryResolve() {
-          if (!clusterOpen || !friendsOpen || settled) return;
-          settled = true;
-          clearTimeout(timeout);
-
-          // friends keepalive: "." every 1s, but offset start by jitter so
-          // multiple viewer pings don't all fire on the same wall-clock tick.
-          friendsPingStart = setTimeout(() => {
-            friendsPingTimer = setInterval(() => {
-              if (friendsWs.readyState === 1) friendsWs.send('.');
-              else clearInterval(friendsPingTimer);
-            }, 1000);
-          }, pingJitterMs);
-
-          // cluster9 keepalive: {"method":"ping"} every 30s, also offset.
-          clusterPingTimer = setInterval(() => {
-            if (clusterWs.readyState === 1) clusterWs.send(JSON.stringify({ method: 'ping' }));
-            else clearInterval(clusterPingTimer);
-          }, 30000 + Math.floor(Math.random() * 5000));
-
-          window.__viewers[id] = {
-            clusterWs, friendsWs,
-            friendsPingTimer, clusterPingTimer, friendsPingStart,
-            pairAddress,
-          };
-          resolve(id);
-        }
-
-        clusterWs.onopen = () => {
-          for (const room of tokenRooms) {
-            clusterWs.send(JSON.stringify({ action: 'join', room }));
-          }
-          console.log('[viewer ' + id + '] cluster9 joined ' + tokenRooms.length + ' rooms (e-' + pairAddress.slice(0, 6) + '...)');
-          clusterOpen = true;
-          tryResolve();
-        };
-        clusterWs.onmessage = (e) => {
-          // Surface viewer-count broadcasts so we can confirm we're being counted
-          try {
-            const msg = JSON.parse(e.data);
-            if (msg.room === 'e-' + pairAddress) {
-              console.log('[viewer ' + id + '] eye-room count = ' + msg.content);
-            }
-          } catch {}
-        };
-        clusterWs.onerror = () => {
-          // onerror has no useful detail in browsers; rely on onclose for reason.
-          console.log('[viewer ' + id + '] cluster9 error event');
-        };
-        clusterWs.onclose = (e) => {
-          const dt = Date.now() - tStart;
-          console.log('[viewer ' + id + '] cluster9 closed code=' + e.code + ' clean=' + e.wasClean + ' reason="' + (e.reason || '') + '" after ' + dt + 'ms');
-          const v = window.__viewers[id];
-          if (v) {
-            clearTimeout(v.friendsPingStart);
-            clearInterval(v.friendsPingTimer);
-            clearInterval(v.clusterPingTimer);
-            delete window.__viewers[id];
-          }
-          if (!settled) fail('cluster9 closed code=' + e.code + (e.reason ? ' reason=' + e.reason : ''));
-        };
-
-        friendsWs.onopen = () => {
-          // Real client sends pageUpdate with the FULL token info as subpage.
-          friendsWs.send(JSON.stringify({
-            type: 'pageUpdate',
-            page: 'meme',
-            subpage: tokenInfo,
-            chain: 'sol',
-          }));
-          friendsOpen = true;
-          tryResolve();
-        };
-        friendsWs.onmessage = (e) => {
-          if (e.data === '.') return; // friends "." pong
-          try {
-            const msg = JSON.parse(e.data);
-            if (msg.type === 'ping') friendsWs.send(JSON.stringify({ type: 'pong' }));
-          } catch {}
-        };
-        friendsWs.onerror = () => {
-          console.log('[viewer ' + id + '] friends error event');
-        };
-        friendsWs.onclose = (e) => {
-          const dt = Date.now() - tStart;
-          console.log('[viewer ' + id + '] friends closed code=' + e.code + ' clean=' + e.wasClean + ' reason="' + (e.reason || '') + '" after ' + dt + 'ms');
-          if (!settled) fail('friends closed code=' + e.code + (e.reason ? ' reason=' + e.reason : ''));
-        };
-      });
-    };
-
-    window.__disconnectViewer = (id) => {
-      const v = window.__viewers[id];
-      if (!v) return;
-      clearTimeout(v.friendsPingStart);
-      clearInterval(v.friendsPingTimer);
-      clearInterval(v.clusterPingTimer);
-      try { v.clusterWs.close(); } catch {}
-      try { v.friendsWs.close(); } catch {}
-      delete window.__viewers[id];
-    };
-
-    window.__disconnectAll = () => {
-      for (const id of Object.keys(window.__viewers)) {
-        const v = window.__viewers[id];
-        clearTimeout(v.friendsPingStart);
-        clearInterval(v.friendsPingTimer);
-        clearInterval(v.clusterPingTimer);
-        try { v.clusterWs.close(); } catch {}
-        try { v.friendsWs.close(); } catch {}
+  async function attachCdpListenersTo(p: Page): Promise<void> {
+    const cdp = await context.newCDPSession(p);
+    await cdp.send('Network.enable');
+    cdp.on('Network.webSocketCreated', ({ requestId, url }: any) => {
+      wsUrlByReq.set(requestId, url);
+    });
+    cdp.on('Network.webSocketHandshakeResponseReceived', ({ requestId, response }: any) => {
+      const status = response?.status;
+      const statusText = response?.statusText;
+      if (status !== 101) {
+        console.log(`[CDP] ${tag(requestId)} handshake ${status} ${statusText || ''}`);
       }
-      window.__viewers = {};
-    };
+    });
+    cdp.on('Network.webSocketFrameSent', ({ requestId, response }) => {
+      if (response.payloadData) console.log(`[CDP→${tag(requestId)}]`, response.payloadData.slice(0, 300));
+    });
+    cdp.on('Network.webSocketFrameReceived', ({ requestId, response }) => {
+      if (response.payloadData) console.log(`[CDP←${tag(requestId)}]`, response.payloadData.slice(0, 300));
+    });
+    cdp.on('Network.webSocketFrameError', ({ requestId, errorMessage }: any) => {
+      console.log(`[CDP] ${tag(requestId)} frame error: ${errorMessage}`);
+    });
+    cdp.on('Network.webSocketClosed', ({ requestId }) => {
+      console.log(`[CDP] ${tag(requestId)} closed`);
+      wsUrlByReq.delete(requestId);
+    });
+  }
 
-    window.__activeCount = () => {
-      return Object.values(window.__viewers).filter(v => v.clusterWs.readyState === 1).length;
-    };
-  })()`);
+  async function setupFriendsPage(): Promise<Page> {
+    const p = await context.newPage();
+    await p.goto('https://axiom.trade', { waitUntil: 'load', timeout: 30000 }).catch(() => {});
+    await p.waitForTimeout(500);
+    p.on('console', msg => {
+      const t = msg.text();
+      if (t.startsWith('[viewer ') || t.startsWith('[viewer]')) console.log('[Browser]', t);
+    });
+    await attachCdpListenersTo(p);
+    return p;
+  }
+
+  const friendsPages: Page[] = [];
+  friendsPages.push(await setupFriendsPage());
+  const friendsPage = friendsPages[0]; // primary for non-pool operations (resolvePairFromCa, bootstrapSession)
+  console.log('[BrowserAuth] Axiom page ready for WS connections');
+
+  async function ensurePageSlots(n: number): Promise<void> {
+    while (friendsPages.length < n) {
+      friendsPages.push(await setupFriendsPage());
+      console.log(`[BrowserAuth] friendsPage pool grew to ${friendsPages.length}`);
+    }
+  }
+
+  // Global cookie mutex (promise-chain). Held only across:
+  //   addCookies → page.evaluate('__connectViewerStart(...)') → clearCookies
+  // Total ~10-30ms. Handshake (~700ms) runs outside the lock.
+  let cookieChain: Promise<void> = Promise.resolve();
+  function withCookieLock<T>(fn: () => Promise<T>): Promise<T> {
+    const prev = cookieChain;
+    let release!: () => void;
+    cookieChain = new Promise<void>(r => { release = r; });
+    return prev.then(async () => {
+      try { return await fn(); }
+      finally { release(); }
+    });
+  }
+
+  // Track which page each viewer was created on, so disconnect routes correctly.
+  const viewerToPage = new Map<number, Page>();
+  let nextViewerId = 0;
+
+  // Viewer manager is auto-installed on every page via context.addInitScript
+  // (see VIEWER_MANAGER_SCRIPT at top of file). Each friendsPage in the pool
+  // already has __connectViewerStart / __connectViewerAwait / __disconnectViewer
+  // / __disconnectAll / __activeCount available on window — no inline eval needed.
 
   async function getTurnstileToken(): Promise<string> {
     const token = await page.evaluate(`
@@ -535,6 +609,71 @@ async loginAccount(wallet: WalletInfo): Promise<AuthTokens> {
       };
     },
 
+    async refreshAccount(oldRefreshToken: string): Promise<AuthTokens> {
+      // POST /refresh-access-token from the axiom.trade origin. The endpoint
+      // reads auth-refresh-token from the cookie jar (we set it on the
+      // context first) and responds with Set-Cookie for the new access token
+      // (and usually a rotated refresh token). CORS allow-origin is
+      // https://axiom.trade, so the fetch MUST run on friendsPage.
+      const domains = ['cluster9.axiom.trade', 'friends.axiom.trade', '.axiom.trade'];
+      const cookiesToAdd: { name: string; value: string; domain: string; path: string }[] = [];
+      for (const domain of domains) {
+        cookiesToAdd.push({ name: 'auth-refresh-token', value: oldRefreshToken, domain, path: '/' });
+      }
+      await context.addCookies(cookiesToAdd);
+
+      try {
+        const result = await friendsPage.evaluate(async () => {
+          try {
+            const r = await fetch('https://api9.axiom.trade/refresh-access-token', {
+              method: 'POST',
+              credentials: 'include',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({}),
+            });
+            const text = await r.text();
+            return { ok: r.ok, status: r.status, body: text.slice(0, 500) };
+          } catch (e: any) {
+            return { ok: false, status: 0, body: 'fetch error: ' + (e?.message || String(e)) };
+          }
+        });
+
+        if (!result.ok) {
+          throw new Error(`refresh-access-token ${result.status}: ${result.body}`);
+        }
+
+        // Pull the rotated tokens out of the context cookie jar (set by Set-Cookie).
+        await friendsPage.waitForTimeout(50); // tiny pause to let Set-Cookie commit
+        const browserCookies = await context.cookies();
+        let accessToken = '';
+        let refreshToken = '';
+        const parts: string[] = [];
+        const seen = new Set<string>();
+        for (const c of browserCookies) {
+          if (c.name === 'auth-access-token') accessToken = c.value;
+          if (c.name === 'auth-refresh-token') refreshToken = c.value;
+          if (c.name.startsWith('auth-') || c.name === 'cf_clearance' || c.name === '__cf_bm') {
+            if (!seen.has(c.name)) {
+              seen.add(c.name);
+              parts.push(`${c.name}=${c.value}`);
+            }
+          }
+        }
+        if (!accessToken) {
+          throw new Error('refresh-access-token returned 200 but no new auth-access-token cookie set');
+        }
+        console.log(`[BrowserAuth] Refresh OK, new access token ${accessToken.slice(0, 20)}... (refresh ${refreshToken ? 'rotated' : 'kept'})`);
+        return {
+          accessToken,
+          refreshToken: refreshToken || oldRefreshToken,
+          cookies: parts.join('; '),
+        };
+      } finally {
+        await context.clearCookies({ name: 'auth-access-token' });
+        await context.clearCookies({ name: 'auth-refresh-token' });
+      }
+    },
+
     async bootstrapSession(walletAddress: string, accessToken: string, refreshToken: string): Promise<void> {
       // Mirror the HTTP burst the real React client fires on first page load.
       // Empirically: viewer counts drop accounts that haven't called these
@@ -588,7 +727,16 @@ async loginAccount(wallet: WalletInfo): Promise<AuthTokens> {
       }
     },
 
-    async connectViewer(accessToken: string, refreshToken: string, tokenInfo: any, pingJitterMs?: number): Promise<number> {
+    async ensurePageSlots(n: number): Promise<void> {
+      await ensurePageSlots(n);
+    },
+
+    async connectViewer(accessToken: string, refreshToken: string, tokenInfo: any, pingJitterMs?: number, slotIndex: number = 0): Promise<number> {
+      // Pick a page from the pool; default to slot 0 for callers that don't
+      // care. viewer-service passes its worker index so each worker owns a
+      // distinct page → evaluates run truly in parallel.
+      const page = friendsPages[slotIndex % friendsPages.length];
+
       // Set this account's auth cookies on every axiom subdomain we touch.
       // The WS handshake reads cookies from the matching domain, so the
       // auth-access-token must be present for cluster9, friends, AND
@@ -598,27 +746,39 @@ async loginAccount(wallet: WalletInfo): Promise<AuthTokens> {
         'friends.axiom.trade',
         '.axiom.trade',
       ];
-      const cookiesToAdd = [];
+      const cookiesToAdd: { name: string; value: string; domain: string; path: string }[] = [];
       for (const domain of domains) {
         cookiesToAdd.push(
           { name: 'auth-access-token', value: accessToken, domain, path: '/' },
           { name: 'auth-refresh-token', value: refreshToken, domain, path: '/' },
         );
       }
-      await context.addCookies(cookiesToAdd);
 
-      // Create WS connection from the browser (uses current cookies for handshake)
       const opts = { pingJitterMs: typeof pingJitterMs === 'number' ? pingJitterMs : Math.floor(Math.random() * 1000) };
-      const viewerId = await friendsPage.evaluate(
-        `window.__connectViewer(${JSON.stringify(tokenInfo)}, ${JSON.stringify(opts)})`
-      ) as number;
+      const viewerId = ++nextViewerId;
 
-      // Clear auth cookies so the next account's handshake doesn't reuse them.
-      // Existing WS connections keep the identity captured at handshake time.
-      await context.clearCookies({ name: 'auth-access-token' });
-      await context.clearCookies({ name: 'auth-refresh-token' });
+      // Cookie-locked critical section: addCookies → synchronously construct
+      // the WS pair (so cookies are captured) → clear cookies. Lock is held
+      // ~10-30ms total. The handshake (~700ms) runs OUTSIDE the lock, in
+      // parallel across pool slots.
+      const tStart = Date.now();
+      await withCookieLock(async () => {
+        await context.addCookies(cookiesToAdd);
+        await page.evaluate(
+          `window.__connectViewerStart(${viewerId}, ${JSON.stringify(tokenInfo)}, ${JSON.stringify(opts)})`
+        );
+        await context.clearCookies({ name: 'auth-access-token' });
+        await context.clearCookies({ name: 'auth-refresh-token' });
+      });
+      const tStartDone = Date.now();
 
-      console.log(`[BrowserAuth] Viewer ${viewerId} connected (acct token=${accessToken.slice(0, 12)}..., pingJitter=${opts.pingJitterMs}ms)`);
+      // Wait for both WS handshakes to complete (no cookie lock held).
+      await page.evaluate(`window.__connectViewerAwait(${viewerId})`);
+      const tAwaitDone = Date.now();
+      console.log(`[Timing] slot=${slotIndex} cookieLocked=${tStartDone - tStart}ms handshake=${tAwaitDone - tStartDone}ms`);
+
+      viewerToPage.set(viewerId, page);
+      console.log(`[BrowserAuth] Viewer ${viewerId} connected on slot ${slotIndex} (acct token=${accessToken.slice(0, 12)}..., pingJitter=${opts.pingJitterMs}ms)`);
       return viewerId;
     },
 
@@ -653,16 +813,20 @@ async loginAccount(wallet: WalletInfo): Promise<AuthTokens> {
     },
 
     async disconnectViewer(viewerId: number): Promise<void> {
-      await friendsPage.evaluate(`window.__disconnectViewer(${viewerId})`);
+      const page = viewerToPage.get(viewerId) ?? friendsPage;
+      await page.evaluate(`window.__disconnectViewer(${viewerId})`);
+      viewerToPage.delete(viewerId);
     },
 
     async disconnectAllViewers(): Promise<void> {
-      await friendsPage.evaluate('window.__disconnectAll()');
+      await Promise.all(friendsPages.map(p => p.evaluate('window.__disconnectAll()')));
+      viewerToPage.clear();
       console.log('[BrowserAuth] All viewers disconnected');
     },
 
     async getActiveViewerCount(): Promise<number> {
-      return await friendsPage.evaluate('window.__activeCount()') as number;
+      const counts = await Promise.all(friendsPages.map(p => p.evaluate('window.__activeCount()') as Promise<number>));
+      return counts.reduce((a, b) => a + b, 0);
     },
 
     async getCfData(): Promise<{ cfCookies: string; userAgent: string }> {

@@ -30,6 +30,7 @@ interface Props {
 const BASE58 = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
 const DEFAULT_MIN_GAP_MS = 20;
 const DEFAULT_MAX_GAP_MS = 50;
+const DEFAULT_CONCURRENCY = 1;
 
 /**
  * Heuristic: pump.fun token CAs always end with "pump"; pair addresses don't.
@@ -70,6 +71,7 @@ export function RunTab({ onLog, refreshTick, onAccountsChanged }: Props) {
   const [pasting, setPasting] = useState(false);
   const [minGapMs, setMinGapMs] = useState<number>(DEFAULT_MIN_GAP_MS);
   const [maxGapMs, setMaxGapMs] = useState<number>(DEFAULT_MAX_GAP_MS);
+  const [concurrency, setConcurrency] = useState<number>(DEFAULT_CONCURRENCY);
   const [bootstrapDisabled, setBootstrapDisabled] = useState<boolean>(true);
 
   const fetchAccounts = useCallback(async () => {
@@ -170,6 +172,7 @@ export function RunTab({ onLog, refreshTick, onAccountsChanged }: Props) {
           pairAddress: t.pairAddress,
           minGapMs: safeMin,
           maxGapMs: safeMax,
+          concurrency: Math.max(1, Math.floor(concurrency)),
           bootstrapDisabled,
         }),
       });
@@ -307,6 +310,25 @@ export function RunTab({ onLog, refreshTick, onAccountsChanged }: Props) {
             Default
           </Button>
         </div>
+      </div>
+
+      <div className="flex flex-col gap-2">
+        <label className="text-xs font-medium uppercase tracking-wider text-muted-foreground">
+          Concurrent handshakes (1 = serial)
+        </label>
+        <Input
+          type="number"
+          min={1}
+          step={1}
+          value={Number.isFinite(concurrency) ? concurrency : ""}
+          onChange={(e) => {
+            const v = e.target.value === "" ? 1 : Number(e.target.value);
+            setConcurrency(Number.isFinite(v) ? Math.max(1, Math.floor(v)) : 1);
+          }}
+          disabled={running || busy}
+          className="font-mono"
+          aria-label="Concurrent handshakes"
+        />
       </div>
 
       <label className="flex items-center gap-2 text-xs text-muted-foreground">

@@ -331,6 +331,89 @@ export class AccountManager {
     return loadWalletFromPrivateKey(secret);
   }
 
+  /**
+   * Refresh just the access token via /refresh-access-token. Fast — no
+   * Turnstile, no signing. Falls back to false if the stored refresh token
+   * is missing or the endpoint rejects it; caller can then escalate to a
+   * full re-login.
+   */
+  async refreshAccount(publicKey: string, browserSession: BrowserSession): Promise<boolean> {
+    const tokens = this.readTokens(publicKey);
+    if (!tokens?.refreshToken) {
+      console.log(`[AccountManager] ${publicKey.slice(0, 8)}: no refresh token — needs full login`);
+      return false;
+    }
+    try {
+      const fresh = await browserSession.refreshAccount(tokens.refreshToken);
+      this.writeTokens(publicKey, fresh);
+      console.log(`[AccountManager] ${publicKey.slice(0, 8)}... refreshed`);
+      return true;
+    } catch (err: any) {
+      console.error(`[AccountManager] Refresh failed for ${publicKey.slice(0, 8)}: ${err.message}`);
+      return false;
+    }
+  }
+
+  /**
+   * Bulk refresh. Reuses the open browser session if one exists; otherwise
+   * spins one up (which costs a CF challenge once). Returns counts only.
+   */
+  async refreshAccounts(
+    targets: string[] | undefined,
+    onProgress?: (done: number, total: number, message: string) => void,
+  ): Promise<{ success: number; total: number }> {
+    const { openBrowserSession } = await import('../browser-auth');
+    this.refreshKeys();
+    this.stopRelogin = false;
+
+    let pool: string[];
+    if (targets && targets.length > 0) {
+      pool = targets.filter(k => this.keyCache.has(k));
+    } else {
+      const selected = this.readSelection();
+      pool = selected.size > 0
+        ? [...this.keyCache.keys()].filter(k => selected.has(k))
+        : [...this.keyCache.keys()];
+    }
+
+    const total = pool.length;
+    let success = 0;
+    if (total === 0) {
+      onProgress?.(0, 0, 'No accounts selected');
+      return { success, total };
+    }
+
+    let session = this.reloginSession;
+    let opened = false;
+    if (!session) {
+      onProgress?.(0, total, 'Opening browser — complete the Cloudflare challenge...');
+      session = await openBrowserSession();
+      this.reloginSession = session;
+      opened = true;
+    }
+
+    onProgress?.(0, total, `Refreshing ${total} account(s)...`);
+    for (let i = 0; i < pool.length; i++) {
+      if (this.stopRelogin) {
+        onProgress?.(i, total, 'Stopped by user');
+        break;
+      }
+      const pk = pool[i];
+      onProgress?.(i, total, `Refreshing ${pk.slice(0, 8)}...`);
+      const ok = await this.refreshAccount(pk, session).catch(() => false);
+      if (ok) success++;
+      const done = i + 1;
+      onProgress?.(done, total, ok
+        ? `${pk.slice(0, 8)} OK (${success}/${done})`
+        : `${pk.slice(0, 8)} FAIL (${success}/${done})`);
+    }
+
+    // Leave session open if WE opened it AND viewers might use it. Caller
+    // can close via stopReloginAll if they want to discard it.
+    void opened;
+    return { success, total };
+  }
+
   async reloginAccount(publicKey: string, browserSession?: BrowserSession): Promise<boolean> {
     const wallet = this.walletFor(publicKey);
     if (!wallet) {

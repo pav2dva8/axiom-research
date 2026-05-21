@@ -182,6 +182,35 @@ async function handleApi(
       return;
     }
 
+    // POST /api/accounts/refresh  { publicKeys?: string[] }
+    // Lighter-weight than relogin: just hits /refresh-access-token.
+    if (pathname === "/api/accounts/refresh" && req.method === "POST") {
+      const body = await readBody(req).catch(() => "");
+      let targets: string[] | undefined;
+      try {
+        if (body) {
+          const parsed = JSON.parse(body);
+          if (Array.isArray(parsed.publicKeys)) targets = parsed.publicKeys;
+        }
+      } catch {}
+
+      res.writeHead(200);
+      const result = await accountManager.refreshAccounts(
+        targets,
+        (done, total, message) => {
+          broadcast("relogin-progress", { done, total, message });
+        },
+      );
+
+      const session = accountManager.getBrowserSession();
+      if (session) viewerService.setBrowserSession(session);
+
+      broadcast("accounts-changed", {});
+      broadcastStatus();
+      res.end(JSON.stringify({ success: result.success, total: result.total }));
+      return;
+    }
+
     // POST /api/resolve  { input }  — accepts CA or pair address
     if (pathname === "/api/resolve" && req.method === "POST") {
       const { input } = JSON.parse(await readBody(req));
@@ -254,10 +283,10 @@ async function handleApi(
       return;
     }
 
-    // POST /api/viewers/start  { pairAddress, minGapMs?, maxGapMs?, bootstrapDisabled? }
+    // POST /api/viewers/start  { pairAddress, minGapMs?, maxGapMs?, bootstrapDisabled?, concurrency? }
     if (pathname === "/api/viewers/start" && req.method === "POST") {
       const body = JSON.parse(await readBody(req));
-      const { pairAddress, minGapMs, maxGapMs, bootstrapDisabled } = body ?? {};
+      const { pairAddress, minGapMs, maxGapMs, bootstrapDisabled, concurrency } = body ?? {};
       if (typeof pairAddress !== "string" || !pairAddress.trim()) {
         res.writeHead(400);
         res.end(JSON.stringify({ error: "pairAddress required" }));
@@ -265,6 +294,7 @@ async function handleApi(
       }
       const minGapValid = typeof minGapMs === "number" && Number.isFinite(minGapMs) && minGapMs >= 0;
       const maxGapValid = typeof maxGapMs === "number" && Number.isFinite(maxGapMs) && maxGapMs >= 0;
+      const concurrencyValid = typeof concurrency === "number" && Number.isFinite(concurrency) && concurrency >= 1;
 
       await ensureBrowserSession();
 
@@ -300,6 +330,7 @@ async function handleApi(
       const connected = await viewerService.connectAll(accounts, {
         ...(minGapValid ? { minGapMs } : {}),
         ...(maxGapValid ? { maxGapMs } : {}),
+        ...(concurrencyValid ? { concurrency } : {}),
         bootstrapDisabled: bootstrapDisabled === true,
       });
 

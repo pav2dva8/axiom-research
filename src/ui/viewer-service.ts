@@ -19,6 +19,8 @@ export interface ConnectAllOptions {
   maxGapMs?: number;
   shuffle?: boolean;
   bootstrapDisabled?: boolean;
+  /** Max number of viewer handshakes in flight at the same time. Default 1 (serial). */
+  concurrency?: number;
 }
 
 function shuffle<T>(arr: T[]): T[] {
@@ -86,7 +88,7 @@ export class ViewerService extends EventEmitter {
     return this.tokenInfo;
   }
 
-  private async connectAccount(account: LoadedAccount): Promise<boolean> {
+  private async connectAccount(account: LoadedAccount, slotIndex: number = 0): Promise<boolean> {
     if (!this.tokenInfo || !this.browserSession) {
       console.log(`[Viewer] ${account.publicKey.slice(0, 8)}: no ${!this.tokenInfo ? 'token info' : 'browser session'}`);
       return false;
@@ -121,12 +123,15 @@ export class ViewerService extends EventEmitter {
       // Random ping-start jitter (0..1000 ms) so multiple viewers' 1-Hz "."
       // pings spread across the second instead of pulsing in lockstep.
       const pingJitterMs = Math.floor(Math.random() * 1000);
+      const tStart = Date.now();
       const viewerId = await this.browserSession.connectViewer(
         account.accessToken,
         account.refreshToken,
         this.tokenInfo,
         pingJitterMs,
+        slotIndex,
       );
+      console.log(`[Timing] slot=${slotIndex} ${account.publicKey.slice(0, 8)} connectViewer took ${Date.now() - tStart}ms`);
       this.connectedViewers.set(account.publicKey, viewerId);
       console.log(`[Viewer] ${account.publicKey.slice(0, 8)} connected as viewer ${viewerId}`);
       this.emit('viewer-connected', account.publicKey);
@@ -156,17 +161,34 @@ export class ViewerService extends EventEmitter {
     }
     this.bootstrapDisabled = nextBootstrapDisabled;
 
-    let connected = 0;
-    for (let i = 0; i < order.length; i++) {
-      const account = order[i];
-      if (this.connectedViewers.has(account.publicKey)) continue;
-      if (i > 0) {
-        const gap = minGap + Math.floor(Math.random() * Math.max(1, maxGap - minGap));
-        await new Promise(r => setTimeout(r, gap));
-      }
-      const success = await this.connectAccount(account);
-      if (success) connected++;
+    const concurrency = Math.max(1, Math.floor(opts.concurrency ?? 1));
+    // Pre-grow the friendsPage pool so each worker gets its own page.
+    // Without this, evaluates serialize on a single page and concurrency
+    // does nothing (measured empirically).
+    if (this.browserSession) {
+      await this.browserSession.ensurePageSlots(concurrency);
     }
+
+    let connected = 0;
+    let nextIndex = 0;
+    const claim = (): LoadedAccount | null => {
+      while (nextIndex < order.length) {
+        const a = order[nextIndex++];
+        if (!this.connectedViewers.has(a.publicKey)) return a;
+      }
+      return null;
+    };
+    const worker = async (slotIndex: number) => {
+      while (true) {
+        const account = claim();
+        if (!account) return;
+        const gap = minGap + Math.floor(Math.random() * Math.max(1, maxGap - minGap));
+        if (gap > 0) await new Promise(r => setTimeout(r, gap));
+        const success = await this.connectAccount(account, slotIndex);
+        if (success) connected++;
+      }
+    };
+    await Promise.all(Array.from({ length: concurrency }, (_, i) => worker(i)));
     return connected;
   }
 

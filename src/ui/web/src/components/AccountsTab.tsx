@@ -150,6 +150,26 @@ export function AccountsTab({ onLog, refreshTick, onChanged }: Props) {
     }
   }
 
+  async function refreshSelected() {
+    setBulkRunning(true);
+    onLog('Refreshing selected accounts...', 'info');
+    try {
+      const selected = accounts.filter((a) => a.selected).map((a) => a.publicKey);
+      const res = await fetch('/api/accounts/refresh', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ publicKeys: selected }),
+      });
+      const data = await res.json();
+      onLog(`Refreshed ${data.success}/${data.total} accounts`, 'success');
+    } catch (err: any) {
+      onLog(`Error: ${err.message}`, 'error');
+    } finally {
+      setBulkRunning(false);
+      fetchAccounts();
+    }
+  }
+
   async function stopRelogin() {
     await fetch('/api/accounts/relogin/stop', { method: 'POST' });
     onLog('Stopping re-login...', 'info');
@@ -196,15 +216,28 @@ export function AccountsTab({ onLog, refreshTick, onChanged }: Props) {
             Expired ({expiredCount})
           </Button>
           {!bulkRunning ? (
-            <Button
-              size="sm"
-              variant="secondary"
-              onClick={reloginSelected}
-              disabled={selectedCount === 0}
-            >
-              <RefreshCw className="mr-2 h-3.5 w-3.5" />
-              Re-login selected
-            </Button>
+            <>
+              <Button
+                size="sm"
+                variant="outline"
+                onClick={refreshSelected}
+                disabled={selectedCount === 0}
+                title="Use /refresh-access-token (fast, no Turnstile)"
+              >
+                <RefreshCw className="mr-2 h-3.5 w-3.5" />
+                Refresh selected
+              </Button>
+              <Button
+                size="sm"
+                variant="secondary"
+                onClick={reloginSelected}
+                disabled={selectedCount === 0}
+                title="Full re-login: Turnstile + sign nonce + verify"
+              >
+                <RefreshCw className="mr-2 h-3.5 w-3.5" />
+                Re-login selected
+              </Button>
+            </>
           ) : (
             <Button size="sm" variant="destructive" onClick={stopRelogin}>
               <Square className="mr-2 h-3.5 w-3.5" />
