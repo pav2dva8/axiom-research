@@ -221,7 +221,7 @@ const DEBUG_PORT = 9222;
 export interface BrowserSession {
   loginAccount(wallet: WalletInfo): Promise<AuthTokens>;
   getCfData(): Promise<{ cfCookies: string; userAgent: string }>;
-  resolvePairFromCa(ca: string): Promise<any | null>;
+  resolvePairFromCa(ca: string, accessToken?: string, refreshToken?: string): Promise<any | null>;
   /**
    * Run the session bootstrap that the real client fires on every page load
    * (user-data, lighthouse, get-settings, ...). Without this the server
@@ -869,34 +869,56 @@ export async function openBrowserSession(): Promise<BrowserSession> {
       return viewerId;
     },
 
-    async resolvePairFromCa(ca: string): Promise<any | null> {
-      // Real client: GET /clipboard-pair-info?address={CA}.
-      // CORS allow-origin is https://axiom.trade only, so we MUST issue this
-      // from friendsPage (which is on axiom.trade), not from apiPage (api2).
-      const hosts = ['api9.axiom.trade', 'api2.axiom.trade'];
-      for (const host of hosts) {
-        try {
-          const url = `https://${host}/clipboard-pair-info?address=${ca}&v=${Date.now()}`;
-          const result = await friendsPage.evaluate(async (u) => {
-            try {
-              const r = await fetch(u, { credentials: 'include' });
-              if (!r.ok) return { __err: 'status ' + r.status };
-              return await r.json();
-            } catch (e: any) {
-              return { __err: 'fetch ' + (e?.message || String(e)) };
+    async resolvePairFromCa(ca: string, accessToken?: string, refreshToken?: string): Promise<any | null> {
+      // Real client: GET /clipboard-pair-info?address={CA}. This endpoint is
+      // AUTHENTICATED — without a valid auth-access-token cookie it returns a
+      // 502 with {"error":"Session invalid, please login again"} (not a host
+      // outage). So set a logged-in account's cookies for the call — a
+      // cookie-locked critical section, like every other authed op — then
+      // clear them. CORS allow-origin is axiom.trade only, so the fetch MUST
+      // run on friendsPage.
+      const domains = ['cluster9.axiom.trade', 'friends.axiom.trade', '.axiom.trade'];
+      if (accessToken) {
+        const cookiesToAdd: { name: string; value: string; domain: string; path: string }[] = [];
+        for (const domain of domains) {
+          cookiesToAdd.push({ name: 'auth-access-token', value: accessToken, domain, path: '/' });
+          if (refreshToken) cookiesToAdd.push({ name: 'auth-refresh-token', value: refreshToken, domain, path: '/' });
+        }
+        await context.addCookies(cookiesToAdd);
+      }
+
+      // A single apiN host can still 502 transiently; try a couple.
+      const hosts = ['api9.axiom.trade', 'api7.axiom.trade', 'api2.axiom.trade'];
+      try {
+        for (const host of hosts) {
+          try {
+            const url = `https://${host}/clipboard-pair-info?address=${ca}&v=${Date.now()}`;
+            const result = await friendsPage.evaluate(async (u) => {
+              try {
+                const r = await fetch(u, { credentials: 'include' });
+                if (!r.ok) return { __err: 'status ' + r.status };
+                return await r.json();
+              } catch (e: any) {
+                return { __err: 'fetch ' + (e?.message || String(e)) };
+              }
+            }, url);
+            if (result && !(result as any).__err && (result as any).pairAddress) {
+              console.log(`[BrowserAuth] resolvePairFromCa OK via ${host} pair=${(result as any).pairAddress}`);
+              return result;
             }
-          }, url);
-          if (result && !(result as any).__err && (result as any).pairAddress) {
-            console.log(`[BrowserAuth] resolvePairFromCa OK via ${host} pair=${(result as any).pairAddress}`);
-            return result;
+            console.log(`[BrowserAuth] resolvePairFromCa ${host} -> ${(result as any)?.__err || 'no pairAddress'}`);
+          } catch (e: any) {
+            console.log(`[BrowserAuth] resolvePairFromCa evaluate error on ${host}:`, e.message);
           }
-          console.log(`[BrowserAuth] resolvePairFromCa ${host} -> ${(result as any)?.__err || 'no pairAddress'}`);
-        } catch (e: any) {
-          console.log(`[BrowserAuth] resolvePairFromCa evaluate error on ${host}:`, e.message);
+        }
+        console.log('[BrowserAuth] resolvePairFromCa returned null for', ca);
+        return null;
+      } finally {
+        if (accessToken) {
+          await context.clearCookies({ name: 'auth-access-token' });
+          await context.clearCookies({ name: 'auth-refresh-token' });
         }
       }
-      console.log('[BrowserAuth] resolvePairFromCa returned null for', ca);
-      return null;
     },
 
     async disconnectViewer(viewerId: number): Promise<void> {

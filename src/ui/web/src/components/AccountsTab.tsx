@@ -188,6 +188,7 @@ export function AccountsTab({ onLog, refreshTick, onChanged }: Props) {
   const someSelected = selectedCount > 0 && !allSelected;
   const loggedInCount = accounts.filter((a) => a.tokenValid).length;
   const expiredCount = accounts.filter((a) => a.hasTokens && !a.tokenValid).length;
+  const needsLoginCount = accounts.filter((a) => !a.tokenValid && !a.hasTokens).length;
 
   return (
     <div className="mx-auto flex max-w-3xl flex-col gap-4">
@@ -214,6 +215,14 @@ export function AccountsTab({ onLog, refreshTick, onChanged }: Props) {
             disabled={expiredCount === 0 || bulkRunning}
           >
             Expired ({expiredCount})
+          </Button>
+          <Button
+            size="sm"
+            variant="outline"
+            onClick={() => selectByStatus((a) => !a.tokenValid && !a.hasTokens)}
+            disabled={needsLoginCount === 0 || bulkRunning}
+          >
+            Needs login ({needsLoginCount})
           </Button>
           {!bulkRunning ? (
             <>
