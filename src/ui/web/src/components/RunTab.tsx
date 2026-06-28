@@ -28,17 +28,21 @@ interface Props {
 }
 
 const BASE58 = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
+const BASE58_ADDRESS = /[1-9A-HJ-NP-Za-km-z]{32,44}/;
 const DEFAULT_MIN_GAP_MS = 20;
 const DEFAULT_MAX_GAP_MS = 50;
 const DEFAULT_CONCURRENCY = 1;
 
 /**
- * Heuristic: pump.fun token CAs always end with "pump"; pair addresses don't.
- * If the user pasted something we can't classify, we treat it as a pair address
- * and let the server validate.
+ * The input is always either a bare token CA or a full axiom.trade link
+ * (e.g. https://axiom.trade/meme/<pair>?chain=sol) whose embedded address is
+ * the pair. Pull the base58 address out of whatever was pasted; a bare CA is
+ * returned unchanged so the server's CA-vs-pair logic can take over.
  */
-function isLikelyCA(input: string): boolean {
-  return /pump$/i.test(input.trim());
+function extractAddress(input: string): string {
+  const trimmed = input.trim();
+  const match = trimmed.match(BASE58_ADDRESS);
+  return match ? match[0] : trimmed;
 }
 
 function parsePaste(text: string, knownAccounts: Set<string>) {
@@ -50,10 +54,12 @@ function parsePaste(text: string, knownAccounts: Set<string>) {
   let ca: string | undefined;
 
   for (const token of tokens) {
-    if (!BASE58.test(token)) continue;
-    if (knownAccounts.has(token)) {
-      publicKeys.push(token);
-    } else if (!ca || /pump$/i.test(token)) {
+    const addr = extractAddress(token);
+    if (!BASE58.test(addr)) continue;
+    if (knownAccounts.has(addr)) {
+      publicKeys.push(addr);
+    } else if (!ca) {
+      // Keep the original token (bare CA or full link) so Start can classify it.
       ca = token;
     }
   }
@@ -136,9 +142,13 @@ export function RunTab({ onLog, refreshTick, onAccountsChanged }: Props) {
   async function resolveAndStart() {
     const trimmed = input.trim();
     if (!trimmed) {
-      onLog("Enter a token CA or pair address", "error");
+      onLog("Enter a token CA or axiom.trade link", "error");
       return;
     }
+    // A bare address is a token CA; a link wraps the pair. Send the raw input
+    // so the server can tell which it was — stripping it to the bare address
+    // would make a pair look like a CA.
+    const fromLink = extractAddress(trimmed) !== trimmed;
 
     setBusy(true);
     setResolving(true);
@@ -159,7 +169,7 @@ export function RunTab({ onLog, refreshTick, onAccountsChanged }: Props) {
       setToken(t);
       setResolving(false);
       onLog(
-        `Resolved ${isLikelyCA(trimmed) ? "CA" : "pair"} to ${t.ticker} (${t.pairAddress.slice(0, 6)}\u2026)`,
+        `Resolved ${fromLink ? "pair" : "CA"} to ${t.ticker} (${t.pairAddress.slice(0, 6)}\u2026)`,
         "success",
       );
 
@@ -215,7 +225,7 @@ export function RunTab({ onLog, refreshTick, onAccountsChanged }: Props) {
     <div className="mx-auto flex max-w-xl flex-col gap-4">
       <div className="flex flex-col gap-2">
         <label className="text-xs font-medium uppercase tracking-wider text-muted-foreground">
-          Token CA or pair address
+          Token CA or axiom link
         </label>
         <div className="flex gap-2">
           <Input

@@ -51,9 +51,18 @@ function readBody(req: http.IncomingMessage): Promise<string> {
   });
 }
 
-/** pump.fun token CAs always end with "pump"; pair addresses don't. */
-function looksLikeCA(input: string): boolean {
-  return /pump$/i.test(input.trim());
+/**
+ * The input is always either a bare token CA or a full axiom.trade link
+ * (e.g. https://axiom.trade/meme/<pair>?chain=sol) whose embedded address is
+ * the pair. Pull the base58 address out of whatever was pasted; a bare CA is
+ * returned unchanged. Whether the input was a bare address (CA) or a link
+ * (pair) is what classifies it below — not the address suffix.
+ */
+const BASE58_ADDRESS = /[1-9A-HJ-NP-Za-km-z]{32,44}/;
+function extractAddress(input: string): string {
+  const trimmed = input.trim();
+  const match = trimmed.match(BASE58_ADDRESS);
+  return match ? match[0] : trimmed;
 }
 
 async function ensureBrowserSession(): Promise<
@@ -76,6 +85,37 @@ async function ensureBrowserSession(): Promise<
     message: "Browser ready.",
   });
   return session;
+}
+
+/**
+ * /clipboard-pair-info is authenticated — it 502s with "Session invalid"
+ * unless the request carries a valid auth-access-token. Return a logged-in
+ * account's tokens for the CA lookup: prefer a selected account with a still
+ * valid access token, otherwise refresh one (fast, uses the refresh token).
+ * Returns null if no account has usable credentials (user must log in first).
+ */
+async function authTokensForResolve(
+  session: NonNullable<ReturnType<typeof viewerService.getBrowserSession>>,
+): Promise<{ accessToken: string; refreshToken: string } | null> {
+  const selected = accountManager.loadSelectedAccounts();
+  const pool = selected.length > 0 ? selected : accountManager.loadAllAccounts();
+  if (pool.length === 0) return null;
+
+  const valid = pool.find((a) => accountManager.isTokenValid(a.publicKey));
+  if (valid) return { accessToken: valid.accessToken, refreshToken: valid.refreshToken };
+
+  // No valid cached token — refresh one. Try a few in case some refresh
+  // tokens are also stale.
+  for (const a of pool.slice(0, 3)) {
+    const ok = await accountManager.refreshAccount(a.publicKey, session).catch(() => false);
+    if (ok) {
+      const fresh = accountManager.loadAccount(a.publicKey);
+      if (fresh?.accessToken) {
+        return { accessToken: fresh.accessToken, refreshToken: fresh.refreshToken };
+      }
+    }
+  }
+  return null;
 }
 
 async function handleApi(
@@ -211,7 +251,7 @@ async function handleApi(
       return;
     }
 
-    // POST /api/resolve  { input }  — accepts CA or pair address
+    // POST /api/resolve  { input }  — accepts a token CA or an axiom.trade link
     if (pathname === "/api/resolve" && req.method === "POST") {
       const { input } = JSON.parse(await readBody(req));
       if (typeof input !== "string" || !input.trim()) {
@@ -219,31 +259,53 @@ async function handleApi(
         res.end(JSON.stringify({ error: "input required" }));
         return;
       }
-      const value = input.trim();
+      const value = extractAddress(input);
+      // A bare address is a token CA (any suffix, not only "pump"); a full
+      // axiom.trade link wraps the pair. The input is never a bare pair.
+      const fromLink = value !== input.trim();
+
+      if (!/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(value)) {
+        res.writeHead(400);
+        res.end(JSON.stringify({ error: "No token CA or axiom link found in input" }));
+        return;
+      }
 
       let pairAddress: string | null = null;
       let pairData: any = null;
 
-      // Pump.fun CA → pair is a deterministic PDA. Derive it locally first
-      // so a flaky api9/api2 (e.g. CF 502) doesn't block us. We still try
-      // to enrich with metadata via the API afterwards.
-      if (isPumpCa(value)) {
-        pairAddress = derivePumpPair(value);
-      }
-
-      // If we still need the pair, hit Axiom through the CF-bypassed browser.
-      // Skip enrichment via fetchPairInfo — Axiom's pair-info endpoint
-      // frequently 502s and the WS protocol only requires pairAddress.
-      if (!pairAddress) {
-        const session = await ensureBrowserSession();
-        if (looksLikeCA(value)) {
-          const resolved = await session.resolvePairFromCa(value);
+      if (fromLink) {
+        // The address inside an axiom.trade link is already the pair.
+        pairAddress = value;
+      } else {
+        // Bare token CA → resolve to its pair. A pump.fun CA has a
+        // deterministic bonding-curve PDA we can derive locally (fast, and it
+        // survives a flaky api9/api2 502). Any other CA needs the
+        // authenticated /clipboard-pair-info lookup.
+        if (isPumpCa(value)) {
+          pairAddress = derivePumpPair(value);
+        }
+        if (!pairAddress) {
+          const session = await ensureBrowserSession();
+          const auth = await authTokensForResolve(session);
+          if (!auth) {
+            res.writeHead(401);
+            res.end(
+              JSON.stringify({
+                error:
+                  "No logged-in account. Open the Accounts tab and log in an account, then resolve the CA.",
+              }),
+            );
+            return;
+          }
+          const resolved = await session.resolvePairFromCa(
+            value,
+            auth.accessToken,
+            auth.refreshToken,
+          );
           if (resolved?.pairAddress) {
             pairAddress = resolved.pairAddress;
             pairData = resolved;
           }
-        } else {
-          pairAddress = value;
         }
       }
 
@@ -259,8 +321,8 @@ async function handleApi(
         ? {
             pairAddress: pairData.pairAddress || pairAddress,
             tokenAddress: pairData.tokenAddress || pairData.baseToken?.address || "",
-            ticker: pairData.ticker || pairData.baseToken?.symbol || "UNKNOWN",
-            name: pairData.name || pairData.baseToken?.name || "Unknown Token",
+            ticker: pairData.ticker || pairData.tokenTicker || pairData.baseToken?.symbol || "UNKNOWN",
+            name: pairData.name || pairData.tokenName || pairData.baseToken?.name || "Unknown Token",
             protocol: pairData.protocol || "Pump V1",
             isMigrated: pairData.isMigrated || false,
             supply: pairData.supply || pairData.baseToken?.totalSupply || 1000000000,
@@ -268,7 +330,7 @@ async function handleApi(
           }
         : {
             pairAddress,
-            tokenAddress: isPumpCa(value) ? value : "",
+            tokenAddress: fromLink ? "" : value,
             ticker: "TOKEN",
             name: "Token",
             protocol: isPumpCa(value) ? "Pump V1" : "Unknown",
