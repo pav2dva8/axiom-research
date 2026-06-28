@@ -210,7 +210,12 @@ const VIEWER_MANAGER_SCRIPT = `
 `;
 
 const TURNSTILE_SITEKEY = '0x4AAAAAACb1mthF4yHVUfUh';
-const API_BASE = 'https://api2.axiom.trade';
+// Axiom shards its API across apiN.axiom.trade hosts and rotates which one the
+// frontend uses. As of 2026-06 the live site uses api7 for /wallet-nonce +
+// /verify-wallet-v2 (api2 is stale and 500s on verify). If login starts failing
+// with "We can't process this right now", re-check the host the real frontend
+// hits (DevTools → Network) and bump this. (refreshAccount similarly pins api9.)
+const API_BASE = 'https://api7.axiom.trade';
 const DEBUG_PORT = 9222;
 
 export interface BrowserSession {
@@ -309,40 +314,104 @@ export async function openBrowserSession(): Promise<BrowserSession> {
   await page.goto('https://axiom.trade', { waitUntil: 'load', timeout: 30000 });
   console.log('[BrowserAuth] Page loaded, URL:', page.url());
 
-  // Handle CF challenge
-  const content = await page.content();
-  if (content.includes('challenges.cloudflare.com') || content.includes('challenge-platform') || content.includes('Verify you are human')) {
-    console.log('[BrowserAuth] Cloudflare challenge detected — please complete it in the browser');
+  // ── Cloudflare / Turnstile readiness helpers ───────────────────────────
+  // The main axiom.trade page runs the live SPA and is the only page under
+  // Cloudflare's *managed* challenge. Both the SPA and CF can navigate it at
+  // any moment, which destroys the JS execution context of any in-flight
+  // page.evaluate — including the long-lived Turnstile token render. These
+  // helpers let us detect that, wait it out, and re-prime Turnstile before
+  // each login attempt.
+
+  // Is the main page currently sitting on a Cloudflare interstitial?
+  async function mainPageOnChallenge(): Promise<boolean> {
+    try {
+      if (/\/cdn-cgi\/|challenge/i.test(page.url())) return true;
+      const html = await page.content();
+      return /challenges\.cloudflare\.com|challenge-platform|Verify you are human|перевірка безпеки/i.test(html);
+    } catch {
+      // content()/url() can throw if a navigation is in flight — treat as "not ready".
+      return true;
+    }
+  }
+
+  // Wait out a CF challenge on the main page (auto-pass or manual solve, up to 2m).
+  async function waitForMainPageClear(): Promise<void> {
+    console.log('[BrowserAuth] Cloudflare challenge on main page — waiting for it to clear (auto or manual)...');
     await page.waitForURL(/axiom\.trade\/(?!.*challenge)/, { timeout: 120000 });
     await page.waitForLoadState('load');
     console.log('[BrowserAuth] Cloudflare challenge passed');
+  }
+
+  // (Re-)inject the Turnstile container + API script. Idempotent: a navigation
+  // wipes both, so this is safe to call again before every login attempt.
+  async function injectTurnstile(): Promise<void> {
+    await page.evaluate(`(() => {
+      if (!document.getElementById('__ts_container')) {
+        const div = document.createElement('div');
+        div.id = '__ts_container';
+        div.style.position = 'fixed';
+        div.style.bottom = '0';
+        div.style.right = '0';
+        div.style.zIndex = '99999';
+        document.body.appendChild(div);
+      }
+      if (typeof window.turnstile === 'undefined' && !document.getElementById('__ts_script')) {
+        const script = document.createElement('script');
+        script.id = '__ts_script';
+        script.src = 'https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit';
+        script.async = true;
+        document.head.appendChild(script);
+      }
+    })()`);
+    await page.waitForFunction('typeof window.turnstile !== "undefined"', null, { timeout: 15000 })
+      .catch(() => { throw new Error('Failed to load Turnstile API script'); });
+  }
+
+  // Pre-flight before each login attempt: clear any CF re-challenge and make
+  // sure Turnstile is loaded on the main page.
+  async function ensureMainPageReady(): Promise<void> {
+    if (await mainPageOnChallenge()) {
+      await waitForMainPageClear();
+    }
+    await injectTurnstile();
+  }
+
+  // Issue an authenticated API POST from the real SPA page (axiom.trade origin)
+  // to API_BASE, via XMLHttpRequest. We deliberately use the SPA page — not the
+  // bare api page — for two things /verify-wallet-v2 depends on:
+  //   1. Origin/Referer become https://axiom.trade. Browsers forbid setting
+  //      those headers from JS, so the request must *originate* from that page.
+  //   2. Axiom's anti-bot SDK hooks XMLHttpRequest on this page and stamps its
+  //      per-request headers (Xa<rand>-A..Z); a fetch from a bare page gets none.
+  // XHR (not fetch) because the frontend uses axios/XHR — the layer the SDK patches.
+  async function apiPostFromPage(pathName: string, bodyJson: string): Promise<{ status: number; body: string }> {
+    const url = `${API_BASE}${pathName}`;
+    return page.evaluate(`
+      new Promise((resolve, reject) => {
+        try {
+          var xhr = new XMLHttpRequest();
+          xhr.open('POST', ${JSON.stringify(url)}, true);
+          xhr.withCredentials = true;
+          xhr.setRequestHeader('Content-Type', 'application/json');
+          xhr.timeout = 20000;
+          xhr.onload = function () { resolve({ status: xhr.status, body: xhr.responseText }); };
+          xhr.onerror = function () { reject(new Error('XHR network error')); };
+          xhr.ontimeout = function () { reject(new Error('XHR timeout')); };
+          xhr.send(${JSON.stringify(bodyJson)});
+        } catch (e) { reject(e); }
+      })
+    `) as Promise<{ status: number; body: string }>;
+  }
+
+  // Initial readiness on session open.
+  if (await mainPageOnChallenge()) {
+    await waitForMainPageClear();
   } else {
     console.log('[BrowserAuth] No CF challenge — page loaded directly');
   }
-
   await page.waitForTimeout(3000);
   console.log('[BrowserAuth] Current URL:', page.url());
-
-  // Load Turnstile API
-  await page.evaluate(`(() => {
-    const div = document.createElement('div');
-    div.id = '__ts_container';
-    div.style.position = 'fixed';
-    div.style.bottom = '0';
-    div.style.right = '0';
-    div.style.zIndex = '99999';
-    document.body.appendChild(div);
-
-    if (typeof window.turnstile === 'undefined') {
-      const script = document.createElement('script');
-      script.src = 'https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit';
-      script.async = true;
-      document.head.appendChild(script);
-    }
-  })()`);
-
-  await page.waitForFunction('typeof window.turnstile !== "undefined"', null, { timeout: 15000 })
-    .catch(() => { throw new Error('Failed to load Turnstile API script'); });
+  await injectTurnstile();
   console.log('[BrowserAuth] Turnstile API loaded');
 
   // Probe what Axiom's own JS sends — must pass auth tokens so the page loads as a real user
@@ -515,98 +584,116 @@ export async function openBrowserSession(): Promise<BrowserSession> {
       return probeEucalyptusMessages(pairAddress, accessToken, refreshToken);
     },
 
-async loginAccount(wallet: WalletInfo): Promise<AuthTokens> {
-      console.log('[BrowserAuth] Logging in wallet:', wallet.publicKey);
+    async loginAccount(wallet: WalletInfo): Promise<AuthTokens> {
+      const MAX_ATTEMPTS = 3;
+      let lastErr: any;
 
-      // 1. Get turnstile token
-      const turnstileToken = await getTurnstileToken();
+      // A Cloudflare re-challenge (or SPA redirect) can navigate the main page
+      // mid-login and destroy the JS execution context of the in-flight
+      // Turnstile evaluate ("Execution context was destroyed, most likely
+      // because of a navigation"). On that specific, navigation-caused error we
+      // re-clear the page and retry — bounded — instead of failing the account.
+      for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+        try {
+          console.log(`[BrowserAuth] Logging in wallet: ${wallet.publicKey} (attempt ${attempt}/${MAX_ATTEMPTS})`);
 
-      // 2. Get nonce via same-origin fetch from api2 page
-      const nonce = await apiPage.evaluate(`
-        fetch('/wallet-nonce', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ walletAddress: '${wallet.publicKey}' }),
-        }).then(async r => {
-          if (!r.ok) {
-            const text = await r.text();
-            throw new Error('Nonce failed: ' + r.status + ' ' + r.statusText + ' - ' + text);
+          // 0. Recover from any CF re-challenge / navigation that wiped the main
+          //    page since the previous attempt, before the long Turnstile evaluate.
+          await ensureMainPageReady();
+
+          // 1. Get turnstile token
+          const turnstileToken = await getTurnstileToken();
+
+          // 2. Get nonce — issued from the SPA page → API_BASE (see
+          // apiPostFromPage). `v` is the client epoch-ms the frontend sends.
+          const nonceRes = await apiPostFromPage('/wallet-nonce', JSON.stringify({
+            walletAddress: wallet.publicKey,
+            v: Date.now(),
+          }));
+          if (nonceRes.status < 200 || nonceRes.status >= 300) {
+            throw new Error('Nonce failed: ' + nonceRes.status + ' - ' + nonceRes.body);
           }
-          return r.text();
-        })
-      `) as string;
-      console.log('[BrowserAuth] Got nonce:', nonce);
+          const nonce = nonceRes.body;
+          console.log('[BrowserAuth] Got nonce:', nonce);
 
-      // 3. Sign message in Node.js
-      const message = buildSignMessage(nonce);
-      const messageBytes = new TextEncoder().encode(message);
-      const signature = nacl.sign.detached(messageBytes, wallet.secretKey);
-      const signatureBase58 = bs58.encode(signature);
+          // 3. Sign message in Node.js
+          const message = buildSignMessage(nonce);
+          const signature = nacl.sign.detached(new TextEncoder().encode(message), wallet.secretKey);
+          const signatureBase58 = bs58.encode(signature);
 
-      // 4. Verify wallet via same-origin fetch from api2 page
-      // Return the response body + set-cookie info
-      const result = await apiPage.evaluate(`
-        fetch('/verify-wallet-v2', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            walletAddress: '${wallet.publicKey}',
+          // 4. Verify wallet — same SPA-page path. Field set + `v` mirror the
+          // live frontend's request exactly.
+          const verifyRes = await apiPostFromPage('/verify-wallet-v2', JSON.stringify({
+            walletAddress: wallet.publicKey,
             allowLinking: false,
             allowRegistration: false,
             forAddCredential: false,
             isVerify: false,
-            nonce: '${nonce}',
+            nonce,
             referrer: null,
-            signature: '${signatureBase58}',
-            turnstileToken: '${turnstileToken}',
-          }),
-        }).then(async r => {
-          const text = await r.text();
-          if (!r.ok) throw new Error('Verify failed: ' + r.status + ' ' + r.statusText + ' - ' + text);
-          return text;
-        })
-      `) as string;
-      console.log('[BrowserAuth] Verify response received');
-
-      // 5. Extract auth + CF cookies from browser
-      await apiPage.waitForTimeout(500);
-      const browserCookies = await context.cookies();
-      let accessToken = '';
-      let refreshToken = '';
-      const parts: string[] = [];
-      const seen = new Set<string>();
-
-      for (const c of browserCookies) {
-        // Auth cookies
-        if (c.name === 'auth-access-token') { accessToken = c.value; }
-        if (c.name === 'auth-refresh-token') { refreshToken = c.value; }
-
-        // Include auth + CF cookies (needed for API and WS connections)
-        if (c.name.startsWith('auth-') || c.name === 'cf_clearance' || c.name === '__cf_bm') {
-          const key = `${c.name}=${c.value}`;
-          if (!seen.has(c.name)) {
-            seen.add(c.name);
-            parts.push(key);
+            signature: signatureBase58,
+            turnstileToken,
+            v: Date.now(),
+          }));
+          if (verifyRes.status < 200 || verifyRes.status >= 300) {
+            throw new Error('Verify failed: ' + verifyRes.status + ' - ' + verifyRes.body);
           }
+          console.log('[BrowserAuth] Verify response received');
+
+          // 5. Extract auth + CF cookies from browser
+          await apiPage.waitForTimeout(500);
+          const browserCookies = await context.cookies();
+          let accessToken = '';
+          let refreshToken = '';
+          const parts: string[] = [];
+          const seen = new Set<string>();
+
+          for (const c of browserCookies) {
+            // Auth cookies
+            if (c.name === 'auth-access-token') { accessToken = c.value; }
+            if (c.name === 'auth-refresh-token') { refreshToken = c.value; }
+
+            // Include auth + CF cookies (needed for API and WS connections)
+            if (c.name.startsWith('auth-') || c.name === 'cf_clearance' || c.name === '__cf_bm') {
+              const key = `${c.name}=${c.value}`;
+              if (!seen.has(c.name)) {
+                seen.add(c.name);
+                parts.push(key);
+              }
+            }
+          }
+
+          if (!accessToken) {
+            throw new Error('No auth cookies received after verify');
+          }
+
+          console.log('[BrowserAuth] Login successful! Access token:', accessToken.slice(0, 20) + '...');
+          console.log('[BrowserAuth] Cookie types:', [...seen].join(', '));
+
+          // Clear auth cookies so next account starts fresh (keep CF cookies)
+          await context.clearCookies({ name: 'auth-access-token' });
+          await context.clearCookies({ name: 'auth-refresh-token' });
+
+          return {
+            accessToken,
+            refreshToken,
+            cookies: parts.join('; '),
+          };
+        } catch (err: any) {
+          lastErr = err;
+          const emsg = String(err?.message || err);
+          // Playwright's symptom of a navigation landing mid-evaluate.
+          const navRace = /Execution context was destroyed|frame (?:was |got )?detached|because of (?:a )?navigation/i.test(emsg);
+          if (navRace && attempt < MAX_ATTEMPTS) {
+            console.warn(`[BrowserAuth] Login attempt ${attempt}/${MAX_ATTEMPTS} hit a page navigation (${emsg.split('\n')[0]}); recovering & retrying...`);
+            await page.waitForTimeout(1000);
+            continue;
+          }
+          throw err;
         }
       }
 
-      if (!accessToken) {
-        throw new Error('No auth cookies received after verify');
-      }
-
-      console.log('[BrowserAuth] Login successful! Access token:', accessToken.slice(0, 20) + '...');
-      console.log('[BrowserAuth] Cookie types:', [...seen].join(', '));
-
-      // Clear auth cookies so next account starts fresh (keep CF cookies)
-      await context.clearCookies({ name: 'auth-access-token' });
-      await context.clearCookies({ name: 'auth-refresh-token' });
-
-      return {
-        accessToken,
-        refreshToken,
-        cookies: parts.join('; '),
-      };
+      throw lastErr;
     },
 
     async refreshAccount(oldRefreshToken: string): Promise<AuthTokens> {
