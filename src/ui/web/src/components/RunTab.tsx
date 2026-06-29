@@ -4,6 +4,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Checkbox } from "@/components/ui/checkbox";
 import type { LogEntry } from "@/components/LogPanel";
+import type { ViewerProgress, ViewerState } from "@/App";
 
 interface ResolvedToken {
   pairAddress: string;
@@ -25,7 +26,15 @@ interface Props {
   onLog: (msg: string, type: LogEntry["type"]) => void;
   refreshTick: number;
   onAccountsChanged: () => void;
+  viewerProgress: ViewerProgress;
 }
+
+const STATE_STYLE: Record<ViewerState, string> = {
+  pending: "bg-muted text-muted-foreground",
+  connecting: "bg-amber-500/15 text-amber-400",
+  connected: "bg-emerald-500/15 text-emerald-400",
+  failed: "bg-red-500/15 text-red-400",
+};
 
 const BASE58 = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
 const BASE58_ADDRESS = /[1-9A-HJ-NP-Za-km-z]{32,44}/;
@@ -67,7 +76,7 @@ function parsePaste(text: string, knownAccounts: Set<string>) {
   return { ca, publicKeys };
 }
 
-export function RunTab({ onLog, refreshTick, onAccountsChanged }: Props) {
+export function RunTab({ onLog, refreshTick, onAccountsChanged, viewerProgress }: Props) {
   const [input, setInput] = useState("");
   const [token, setToken] = useState<ResolvedToken | null>(null);
   const [accounts, setAccounts] = useState<Account[]>([]);
@@ -221,6 +230,16 @@ export function RunTab({ onLog, refreshTick, onAccountsChanged }: Props) {
     }
   }
 
+  const progressEntries = Object.entries(viewerProgress.states);
+  const counts = progressEntries.reduce(
+    (acc, [, st]) => {
+      acc[st] = (acc[st] ?? 0) + 1;
+      return acc;
+    },
+    {} as Record<string, number>,
+  );
+  const connectedCount = counts.connected ?? 0;
+
   return (
     <div className="mx-auto flex max-w-xl flex-col gap-4">
       <div className="flex flex-col gap-2">
@@ -315,7 +334,7 @@ export function RunTab({ onLog, refreshTick, onAccountsChanged }: Props) {
               setMaxGapMs(DEFAULT_MAX_GAP_MS);
             }}
             disabled={running || busy}
-            title="Reset to default 200–500 ms"
+            title={`Reset to default ${DEFAULT_MIN_GAP_MS}–${DEFAULT_MAX_GAP_MS} ms`}
           >
             Default
           </Button>
@@ -357,6 +376,36 @@ export function RunTab({ onLog, refreshTick, onAccountsChanged }: Props) {
           <dt className="text-muted-foreground">token</dt>
           <dd className="truncate">{token.tokenAddress || "—"}</dd>
         </dl>
+      )}
+
+      {progressEntries.length > 0 && (
+        <div className="flex flex-col gap-2 rounded-md border border-border bg-card p-3">
+          <div className="flex items-center justify-between text-xs">
+            <span className="font-medium">
+              {connectedCount}/{viewerProgress.total || progressEntries.length} connected
+            </span>
+            <span className="flex gap-2 font-mono text-muted-foreground">
+              {(counts.connecting ?? 0) > 0 && (
+                <span className="text-amber-400">{counts.connecting} connecting</span>
+              )}
+              {(counts.pending ?? 0) > 0 && <span>{counts.pending} pending</span>}
+              {(counts.failed ?? 0) > 0 && (
+                <span className="text-red-400">{counts.failed} failed</span>
+              )}
+            </span>
+          </div>
+          <div className="flex max-h-48 flex-wrap gap-1 overflow-auto">
+            {progressEntries.map(([pk, st]) => (
+              <span
+                key={pk}
+                className={`rounded px-1.5 py-0.5 font-mono text-[10px] ${STATE_STYLE[st]}`}
+                title={`${pk} — ${st}`}
+              >
+                {pk.slice(0, 4)}…{pk.slice(-4)}
+              </span>
+            ))}
+          </div>
+        </div>
       )}
     </div>
   );
