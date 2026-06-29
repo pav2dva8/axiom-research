@@ -429,7 +429,7 @@ export function AccountsTab({ onLog, refreshTick, onChanged, keepWarmRunning }: 
                       ) : (
                         <Badge variant="outline">Needs login</Badge>
                       )}
-                      {a.accessExpiresAt != null && (() => {
+                      {a.tokenValid && a.accessExpiresAt != null && (() => {
                         const c = countdown(a.accessExpiresAt, now);
                         return <span className={`font-mono text-xs ${c.cls}`}>{c.text}</span>;
                       })()}
