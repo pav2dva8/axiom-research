@@ -32,6 +32,7 @@ function statusPayload() {
     accounts: accountManager.getAccountCount(),
     selected: accountManager.getSelectedCount(),
     activeViewers: viewerService.getActiveCount(),
+    keepWarm: accountManager.isKeepWarmRunning(),
   };
 }
 
@@ -39,7 +40,24 @@ function broadcastStatus(): void {
   broadcast("status", statusPayload());
 }
 
-viewerService.on("viewer-connected", () => broadcastStatus());
+// Total accounts in the current viewer run, for the live progress display.
+let currentRunTotal = 0;
+
+function broadcastViewerProgress(publicKey: string, state: string): void {
+  broadcast("viewer-progress", {
+    publicKey,
+    state,
+    connected: viewerService.getActiveCount(),
+    total: currentRunTotal,
+  });
+}
+
+viewerService.on("viewer-connecting", (pk: string) => broadcastViewerProgress(pk, "connecting"));
+viewerService.on("viewer-connected", (pk: string) => {
+  broadcastViewerProgress(pk, "connected");
+  broadcastStatus();
+});
+viewerService.on("viewer-failed", (pk: string) => broadcastViewerProgress(pk, "failed"));
 viewerService.on("viewer-disconnected", () => broadcastStatus());
 
 function readBody(req: http.IncomingMessage): Promise<string> {
@@ -251,6 +269,76 @@ async function handleApi(
       return;
     }
 
+    // POST /api/accounts/keepwarm/start  { publicKeys?, delayMs?, thresholdMin? }
+    // Refresh-only: keeps selected accounts logged in indefinitely. Never re-logins.
+    if (pathname === "/api/accounts/keepwarm/start" && req.method === "POST") {
+      const body = await readBody(req).catch(() => "");
+      let targets: string[] | undefined;
+      let delayMs: number | undefined;
+      let thresholdMin: number | undefined;
+      try {
+        if (body) {
+          const parsed = JSON.parse(body);
+          if (Array.isArray(parsed.publicKeys)) targets = parsed.publicKeys;
+          if (typeof parsed.delayMs === "number" && Number.isFinite(parsed.delayMs)) delayMs = parsed.delayMs;
+          if (typeof parsed.thresholdMin === "number" && Number.isFinite(parsed.thresholdMin)) thresholdMin = parsed.thresholdMin;
+        }
+      } catch {}
+
+      await accountManager.startKeepLoggedIn(targets, { delayMs, thresholdMin }, (message, running) => {
+        broadcast("keepwarm", { running, message });
+      });
+
+      const session = accountManager.getBrowserSession();
+      if (session) viewerService.setBrowserSession(session);
+
+      broadcastStatus();
+      res.writeHead(200);
+      res.end(JSON.stringify({ ok: true, running: accountManager.isKeepWarmRunning() }));
+      return;
+    }
+
+    // POST /api/accounts/keepwarm/stop
+    if (pathname === "/api/accounts/keepwarm/stop" && req.method === "POST") {
+      accountManager.stopKeepLoggedIn();
+      broadcast("keepwarm", { running: false, message: "Keep-logged-in stopping..." });
+      broadcastStatus();
+      res.writeHead(200);
+      res.end(JSON.stringify({ ok: true }));
+      return;
+    }
+
+    // POST /api/accounts/probe-limit  { publicKeys?: string[], cap?: number }
+    // Fires refreshes back-to-back to measure the per-IP rate-limit ceiling +
+    // cooldown. Cancellable via /api/accounts/relogin/stop.
+    if (pathname === "/api/accounts/probe-limit" && req.method === "POST") {
+      const body = await readBody(req).catch(() => "");
+      let targets: string[] | undefined;
+      let cap = 20;
+      try {
+        if (body) {
+          const parsed = JSON.parse(body);
+          if (Array.isArray(parsed.publicKeys)) targets = parsed.publicKeys;
+          if (typeof parsed.cap === "number" && Number.isFinite(parsed.cap) && parsed.cap >= 1) {
+            cap = Math.floor(parsed.cap);
+          }
+        }
+      } catch {}
+
+      res.writeHead(200);
+      const result = await accountManager.probeLimit(targets, cap, (message) => {
+        broadcast("probe-progress", { message });
+      });
+
+      const session = accountManager.getBrowserSession();
+      if (session) viewerService.setBrowserSession(session);
+
+      broadcast("accounts-changed", {});
+      broadcastStatus();
+      res.end(JSON.stringify(result));
+      return;
+    }
+
     // POST /api/resolve  { input }  — accepts a token CA or an axiom.trade link
     if (pathname === "/api/resolve" && req.method === "POST") {
       const { input } = JSON.parse(await readBody(req));
@@ -389,6 +477,13 @@ async function handleApi(
         return;
       }
 
+      // Reset the live progress display: every account starts "pending".
+      currentRunTotal = accounts.length;
+      broadcast("viewer-run", {
+        total: accounts.length,
+        accounts: accounts.map((a) => a.publicKey),
+      });
+
       const connected = await viewerService.connectAll(accounts, {
         ...(minGapValid ? { minGapMs } : {}),
         ...(maxGapValid ? { maxGapMs } : {}),
@@ -405,6 +500,8 @@ async function handleApi(
     // POST /api/viewers/stop
     if (pathname === "/api/viewers/stop" && req.method === "POST") {
       viewerService.disconnectAll();
+      currentRunTotal = 0;
+      broadcast("viewer-run", { total: 0, accounts: [] });
       broadcastStatus();
       res.writeHead(200);
       res.end(JSON.stringify({ ok: true }));

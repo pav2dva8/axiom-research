@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from 'react';
-import { Copy, Loader2, RefreshCw, Square } from 'lucide-react';
+import { Copy, Gauge, Loader2, RefreshCw, Square } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Checkbox } from '@/components/ui/checkbox';
 import { Badge } from '@/components/ui/badge';
@@ -19,23 +19,42 @@ interface Account {
   hasTokens: boolean;
   selected: boolean;
   lastUsed?: string;
+  accessExpiresAt?: number;
 }
 
 interface Props {
   onLog: (msg: string, type: LogEntry['type']) => void;
   refreshTick: number;
   onChanged: () => void;
+  keepWarmRunning: boolean;
 }
 
 function shortKey(k: string) {
   return `${k.slice(0, 4)}\u2026${k.slice(-4)}`;
 }
 
-export function AccountsTab({ onLog, refreshTick, onChanged }: Props) {
+/** Live mm:ss countdown to access-token expiry, with a colour class. */
+function countdown(expiresAt: number | undefined, now: number): { text: string; cls: string } {
+  if (expiresAt == null) return { text: '\u2014', cls: 'text-muted-foreground' };
+  const ms = expiresAt - now;
+  if (ms <= 0) return { text: 'expired', cls: 'text-red-400' };
+  const totalSec = Math.floor(ms / 1000);
+  const text = `${Math.floor(totalSec / 60)}:${String(totalSec % 60).padStart(2, '0')}`;
+  return { text, cls: ms <= 5 * 60_000 ? 'text-amber-400' : 'text-emerald-400' };
+}
+
+export function AccountsTab({ onLog, refreshTick, onChanged, keepWarmRunning }: Props) {
   const [accounts, setAccounts] = useState<Account[]>([]);
   const [loading, setLoading] = useState(true);
   const [bulkRunning, setBulkRunning] = useState(false);
   const [pendingKey, setPendingKey] = useState<string | null>(null);
+  const [now, setNow] = useState(() => Date.now());
+
+  // Tick once a second so the expiry countdowns stay live between 4s polls.
+  useEffect(() => {
+    const t = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(t);
+  }, []);
 
   const fetchAccounts = useCallback(async () => {
     try {
@@ -170,9 +189,68 @@ export function AccountsTab({ onLog, refreshTick, onChanged }: Props) {
     }
   }
 
+  async function findLimit() {
+    setBulkRunning(true);
+    const selected = accounts.filter((a) => a.selected).map((a) => a.publicKey);
+    onLog(
+      `Probing refresh rate limit on ${selected.length > 0 ? selected.length + ' selected' : 'all'} account(s) (cap 20)...`,
+      'info',
+    );
+    try {
+      const res = await fetch('/api/accounts/probe-limit', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ publicKeys: selected, cap: 20 }),
+      });
+      const r = await res.json();
+      if (!res.ok) {
+        onLog(`Probe failed: ${r.error ?? res.statusText}`, 'error');
+        return;
+      }
+      const cooldown = r.cooldownSec != null ? `${r.cooldownSec}s` : r.throttled ? '>600s' : 'n/a';
+      onLog(
+        r.throttled
+          ? `Refresh limit: ~${r.successesBeforeThrottle} per IP, cooldown ${cooldown}, ~${r.requestsPerMin}/min`
+          : `Probe done: ${r.successesBeforeThrottle} refreshed OK, no IP throttle confirmed (~${r.requestsPerMin}/min). See log.`,
+        r.throttled ? 'error' : 'success',
+      );
+    } catch (err: any) {
+      onLog(`Probe failed: ${err.message}`, 'error');
+    } finally {
+      setBulkRunning(false);
+      fetchAccounts();
+    }
+  }
+
+  async function startKeepWarm() {
+    const selected = accounts.filter((a) => a.selected).map((a) => a.publicKey);
+    if (selected.length === 0) {
+      onLog('Select accounts first', 'error');
+      return;
+    }
+    onLog(`Keeping ${selected.length} account(s) logged in (refresh-only, ~2.5s apart)...`, 'info');
+    try {
+      await fetch('/api/accounts/keepwarm/start', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ publicKeys: selected }),
+      });
+    } catch (err: any) {
+      onLog(`Keep-logged-in failed: ${err.message}`, 'error');
+    }
+  }
+
+  async function stopKeepWarm() {
+    try {
+      await fetch('/api/accounts/keepwarm/stop', { method: 'POST' });
+    } catch (err: any) {
+      onLog(`Error: ${err.message}`, 'error');
+    }
+  }
+
   async function stopRelogin() {
     await fetch('/api/accounts/relogin/stop', { method: 'POST' });
-    onLog('Stopping re-login...', 'info');
+    onLog('Stopping...', 'info');
     setBulkRunning(false);
   }
 
@@ -192,14 +270,38 @@ export function AccountsTab({ onLog, refreshTick, onChanged }: Props) {
 
   return (
     <div className="mx-auto flex max-w-3xl flex-col gap-4">
-      <div className="flex items-center justify-between">
-        <div className="flex items-baseline gap-2">
-          <span className="text-sm font-medium">Accounts</span>
-          <span className="text-xs text-muted-foreground">
-            {selectedCount}/{accounts.length} selected
-          </span>
+      <div className="flex flex-col gap-3">
+        <div className="flex items-center justify-between gap-3">
+          <div className="flex items-baseline gap-2">
+            <span className="text-sm font-medium">Accounts</span>
+            <span className="text-xs text-muted-foreground">
+              {selectedCount}/{accounts.length} selected
+            </span>
+            {keepWarmRunning && (
+              <span className="flex items-center gap-1.5 text-xs text-emerald-400">
+                <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-emerald-400" />
+                keeping logged in
+              </span>
+            )}
+          </div>
+          {keepWarmRunning ? (
+            <Button size="sm" variant="destructive" onClick={stopKeepWarm}>
+              <Square className="mr-2 h-3.5 w-3.5" />
+              Stop keeping logged in
+            </Button>
+          ) : (
+            <Button
+              size="sm"
+              onClick={startKeepWarm}
+              disabled={selectedCount === 0 || bulkRunning}
+              title="Refresh all selected now, then keep them logged in indefinitely — refresh-only (no re-login), ~2.5s apart, auto-throttled under the rate limit. Keeps the accounts selected when you click."
+            >
+              <RefreshCw className="mr-2 h-3.5 w-3.5" />
+              Keep logged in ({selectedCount})
+            </Button>
+          )}
         </div>
-        <div className="flex gap-2">
+        <div className="flex flex-wrap items-center gap-2">
           <Button
             size="sm"
             variant="outline"
@@ -230,8 +332,8 @@ export function AccountsTab({ onLog, refreshTick, onChanged }: Props) {
                 size="sm"
                 variant="outline"
                 onClick={refreshSelected}
-                disabled={selectedCount === 0}
-                title="Use /refresh-access-token (fast, no Turnstile)"
+                disabled={selectedCount === 0 || keepWarmRunning}
+                title="One-off refresh of selected (no Turnstile). Disabled while keep-logged-in is running."
               >
                 <RefreshCw className="mr-2 h-3.5 w-3.5" />
                 Refresh selected
@@ -240,11 +342,21 @@ export function AccountsTab({ onLog, refreshTick, onChanged }: Props) {
                 size="sm"
                 variant="secondary"
                 onClick={reloginSelected}
-                disabled={selectedCount === 0}
-                title="Full re-login: Turnstile + sign nonce + verify"
+                disabled={selectedCount === 0 || keepWarmRunning}
+                title="Full re-login: Turnstile + sign nonce + verify. Disabled while keep-logged-in is running (use the per-row button for a single dead account)."
               >
                 <RefreshCw className="mr-2 h-3.5 w-3.5" />
                 Re-login selected
+              </Button>
+              <Button
+                size="sm"
+                variant="ghost"
+                onClick={findLimit}
+                disabled={keepWarmRunning}
+                title="Fire refreshes back-to-back on selected (or all, cap 20) to find the per-IP rate-limit ceiling + cooldown. Deliberately trips the limit once."
+              >
+                <Gauge className="mr-2 h-3.5 w-3.5" />
+                Find refresh limit
               </Button>
             </>
           ) : (
@@ -309,13 +421,19 @@ export function AccountsTab({ onLog, refreshTick, onChanged }: Props) {
                     </button>
                   </TableCell>
                   <TableCell>
-                    {a.tokenValid ? (
-                      <Badge variant="success">Logged in</Badge>
-                    ) : a.hasTokens ? (
-                      <Badge variant="secondary">Expired</Badge>
-                    ) : (
-                      <Badge variant="outline">Needs login</Badge>
-                    )}
+                    <div className="flex items-center gap-2">
+                      {a.tokenValid ? (
+                        <Badge variant="success">Logged in</Badge>
+                      ) : a.hasTokens ? (
+                        <Badge variant="secondary">Expired</Badge>
+                      ) : (
+                        <Badge variant="outline">Needs login</Badge>
+                      )}
+                      {a.accessExpiresAt != null && (() => {
+                        const c = countdown(a.accessExpiresAt, now);
+                        return <span className={`font-mono text-xs ${c.cls}`}>{c.text}</span>;
+                      })()}
+                    </div>
                   </TableCell>
                   <TableCell className="text-xs text-muted-foreground">
                     {a.lastUsed ? new Date(a.lastUsed).toLocaleString() : '\u2014'}

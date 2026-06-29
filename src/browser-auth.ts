@@ -482,9 +482,35 @@ export async function openBrowserSession(): Promise<BrowserSession> {
     const u = wsUrlByReq.get(reqId) || reqId;
     return u.includes('cluster9') ? 'cluster9' : u.includes('friends') ? 'friends' : u;
   }
+
+  // CDP-observed outcome of the most recent /refresh-access-token request. The
+  // browser sees the REAL HTTP status + failure reason even when the in-page
+  // fetch can only report status 0 (e.g. a 429/CF response with no CORS headers,
+  // or a connection the rate-limiter reset). refreshAccount reads this to learn
+  // what's actually behind an opaque fetch error. Refreshes are serial, so a
+  // single slot is enough.
+  const refreshReqIds = new Set<string>();
+  let lastRefreshNetwork: { status: number | null; statusText: string; failed: boolean; error: string | null; ts: number } | null = null;
+
   async function attachCdpListenersTo(p: Page): Promise<void> {
     const cdp = await context.newCDPSession(p);
     await cdp.send('Network.enable');
+    cdp.on('Network.requestWillBeSent', ({ requestId, request }: any) => {
+      if (request?.url?.includes('refresh-access-token')) refreshReqIds.add(requestId);
+    });
+    cdp.on('Network.responseReceived', ({ requestId, response }: any) => {
+      if (refreshReqIds.has(requestId)) {
+        lastRefreshNetwork = { status: response?.status ?? null, statusText: response?.statusText ?? '', failed: false, error: null, ts: Date.now() };
+      }
+    });
+    cdp.on('Network.loadingFailed', ({ requestId, errorText, blockedReason, corsErrorStatus }: any) => {
+      if (refreshReqIds.has(requestId)) {
+        const cors = corsErrorStatus?.corsError ? `cors:${corsErrorStatus.corsError}` : null;
+        lastRefreshNetwork = { status: null, statusText: '', failed: true, error: errorText || blockedReason || cors || 'unknown', ts: Date.now() };
+        refreshReqIds.delete(requestId);
+      }
+    });
+    cdp.on('Network.loadingFinished', ({ requestId }: any) => { refreshReqIds.delete(requestId); });
     cdp.on('Network.webSocketCreated', ({ requestId, url }: any) => {
       wsUrlByReq.set(requestId, url);
     });
@@ -710,7 +736,16 @@ export async function openBrowserSession(): Promise<BrowserSession> {
       await context.addCookies(cookiesToAdd);
 
       try {
+        const tBefore = Date.now();
         const result = await friendsPage.evaluate(async () => {
+          // Best-effort: most rate-limit headers are NOT CORS-safelisted, so a
+          // cross-origin read (api9 from the axiom.trade page) usually returns
+          // null for them. We still try — if the server exposes them we capture
+          // the real numbers; otherwise the probe falls back to measuring the
+          // ceiling/cooldown empirically.
+          const RL_HEADERS = ['retry-after', 'ratelimit-remaining', 'ratelimit-limit',
+            'ratelimit-reset', 'x-ratelimit-remaining', 'x-ratelimit-limit', 'x-ratelimit-reset'];
+          const t0 = performance.now();
           try {
             const r = await fetch('https://api9.axiom.trade/refresh-access-token', {
               method: 'POST',
@@ -719,14 +754,40 @@ export async function openBrowserSession(): Promise<BrowserSession> {
               body: JSON.stringify({}),
             });
             const text = await r.text();
-            return { ok: r.ok, status: r.status, body: text.slice(0, 500) };
+            const headers: Record<string, string> = {};
+            for (const k of RL_HEADERS) {
+              const v = r.headers.get(k);
+              if (v != null) headers[k] = v;
+            }
+            return { ok: r.ok, status: r.status, body: text.slice(0, 500), elapsedMs: Math.round(performance.now() - t0), headers };
           } catch (e: any) {
-            return { ok: false, status: 0, body: 'fetch error: ' + (e?.message || String(e)) };
+            return { ok: false, status: 0, body: 'fetch error: ' + (e?.message || String(e)), elapsedMs: Math.round(performance.now() - t0), headers: {} as Record<string, string> };
           }
         });
 
+        // What CDP saw for this exact request (real status / failure reason),
+        // which beats the opaque status 0 the in-page fetch reports when the
+        // response lacks CORS headers or the connection was reset.
+        const cdp = lastRefreshNetwork && lastRefreshNetwork.ts >= tBefore ? lastRefreshNetwork : null;
+        // Trust the in-page status when we got one; otherwise fall back to the
+        // status CDP observed on the wire.
+        const realStatus = result.status && result.status !== 0 ? result.status : (cdp?.status ?? 0);
+        const cdpNote = cdp ? (cdp.failed ? ` net=${cdp.error}` : ` wire=${cdp.status} ${cdp.statusText}`) : '';
+
+        // Surface rate-limit signals to callers. Passive: anything throttled or
+        // carrying a rate-limit header gets logged. The probe reads err.status.
+        const retryAfter = result.headers?.['retry-after'] ?? null;
+        if (realStatus === 429 || retryAfter != null || (cdp?.failed)) {
+          console.log(`[BrowserAuth] refresh signal: js-status=${result.status} wire-status=${cdp?.status ?? '?'} failed=${cdp?.failed ?? false} reason=${cdp?.error ?? '-'} retry-after=${retryAfter ?? '?'} headers=${JSON.stringify(result.headers)}`);
+        }
+
         if (!result.ok) {
-          throw new Error(`refresh-access-token ${result.status}: ${result.body}`);
+          const err: any = new Error(`refresh-access-token ${realStatus}${retryAfter != null ? ` retry-after=${retryAfter}` : ''}:${cdpNote} ${result.body}`);
+          err.status = realStatus;
+          err.retryAfter = retryAfter != null ? Number(retryAfter) : null;
+          err.elapsedMs = result.elapsedMs;
+          err.cdpError = cdp?.error ?? null;
+          throw err;
         }
 
         // Pull the rotated tokens out of the context cookie jar (set by Set-Cookie).

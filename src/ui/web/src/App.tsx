@@ -8,14 +8,22 @@ interface Status {
   accounts: number;
   selected: number;
   activeViewers: number;
+  keepWarm: boolean;
+}
+
+export type ViewerState = 'pending' | 'connecting' | 'connected' | 'failed';
+export interface ViewerProgress {
+  total: number;
+  states: Record<string, ViewerState>;
 }
 
 let logIdCounter = 0;
 
 export default function App() {
-  const [status, setStatus] = useState<Status>({ accounts: 0, selected: 0, activeViewers: 0 });
+  const [status, setStatus] = useState<Status>({ accounts: 0, selected: 0, activeViewers: 0, keepWarm: false });
   const [logEntries, setLogEntries] = useState<LogEntry[]>([]);
   const [accountsRefreshTick, setAccountsRefreshTick] = useState(0);
+  const [viewerProgress, setViewerProgress] = useState<ViewerProgress>({ total: 0, states: {} });
   const wsRef = useRef<WebSocket | null>(null);
 
   const addLog = useCallback((message: string, type: LogEntry['type'] = 'info') => {
@@ -68,12 +76,44 @@ export default function App() {
             accounts: msg.data.accounts ?? s.accounts,
             selected: msg.data.selected ?? s.selected,
             activeViewers: msg.data.activeViewers ?? s.activeViewers,
+            keepWarm: msg.data.keepWarm ?? s.keepWarm,
           }));
+        } else if (msg.type === 'keepwarm') {
+          const m: string = msg.data.message ?? '';
+          const type: LogEntry['type'] = /dead token|rate limit|no refresh token|error/i.test(m)
+            ? 'error'
+            : /refreshed|started/i.test(m)
+              ? 'success'
+              : 'info';
+          addLog(`[keep] ${m}`, type);
+          if (typeof msg.data.running === 'boolean') {
+            setStatus((s) => ({ ...s, keepWarm: msg.data.running }));
+          }
         } else if (msg.type === 'relogin-progress') {
           addLog(msg.data.message, 'info');
           if (msg.data.done === msg.data.total) refreshAccounts();
         } else if (msg.type === 'accounts-changed') {
           refreshAccounts();
+        } else if (msg.type === 'viewer-run') {
+          const states: Record<string, ViewerState> = {};
+          for (const pk of msg.data.accounts ?? []) states[pk] = 'pending';
+          setViewerProgress({ total: msg.data.total ?? 0, states });
+        } else if (msg.type === 'viewer-progress') {
+          setViewerProgress((p) => ({
+            total: msg.data.total ?? p.total,
+            states: { ...p.states, [msg.data.publicKey]: msg.data.state as ViewerState },
+          }));
+          if (typeof msg.data.connected === 'number') {
+            setStatus((s) => ({ ...s, activeViewers: msg.data.connected }));
+          }
+        } else if (msg.type === 'probe-progress') {
+          const m: string = msg.data.message ?? '';
+          const type: LogEntry['type'] = /throttl|FAIL|net::|429|longer than/i.test(m)
+            ? 'error'
+            : /Recovered|cooldown measured|\bOK\b/i.test(m)
+              ? 'success'
+              : 'info';
+          addLog(`[probe] ${m}`, type);
         }
       };
     }
@@ -107,10 +147,10 @@ export default function App() {
             </TabsList>
           </div>
           <TabsContent value="run" forceMount className="m-0 flex-1 overflow-auto p-4 data-[state=inactive]:hidden">
-            <RunTab onLog={addLog} refreshTick={accountsRefreshTick} onAccountsChanged={refreshAccounts} />
+            <RunTab onLog={addLog} refreshTick={accountsRefreshTick} onAccountsChanged={refreshAccounts} viewerProgress={viewerProgress} />
           </TabsContent>
           <TabsContent value="accounts" className="m-0 flex-1 overflow-auto p-4">
-            <AccountsTab onLog={addLog} refreshTick={accountsRefreshTick} onChanged={refreshAccounts} />
+            <AccountsTab onLog={addLog} refreshTick={accountsRefreshTick} onChanged={refreshAccounts} keepWarmRunning={status.keepWarm} />
           </TabsContent>
         </Tabs>
       </main>

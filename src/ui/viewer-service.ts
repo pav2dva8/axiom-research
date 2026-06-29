@@ -96,11 +96,13 @@ export class ViewerService extends EventEmitter {
     return this.tokenInfo;
   }
 
-  private async connectAccount(account: LoadedAccount, slotIndex: number = 0): Promise<boolean> {
+  private async connectAccount(account: LoadedAccount, slotIndex: number = 0, emitProgress: boolean = true): Promise<boolean> {
     if (!this.tokenInfo || !this.browserSession) {
       console.log(`[Viewer] ${account.publicKey.slice(0, 8)}: no ${!this.tokenInfo ? 'token info' : 'browser session'}`);
+      if (emitProgress) this.emit('viewer-failed', account.publicKey);
       return false;
     }
+    if (emitProgress) this.emit('viewer-connecting', account.publicKey);
     try {
       // First viewer attempt for this account in this process: fire the
       // bootstrap HTTP burst the real client does on page load. Without it
@@ -146,6 +148,7 @@ export class ViewerService extends EventEmitter {
       return true;
     } catch (err: any) {
       console.log(`[Viewer] ${account.publicKey.slice(0, 8)} failed: ${err.message}`);
+      if (emitProgress) this.emit('viewer-failed', account.publicKey);
       return false;
     }
   }
@@ -186,7 +189,7 @@ export class ViewerService extends EventEmitter {
       const warmAccount = order.find(a => !this.connectedViewers.has(a.publicKey));
       if (warmAccount) {
         console.log(`[Viewer] Warming cluster9 path with ${warmAccount.publicKey.slice(0, 8)}...`);
-        const ok = await this.connectAccount(warmAccount, 0).catch(() => false);
+        const ok = await this.connectAccount(warmAccount, 0, false).catch(() => false);
         if (ok) {
           const id = this.connectedViewers.get(warmAccount.publicKey);
           this.connectedViewers.delete(warmAccount.publicKey);

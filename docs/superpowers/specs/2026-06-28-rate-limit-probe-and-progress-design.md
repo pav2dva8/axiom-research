@@ -140,6 +140,31 @@ app (the operator runs it). After implementation:
 5. Run tab: Start viewers; confirm per-account pills move connecting → connected/failed
    live and the N/total header tracks `activeViewers`.
 
+## Addendum — measured limits + "Keep logged in" button (2026-06-28)
+
+Probe results: **refresh ceiling ≈ 16 per IP, cooldown ≈ 31s, ~150/min before the wall.**
+The throttle is NOT a clean 429 — the in-page fetch fails with status 0 (CORS-less
+response / reset connection); CDP capture (`Network.responseReceived` / `loadingFailed`
+on the existing per-page session) surfaces the real wire status/reason. The probe now
+treats 2 consecutive failures as the wall, confirms it's the IP (retries a known-good
+account), then measures cooldown by polling until recovery.
+
+**Capacity verdict:** one IP sustains ~16/31s ≈ 31 refreshes/min; keeping 100 accounts
+alive needs only ~8/min. No proxies required.
+
+**Keep logged in (refresh-only):** one button on the Accounts tab.
+`accountManager.startKeepLoggedIn(targets, {delayMs=2500, thresholdMin=5}, onProgress)`
+runs a background loop: first pass refreshes every selected account that has a refresh
+token; later passes only refresh accounts within `thresholdMin` of expiry. Paced
+`delayMs` apart (≈12–14 per 31s, under the wall). On the wall (2 consecutive fails) it
+backs off 35s; an account whose refresh keeps failing (3×) is flagged dead and skipped
+(needs a manual re-login — the per-row button still works during keep-warm). **It never
+re-logins** — login has its own stricter limits, per operator. A `runExclusive` mutex in
+account-manager serializes every browser refresh/login op (shared cookie jar is not
+concurrency-safe) so the loop can't collide with a manual refresh/relogin/probe.
+Endpoints: `POST /api/accounts/keepwarm/start|stop`; state in `statusPayload().keepWarm`
++ a `keepwarm` WS message. Stop via the button or `stopReloginAll`.
+
 ## Risks / notes
 
 - The probe deliberately trips the rate limit; keep the default cap (20) modest so it
