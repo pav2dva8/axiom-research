@@ -35,6 +35,15 @@ export interface DeployWatchProgress {
 
 let logIdCounter = 0;
 
+function isActiveDeployWatchState(state: DeployWatchState): boolean {
+  return (
+    state === 'preparing' ||
+    state === 'watching' ||
+    state === 'detected' ||
+    state === 'starting'
+  );
+}
+
 export default function App() {
   const [status, setStatus] = useState<Status>({
     accounts: 0,
@@ -94,14 +103,20 @@ export default function App() {
       ws.onmessage = (event) => {
         const msg = JSON.parse(event.data);
         if (msg.type === 'status') {
+          const deployWatchStatus = msg.data.deployWatch;
           setStatus((s) => ({
             ...s,
             accounts: msg.data.accounts ?? s.accounts,
             selected: msg.data.selected ?? s.selected,
             activeViewers: msg.data.activeViewers ?? s.activeViewers,
             keepWarm: msg.data.keepWarm ?? s.keepWarm,
-            deployWatch: msg.data.deployWatch ?? s.deployWatch,
+            deployWatch: deployWatchStatus ?? s.deployWatch,
           }));
+          if (deployWatchStatus === false) {
+            setDeployWatch((prev) =>
+              prev && isActiveDeployWatchState(prev.state) ? null : prev,
+            );
+          }
         } else if (msg.type === 'keepwarm') {
           const m: string = msg.data.message ?? '';
           const type: LogEntry['type'] = /dead token|rate limit|no refresh token|error/i.test(m)
@@ -142,11 +157,7 @@ export default function App() {
           addLog(`[watch] ${data.message}`, type);
           setStatus((s) => ({
             ...s,
-            deployWatch:
-              data.state === 'preparing' ||
-              data.state === 'watching' ||
-              data.state === 'detected' ||
-              data.state === 'starting',
+            deployWatch: isActiveDeployWatchState(data.state),
           }));
         } else if (msg.type === 'probe-progress') {
           const m: string = msg.data.message ?? '';
@@ -195,6 +206,7 @@ export default function App() {
               onAccountsChanged={refreshAccounts}
               viewerProgress={viewerProgress}
               deployWatch={deployWatch}
+              deployWatchActive={status.deployWatch}
             />
           </TabsContent>
           <TabsContent value="accounts" className="m-0 flex-1 overflow-auto p-4">

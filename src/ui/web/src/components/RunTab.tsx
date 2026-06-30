@@ -28,6 +28,7 @@ interface Props {
   onAccountsChanged: () => void;
   viewerProgress: ViewerProgress;
   deployWatch: DeployWatchProgress | null;
+  deployWatchActive: boolean;
 }
 
 const STATE_STYLE: Record<ViewerState, string> = {
@@ -84,6 +85,7 @@ export function RunTab({
   onAccountsChanged,
   viewerProgress,
   deployWatch,
+  deployWatchActive,
 }: Props) {
   const [input, setInput] = useState("");
   const [token, setToken] = useState<ResolvedToken | null>(null);
@@ -328,11 +330,12 @@ export function RunTab({
     {} as Record<string, number>,
   );
   const connectedCount = counts.connected ?? 0;
-  const watchActive =
+  const eventWatchActive =
     deployWatch?.state === "preparing" ||
     deployWatch?.state === "watching" ||
     deployWatch?.state === "detected" ||
     deployWatch?.state === "starting";
+  const watchActive = deployWatchActive || eventWatchActive;
   const isActive =
     watchActive ||
     running ||
