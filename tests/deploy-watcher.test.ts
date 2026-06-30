@@ -33,6 +33,8 @@ test("getDeployWatchConfig uses defaults and trims env values", () => {
     getDeployWatchConfig({ DEPLOY_WATCH_POLL_MS: "abc" }).pollMs,
     DEFAULT_DEPLOY_WATCH_POLL_MS,
   );
+
+  assert.equal(getDeployWatchConfig({ DEPLOY_WATCH_POLL_MS: "0" }).pollMs, 0);
 });
 
 test("parseDeployWatchInput accepts a bare pump CA and derives the pair", () => {
@@ -66,6 +68,11 @@ test("parseDeployWatchInput rejects links, invalid keys, and non-pump CAs", () =
   );
 
   assert.throws(() => parseDeployWatchInput("not-a-solana-address"), /bare token CA/i);
+
+  assert.throws(
+    () => parseDeployWatchInput("111111111111111111111111111111111"),
+    /Invalid Solana CA/i,
+  );
 
   assert.throws(
     () => parseDeployWatchInput("11111111111111111111111111111111"),

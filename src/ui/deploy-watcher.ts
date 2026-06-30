@@ -26,7 +26,7 @@ export function getDeployWatchConfig(
   const rawWs = env.SOLANA_WS_URL?.trim();
   const rawPoll = Number(env.DEPLOY_WATCH_POLL_MS);
   const pollMs =
-    Number.isFinite(rawPoll) && rawPoll >= 50
+    Number.isFinite(rawPoll) && rawPoll >= 0
       ? Math.floor(rawPoll)
       : DEFAULT_DEPLOY_WATCH_POLL_MS;
 
