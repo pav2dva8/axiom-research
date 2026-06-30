@@ -10,6 +10,14 @@ import * as fs from "fs";
 import * as path from "path";
 import { WebSocketServer, WebSocket } from "ws";
 import { AccountManager } from "./account-manager";
+import {
+  DeployWatchCanceledError,
+  DeployWatcher,
+  buildDeployTokenInfo,
+  getDeployWatchConfig,
+  parseDeployWatchInput,
+  type DeployWatchEvent,
+} from "./deploy-watcher";
 import { ViewerService, type TokenInfo } from "./viewer-service";
 import { derivePumpPair, isPumpCa } from "../pump-pair";
 
@@ -17,6 +25,7 @@ const PORT = process.env.PORT || 3847;
 
 const accountManager = new AccountManager();
 const viewerService = new ViewerService();
+const deployWatcher = new DeployWatcher();
 
 const uiClients: Set<WebSocket> = new Set();
 
@@ -33,12 +42,20 @@ function statusPayload() {
     selected: accountManager.getSelectedCount(),
     activeViewers: viewerService.getActiveCount(),
     keepWarm: accountManager.isKeepWarmRunning(),
+    deployWatch: deployWatcher.isActive(),
   };
 }
 
 function broadcastStatus(): void {
   broadcast("status", statusPayload());
 }
+
+const stopDeployWatchBroadcast = deployWatcher.onDeployWatch(
+  (event: DeployWatchEvent) => {
+    broadcast("deploy-watch", event);
+    broadcastStatus();
+  },
+);
 
 // Total accounts in the current viewer run, for the live progress display.
 let currentRunTotal = 0;
@@ -487,6 +504,133 @@ async function handleApi(
       return;
     }
 
+    // POST /api/viewers/watch-deploy-start  { input, minGapMs?, maxGapMs?, bootstrapDisabled?, concurrency? }
+    if (pathname === "/api/viewers/watch-deploy-start" && req.method === "POST") {
+      if (deployWatcher.isActive()) {
+        res.writeHead(409);
+        res.end(JSON.stringify({ error: "A deploy watch is already active." }));
+        return;
+      }
+
+      const body = JSON.parse(await readBody(req));
+      const { input, minGapMs, maxGapMs, bootstrapDisabled, concurrency } =
+        body ?? {};
+      if (typeof input !== "string" || !input.trim()) {
+        res.writeHead(400);
+        res.end(JSON.stringify({ error: "input required" }));
+        return;
+      }
+
+      let parsed;
+      try {
+        parsed = parseDeployWatchInput(input);
+      } catch (err: any) {
+        res.writeHead(400);
+        res.end(JSON.stringify({ error: err.message }));
+        return;
+      }
+
+      const tokenInfo = buildDeployTokenInfo(parsed);
+      const minGapValid =
+        typeof minGapMs === "number" &&
+        Number.isFinite(minGapMs) &&
+        minGapMs >= 0;
+      const maxGapValid =
+        typeof maxGapMs === "number" &&
+        Number.isFinite(maxGapMs) &&
+        maxGapMs >= 0;
+      const concurrencyValid =
+        typeof concurrency === "number" &&
+        Number.isFinite(concurrency) &&
+        concurrency >= 1;
+
+      broadcast("deploy-watch", {
+        state: "preparing",
+        message: `Preparing browser/accounts for CA ${parsed.ca}.`,
+        ca: parsed.ca,
+        pairAddress: parsed.pairAddress,
+      });
+
+      try {
+        await ensureBrowserSession();
+        viewerService.setTokenInfo(tokenInfo);
+
+        const accounts = accountManager.loadSelectedAccounts();
+        if (accounts.length === 0) {
+          res.writeHead(400);
+          res.end(
+            JSON.stringify({
+              error:
+                "No accounts selected or none have valid tokens. Re-login first.",
+            }),
+          );
+          return;
+        }
+
+        const detection = await deployWatcher.waitForDeploy(
+          parsed,
+          getDeployWatchConfig(),
+        );
+
+        broadcast("deploy-watch", {
+          state: "starting",
+          message: `Mint detected at slot ${detection.slot}; starting viewers.`,
+          ca: parsed.ca,
+          pairAddress: parsed.pairAddress,
+        });
+
+        currentRunTotal = accounts.length;
+        broadcast("viewer-run", {
+          total: accounts.length,
+          accounts: accounts.map((a) => a.publicKey),
+        });
+
+        const connected = await viewerService.connectAll(accounts, {
+          ...(minGapValid ? { minGapMs } : {}),
+          ...(maxGapValid ? { maxGapMs } : {}),
+          ...(concurrencyValid ? { concurrency } : {}),
+          bootstrapDisabled: bootstrapDisabled === true,
+        });
+
+        broadcastStatus();
+        res.writeHead(200);
+        res.end(
+          JSON.stringify({
+            connected,
+            total: accounts.length,
+            detectedAt: detection.detectedAt,
+            slot: detection.slot,
+            source: detection.source,
+          }),
+        );
+        return;
+      } catch (err: any) {
+        if (err instanceof DeployWatchCanceledError) {
+          const accounts = accountManager.loadSelectedAccounts();
+          currentRunTotal = 0;
+          broadcast("viewer-run", { total: 0, accounts: [] });
+          broadcastStatus();
+          res.writeHead(200);
+          res.end(
+            JSON.stringify({
+              canceled: true,
+              connected: 0,
+              total: accounts.length,
+            }),
+          );
+          return;
+        }
+
+        broadcast("deploy-watch", {
+          state: "failed",
+          message: err.message,
+          ca: parsed.ca,
+          pairAddress: parsed.pairAddress,
+        });
+        throw err;
+      }
+    }
+
     // POST /api/viewers/start  { pairAddress, minGapMs?, maxGapMs?, bootstrapDisabled?, concurrency? }
     if (pathname === "/api/viewers/start" && req.method === "POST") {
       const body = JSON.parse(await readBody(req));
@@ -584,6 +728,8 @@ async function handleApi(
         }
       } catch {}
 
+      deployWatcher.cancel("Deploy watch canceled by Stop.");
+
       if (mode === "slow") {
         const disconnected = await viewerService.disconnectSlowly(delayMs);
         if (viewerService.getActiveCount() === 0) {
@@ -673,6 +819,8 @@ server.listen(PORT, () => {
 
 process.on("SIGINT", () => {
   console.log("\nShutting down...");
+  deployWatcher.cancel("Server shutting down.");
+  stopDeployWatchBroadcast();
   viewerService.disconnectAll();
   accountManager.closeBrowserSession().catch(() => {});
   server.close();
