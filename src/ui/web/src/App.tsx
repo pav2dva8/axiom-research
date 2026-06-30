@@ -11,7 +11,7 @@ interface Status {
   keepWarm: boolean;
 }
 
-export type ViewerState = 'pending' | 'connecting' | 'connected' | 'failed';
+export type ViewerState = 'pending' | 'connecting' | 'connected' | 'failed' | 'disconnected';
 export interface ViewerProgress {
   total: number;
   states: Record<string, ViewerState>;

@@ -34,6 +34,7 @@ const STATE_STYLE: Record<ViewerState, string> = {
   connecting: "bg-amber-500/15 text-amber-400",
   connected: "bg-emerald-500/15 text-emerald-400",
   failed: "bg-red-500/15 text-red-400",
+  disconnected: "bg-muted/50 text-muted-foreground line-through",
 };
 
 const BASE58 = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
@@ -76,13 +77,19 @@ function parsePaste(text: string, knownAccounts: Set<string>) {
   return { ca, publicKeys };
 }
 
-export function RunTab({ onLog, refreshTick, onAccountsChanged, viewerProgress }: Props) {
+export function RunTab({
+  onLog,
+  refreshTick,
+  onAccountsChanged,
+  viewerProgress,
+}: Props) {
   const [input, setInput] = useState("");
   const [token, setToken] = useState<ResolvedToken | null>(null);
   const [accounts, setAccounts] = useState<Account[]>([]);
   const [resolving, setResolving] = useState(false);
   const [running, setRunning] = useState(false);
   const [busy, setBusy] = useState(false);
+  const [stopping, setStopping] = useState(false);
   const [pasting, setPasting] = useState(false);
   const [minGapMs, setMinGapMs] = useState<number>(DEFAULT_MIN_GAP_MS);
   const [maxGapMs, setMaxGapMs] = useState<number>(DEFAULT_MAX_GAP_MS);
@@ -102,6 +109,10 @@ export function RunTab({ onLog, refreshTick, onAccountsChanged, viewerProgress }
   useEffect(() => {
     fetchAccounts();
   }, [fetchAccounts, refreshTick]);
+
+  useEffect(() => {
+    if (viewerProgress.total === 0) setRunning(false);
+  }, [viewerProgress.total]);
 
   async function pasteFromClipboard() {
     setPasting(true);
@@ -184,6 +195,7 @@ export function RunTab({ onLog, refreshTick, onAccountsChanged, viewerProgress }
 
       const safeMin = Math.max(0, Math.floor(minGapMs));
       const safeMax = Math.max(safeMin, Math.floor(maxGapMs));
+      setRunning(true);
       const startRes = await fetch("/api/viewers/start", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -201,6 +213,7 @@ export function RunTab({ onLog, refreshTick, onAccountsChanged, viewerProgress }
           `Start failed: ${startData.error ?? startRes.statusText}`,
           "error",
         );
+        setRunning(false);
         setBusy(false);
         return;
       }
@@ -208,25 +221,52 @@ export function RunTab({ onLog, refreshTick, onAccountsChanged, viewerProgress }
         `Started ${startData.connected} viewer(s) on ${t.ticker}`,
         "success",
       );
-      setRunning(true);
     } catch (err: any) {
       onLog(`Error: ${err.message}`, "error");
       setResolving(false);
+      setRunning(false);
     } finally {
       setBusy(false);
     }
   }
 
-  async function stopViewers() {
+  async function forceStop() {
     setBusy(true);
     try {
-      await fetch("/api/viewers/stop", { method: "POST" });
-      onLog("Viewers stopped", "success");
+      await fetch("/api/viewers/stop", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ mode: "force" }),
+      });
+      onLog("Force stopped all viewers", "success");
       setRunning(false);
+      setStopping(false);
     } catch (err: any) {
       onLog(`Error: ${err.message}`, "error");
     } finally {
       setBusy(false);
+    }
+  }
+
+  async function slowStop() {
+    setStopping(true);
+    onLog("Slow stop — disconnecting 1 viewer/sec...", "info");
+    try {
+      const res = await fetch("/api/viewers/stop", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ mode: "slow", delayMs: 2000 }),
+      });
+      const data = await res.json();
+      onLog(
+        `Slow stop done — disconnected ${data.disconnected ?? 0} viewer(s)`,
+        "success",
+      );
+      setRunning(false);
+    } catch (err: any) {
+      onLog(`Error: ${err.message}`, "error");
+    } finally {
+      setStopping(false);
     }
   }
 
@@ -239,6 +279,8 @@ export function RunTab({ onLog, refreshTick, onAccountsChanged, viewerProgress }
     {} as Record<string, number>,
   );
   const connectedCount = counts.connected ?? 0;
+  const isActive =
+    running || connectedCount > 0 || (counts.connecting ?? 0) > 0;
 
   return (
     <div className="mx-auto flex max-w-xl flex-col gap-4">
@@ -253,13 +295,13 @@ export function RunTab({ onLog, refreshTick, onAccountsChanged, viewerProgress }
             spellCheck={false}
             autoComplete="off"
             className="font-mono"
-            disabled={running || busy}
+            disabled={isActive || busy || stopping}
           />
           <Button
             variant="outline"
             size="icon"
             onClick={pasteFromClipboard}
-            disabled={running || busy || pasting}
+            disabled={isActive || busy || pasting || stopping}
             aria-label="Paste CA and accounts"
             title="Paste CA and selected accounts from clipboard"
           >
@@ -269,22 +311,45 @@ export function RunTab({ onLog, refreshTick, onAccountsChanged, viewerProgress }
               <ClipboardPaste className="h-4 w-4" />
             )}
           </Button>
-          {!running ? (
-            <Button onClick={resolveAndStart} disabled={busy || !input.trim()}>
-              {resolving ? (
-                <Loader2 className="h-4 w-4 animate-spin" />
-              ) : (
-                <Play className="h-4 w-4" />
-              )}
-              <span className="ml-2">Start</span>
-            </Button>
-          ) : (
-            <Button variant="destructive" onClick={stopViewers} disabled={busy}>
-              <Square className="h-4 w-4" />
-              <span className="ml-2">Stop</span>
-            </Button>
-          )}
+          <Button
+            onClick={resolveAndStart}
+            disabled={isActive || busy || stopping || !input.trim()}
+          >
+            {resolving ? (
+              <Loader2 className="h-4 w-4 animate-spin" />
+            ) : (
+              <Play className="h-4 w-4" />
+            )}
+            <span className="ml-2">Start</span>
+          </Button>
         </div>
+        {isActive && (
+          <div className="flex justify-end gap-2">
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={slowStop}
+              disabled={stopping || connectedCount === 0}
+              title="Disconnect one viewer at a time (~1s apart)"
+            >
+              {stopping ? (
+                <Loader2 className="mr-2 h-3.5 w-3.5 animate-spin" />
+              ) : (
+                <Square className="mr-2 h-3.5 w-3.5" />
+              )}
+              Slow stop
+            </Button>
+            <Button
+              variant="destructive"
+              size="sm"
+              onClick={forceStop}
+              title="Immediately disconnect all viewers and cancel any in-progress connections"
+            >
+              <Square className="mr-2 h-3.5 w-3.5" />
+              Force stop
+            </Button>
+          </div>
+        )}
       </div>
 
       <div className="flex flex-col gap-2">
@@ -304,7 +369,7 @@ export function RunTab({ onLog, refreshTick, onAccountsChanged, viewerProgress }
             onBlur={() => {
               if (maxGapMs < minGapMs) setMaxGapMs(minGapMs);
             }}
-            disabled={running || busy}
+            disabled={isActive || busy || stopping}
             className="font-mono"
             aria-label="Minimum delay"
           />
@@ -321,7 +386,7 @@ export function RunTab({ onLog, refreshTick, onAccountsChanged, viewerProgress }
             onBlur={() => {
               if (maxGapMs < minGapMs) setMaxGapMs(minGapMs);
             }}
-            disabled={running || busy}
+            disabled={isActive || busy || stopping}
             className="font-mono"
             aria-label="Maximum delay"
           />
@@ -333,7 +398,7 @@ export function RunTab({ onLog, refreshTick, onAccountsChanged, viewerProgress }
               setMinGapMs(DEFAULT_MIN_GAP_MS);
               setMaxGapMs(DEFAULT_MAX_GAP_MS);
             }}
-            disabled={running || busy}
+            disabled={isActive || busy || stopping}
             title={`Reset to default ${DEFAULT_MIN_GAP_MS}–${DEFAULT_MAX_GAP_MS} ms`}
           >
             Default
@@ -382,13 +447,18 @@ export function RunTab({ onLog, refreshTick, onAccountsChanged, viewerProgress }
         <div className="flex flex-col gap-2 rounded-md border border-border bg-card p-3">
           <div className="flex items-center justify-between text-xs">
             <span className="font-medium">
-              {connectedCount}/{viewerProgress.total || progressEntries.length} connected
+              {connectedCount}/{viewerProgress.total || progressEntries.length}{" "}
+              connected
             </span>
             <span className="flex gap-2 font-mono text-muted-foreground">
               {(counts.connecting ?? 0) > 0 && (
-                <span className="text-amber-400">{counts.connecting} connecting</span>
+                <span className="text-amber-400">
+                  {counts.connecting} connecting
+                </span>
               )}
-              {(counts.pending ?? 0) > 0 && <span>{counts.pending} pending</span>}
+              {(counts.pending ?? 0) > 0 && (
+                <span>{counts.pending} pending</span>
+              )}
               {(counts.failed ?? 0) > 0 && (
                 <span className="text-red-400">{counts.failed} failed</span>
               )}

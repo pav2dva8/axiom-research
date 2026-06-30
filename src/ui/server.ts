@@ -52,13 +52,20 @@ function broadcastViewerProgress(publicKey: string, state: string): void {
   });
 }
 
-viewerService.on("viewer-connecting", (pk: string) => broadcastViewerProgress(pk, "connecting"));
+viewerService.on("viewer-connecting", (pk: string) =>
+  broadcastViewerProgress(pk, "connecting"),
+);
 viewerService.on("viewer-connected", (pk: string) => {
   broadcastViewerProgress(pk, "connected");
   broadcastStatus();
 });
-viewerService.on("viewer-failed", (pk: string) => broadcastViewerProgress(pk, "failed"));
-viewerService.on("viewer-disconnected", () => broadcastStatus());
+viewerService.on("viewer-failed", (pk: string) =>
+  broadcastViewerProgress(pk, "failed"),
+);
+viewerService.on("viewer-disconnected", (pk: string) => {
+  broadcastViewerProgress(pk, "disconnected");
+  broadcastStatus();
+});
 
 function readBody(req: http.IncomingMessage): Promise<string> {
   return new Promise((resolve, reject) => {
@@ -116,20 +123,27 @@ async function authTokensForResolve(
   session: NonNullable<ReturnType<typeof viewerService.getBrowserSession>>,
 ): Promise<{ accessToken: string; refreshToken: string } | null> {
   const selected = accountManager.loadSelectedAccounts();
-  const pool = selected.length > 0 ? selected : accountManager.loadAllAccounts();
+  const pool =
+    selected.length > 0 ? selected : accountManager.loadAllAccounts();
   if (pool.length === 0) return null;
 
   const valid = pool.find((a) => accountManager.isTokenValid(a.publicKey));
-  if (valid) return { accessToken: valid.accessToken, refreshToken: valid.refreshToken };
+  if (valid)
+    return { accessToken: valid.accessToken, refreshToken: valid.refreshToken };
 
   // No valid cached token — refresh one. Try a few in case some refresh
   // tokens are also stale.
   for (const a of pool.slice(0, 3)) {
-    const ok = await accountManager.refreshAccount(a.publicKey, session).catch(() => false);
+    const ok = await accountManager
+      .refreshAccount(a.publicKey, session)
+      .catch(() => false);
     if (ok) {
       const fresh = accountManager.loadAccount(a.publicKey);
       if (fresh?.accessToken) {
-        return { accessToken: fresh.accessToken, refreshToken: fresh.refreshToken };
+        return {
+          accessToken: fresh.accessToken,
+          refreshToken: fresh.refreshToken,
+        };
       }
     }
   }
@@ -280,28 +294,48 @@ async function handleApi(
         if (body) {
           const parsed = JSON.parse(body);
           if (Array.isArray(parsed.publicKeys)) targets = parsed.publicKeys;
-          if (typeof parsed.delayMs === "number" && Number.isFinite(parsed.delayMs)) delayMs = parsed.delayMs;
-          if (typeof parsed.thresholdMin === "number" && Number.isFinite(parsed.thresholdMin)) thresholdMin = parsed.thresholdMin;
+          if (
+            typeof parsed.delayMs === "number" &&
+            Number.isFinite(parsed.delayMs)
+          )
+            delayMs = parsed.delayMs;
+          if (
+            typeof parsed.thresholdMin === "number" &&
+            Number.isFinite(parsed.thresholdMin)
+          )
+            thresholdMin = parsed.thresholdMin;
         }
       } catch {}
 
-      await accountManager.startKeepLoggedIn(targets, { delayMs, thresholdMin }, (message, running) => {
-        broadcast("keepwarm", { running, message });
-      });
+      await accountManager.startKeepLoggedIn(
+        targets,
+        { delayMs, thresholdMin },
+        (message, running) => {
+          broadcast("keepwarm", { running, message });
+        },
+      );
 
       const session = accountManager.getBrowserSession();
       if (session) viewerService.setBrowserSession(session);
 
       broadcastStatus();
       res.writeHead(200);
-      res.end(JSON.stringify({ ok: true, running: accountManager.isKeepWarmRunning() }));
+      res.end(
+        JSON.stringify({
+          ok: true,
+          running: accountManager.isKeepWarmRunning(),
+        }),
+      );
       return;
     }
 
     // POST /api/accounts/keepwarm/stop
     if (pathname === "/api/accounts/keepwarm/stop" && req.method === "POST") {
       accountManager.stopKeepLoggedIn();
-      broadcast("keepwarm", { running: false, message: "Keep-logged-in stopping..." });
+      broadcast("keepwarm", {
+        running: false,
+        message: "Keep-logged-in stopping...",
+      });
       broadcastStatus();
       res.writeHead(200);
       res.end(JSON.stringify({ ok: true }));
@@ -319,16 +353,24 @@ async function handleApi(
         if (body) {
           const parsed = JSON.parse(body);
           if (Array.isArray(parsed.publicKeys)) targets = parsed.publicKeys;
-          if (typeof parsed.cap === "number" && Number.isFinite(parsed.cap) && parsed.cap >= 1) {
+          if (
+            typeof parsed.cap === "number" &&
+            Number.isFinite(parsed.cap) &&
+            parsed.cap >= 1
+          ) {
             cap = Math.floor(parsed.cap);
           }
         }
       } catch {}
 
       res.writeHead(200);
-      const result = await accountManager.probeLimit(targets, cap, (message) => {
-        broadcast("probe-progress", { message });
-      });
+      const result = await accountManager.probeLimit(
+        targets,
+        cap,
+        (message) => {
+          broadcast("probe-progress", { message });
+        },
+      );
 
       const session = accountManager.getBrowserSession();
       if (session) viewerService.setBrowserSession(session);
@@ -354,7 +396,9 @@ async function handleApi(
 
       if (!/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(value)) {
         res.writeHead(400);
-        res.end(JSON.stringify({ error: "No token CA or axiom link found in input" }));
+        res.end(
+          JSON.stringify({ error: "No token CA or axiom link found in input" }),
+        );
         return;
       }
 
@@ -408,12 +452,22 @@ async function handleApi(
       const tokenInfo: TokenInfo = pairData
         ? {
             pairAddress: pairData.pairAddress || pairAddress,
-            tokenAddress: pairData.tokenAddress || pairData.baseToken?.address || "",
-            ticker: pairData.ticker || pairData.tokenTicker || pairData.baseToken?.symbol || "UNKNOWN",
-            name: pairData.name || pairData.tokenName || pairData.baseToken?.name || "Unknown Token",
+            tokenAddress:
+              pairData.tokenAddress || pairData.baseToken?.address || "",
+            ticker:
+              pairData.ticker ||
+              pairData.tokenTicker ||
+              pairData.baseToken?.symbol ||
+              "UNKNOWN",
+            name:
+              pairData.name ||
+              pairData.tokenName ||
+              pairData.baseToken?.name ||
+              "Unknown Token",
             protocol: pairData.protocol || "Pump V1",
             isMigrated: pairData.isMigrated || false,
-            supply: pairData.supply || pairData.baseToken?.totalSupply || 1000000000,
+            supply:
+              pairData.supply || pairData.baseToken?.totalSupply || 1000000000,
             price: pairData.price || pairData.priceUsd || 0,
           }
         : {
@@ -436,15 +490,30 @@ async function handleApi(
     // POST /api/viewers/start  { pairAddress, minGapMs?, maxGapMs?, bootstrapDisabled?, concurrency? }
     if (pathname === "/api/viewers/start" && req.method === "POST") {
       const body = JSON.parse(await readBody(req));
-      const { pairAddress, minGapMs, maxGapMs, bootstrapDisabled, concurrency } = body ?? {};
+      const {
+        pairAddress,
+        minGapMs,
+        maxGapMs,
+        bootstrapDisabled,
+        concurrency,
+      } = body ?? {};
       if (typeof pairAddress !== "string" || !pairAddress.trim()) {
         res.writeHead(400);
         res.end(JSON.stringify({ error: "pairAddress required" }));
         return;
       }
-      const minGapValid = typeof minGapMs === "number" && Number.isFinite(minGapMs) && minGapMs >= 0;
-      const maxGapValid = typeof maxGapMs === "number" && Number.isFinite(maxGapMs) && maxGapMs >= 0;
-      const concurrencyValid = typeof concurrency === "number" && Number.isFinite(concurrency) && concurrency >= 1;
+      const minGapValid =
+        typeof minGapMs === "number" &&
+        Number.isFinite(minGapMs) &&
+        minGapMs >= 0;
+      const maxGapValid =
+        typeof maxGapMs === "number" &&
+        Number.isFinite(maxGapMs) &&
+        maxGapMs >= 0;
+      const concurrencyValid =
+        typeof concurrency === "number" &&
+        Number.isFinite(concurrency) &&
+        concurrency >= 1;
 
       await ensureBrowserSession();
 
@@ -497,8 +566,36 @@ async function handleApi(
       return;
     }
 
-    // POST /api/viewers/stop
+    // POST /api/viewers/stop  { mode?: 'force' | 'slow', delayMs?: number }
     if (pathname === "/api/viewers/stop" && req.method === "POST") {
+      const body = await readBody(req).catch(() => "");
+      let mode: "force" | "slow" = "force";
+      let delayMs = 2000;
+      try {
+        if (body) {
+          const parsed = JSON.parse(body);
+          if (parsed.mode === "slow") mode = "slow";
+          if (
+            typeof parsed.delayMs === "number" &&
+            Number.isFinite(parsed.delayMs)
+          ) {
+            delayMs = Math.max(0, Math.floor(parsed.delayMs));
+          }
+        }
+      } catch {}
+
+      if (mode === "slow") {
+        const disconnected = await viewerService.disconnectSlowly(delayMs);
+        if (viewerService.getActiveCount() === 0) {
+          currentRunTotal = 0;
+          broadcast("viewer-run", { total: 0, accounts: [] });
+        }
+        broadcastStatus();
+        res.writeHead(200);
+        res.end(JSON.stringify({ ok: true, disconnected }));
+        return;
+      }
+
       viewerService.disconnectAll();
       currentRunTotal = 0;
       broadcast("viewer-run", { total: 0, accounts: [] });
