@@ -255,9 +255,6 @@ export class DeployWatcher extends EventEmitter {
       ): Promise<void> => {
         if (active.settled) return;
         active.settled = true;
-        if (this.active === active) {
-          this.active = null;
-        }
 
         await cleanup();
 
@@ -277,10 +274,16 @@ export class DeployWatcher extends EventEmitter {
               pairAddress: active.pairAddress,
             });
           }
+          if (this.active === active) {
+            this.active = null;
+          }
           reject(value);
           return;
         }
 
+        if (this.active === active) {
+          this.active = null;
+        }
         resolve(value);
       };
 

@@ -324,6 +324,55 @@ test("DeployWatcher cancel removes an active WS subscription", async () => {
   assert.deepEqual(fake.removed, [1]);
 });
 
+test("DeployWatcher remains active until cancellation cleanup completes", async () => {
+  const parsed = parseDeployWatchInput(
+    "2eCCtb16cJkQs3LbCXRG1p97KKSv1c9cNHZUZVchpump",
+  );
+  const cleanupDone = createDeferred<void>();
+  const events: string[] = [];
+  const fake = new FakeConnection([null]);
+  fake.removeAccountChangeListener = async (id: number) => {
+    fake.removed.push(id);
+    await cleanupDone.promise;
+    fake.callbacks.delete(id);
+  };
+  const watcher = new DeployWatcher(() => fake);
+  const unsubscribe = watcher.onDeployWatch((event) => {
+    events.push(event.state);
+  });
+
+  const promise = watcher.waitForDeploy(parsed, {
+    rpcUrl: "http://rpc.local",
+    wsUrl: "ws://rpc.local",
+    pollMs: 1000,
+  });
+  await new Promise((resolve) => setTimeout(resolve, 0));
+
+  watcher.cancel("Deploy watch canceled by test.");
+  await new Promise((resolve) => setTimeout(resolve, 0));
+
+  try {
+    assert.equal(watcher.isActive(), true);
+    await assert.rejects(
+      watcher.waitForDeploy(parsed, {
+        rpcUrl: "http://rpc.local",
+        wsUrl: "ws://rpc.local",
+        pollMs: 1000,
+      }),
+      /already active/i,
+    );
+    assert.deepEqual(events, ["watching"]);
+  } finally {
+    cleanupDone.resolve();
+    await assert.rejects(promise, DeployWatchCanceledError);
+    unsubscribe();
+  }
+
+  assert.equal(watcher.isActive(), false);
+  assert.deepEqual(fake.removed, [1]);
+  assert.deepEqual(events, ["watching", "canceled"]);
+});
+
 test("DeployWatcher emits failed on non-cancel read errors and rejects with the original error", async () => {
   const parsed = parseDeployWatchInput(
     "2eCCtb16cJkQs3LbCXRG1p97KKSv1c9cNHZUZVchpump",

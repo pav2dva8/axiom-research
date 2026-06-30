@@ -248,6 +248,7 @@ export function RunTab({
     setBusy(true);
     setRunning(true);
     setWatching(true);
+    setToken(null);
     try {
       const res = await fetch("/api/viewers/watch-deploy-start", {
         method: "POST",
