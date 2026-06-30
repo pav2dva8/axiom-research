@@ -40,6 +40,12 @@ export function markDeployWatchPhase(
   request.phase = phase;
 }
 
+export function isDeployWatchRequestBusy(
+  request: DeployWatchRequestState,
+): boolean {
+  return !request.canceled || request.phase === "starting";
+}
+
 export function shouldBroadcastDeployWatchEvent(
   request: DeployWatchRequestState,
   event: DeployWatchEvent,

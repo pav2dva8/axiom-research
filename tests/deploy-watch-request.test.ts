@@ -4,6 +4,7 @@ import assert from "node:assert/strict";
 import {
   cancelDeployWatchRequestState,
   createDeployWatchRequestState,
+  isDeployWatchRequestBusy,
   markDeployWatchPhase,
   shouldBroadcastDeployWatchEvent,
   throwIfDeployWatchRequestCanceled,
@@ -31,11 +32,12 @@ test("deploy watch request cancellation records state and emits one canceled eve
     () => throwIfDeployWatchRequestCanceled(request),
     DeployWatchCanceledError,
   );
+  assert.equal(isDeployWatchRequestBusy(request), false);
   assert.equal(shouldBroadcastDeployWatchEvent(request, event!), true);
   assert.equal(shouldBroadcastDeployWatchEvent(request, event!), false);
 });
 
-test("deploy watch request cancellation during viewer start does not emit a watch canceled event", () => {
+test("deploy watch request cancellation during viewer start stays busy and is still observable", () => {
   const request = createDeployWatchRequestState({
     ca: "2eCCtb16cJkQs3LbCXRG1p97KKSv1c9cNHZUZVchpump",
     pairAddress: "Amk61ySm6z9hWSRSEsCKiMMb3i1G8ph89wNP9FzhBzsN",
@@ -45,5 +47,10 @@ test("deploy watch request cancellation during viewer start does not emit a watc
   assert.equal(
     cancelDeployWatchRequestState(request, "Deploy watch canceled by Stop."),
     null,
+  );
+  assert.equal(isDeployWatchRequestBusy(request), true);
+  assert.throws(
+    () => throwIfDeployWatchRequestCanceled(request),
+    DeployWatchCanceledError,
   );
 });

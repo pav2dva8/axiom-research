@@ -21,6 +21,7 @@ import {
 import {
   cancelDeployWatchRequestState,
   createDeployWatchRequestState,
+  isDeployWatchRequestBusy,
   markDeployWatchPhase,
   shouldBroadcastDeployWatchEvent,
   throwIfDeployWatchRequestCanceled,
@@ -46,7 +47,11 @@ function broadcast(type: string, data: any): void {
 }
 
 function isDeployWatchBusy(): boolean {
-  return activeDeployWatchRequest !== null || deployWatcher.isActive();
+  return (
+    deployWatcher.isActive() ||
+    (activeDeployWatchRequest !== null &&
+      isDeployWatchRequestBusy(activeDeployWatchRequest))
+  );
 }
 
 function isDeployWatchStatusActive(): boolean {
@@ -656,6 +661,7 @@ async function handleApi(
           ...(concurrencyValid ? { concurrency } : {}),
           bootstrapDisabled: bootstrapDisabled === true,
         });
+        throwIfDeployWatchRequestCanceled(request);
 
         broadcastStatus();
         res.writeHead(200);
@@ -671,14 +677,18 @@ async function handleApi(
         return;
       } catch (err: any) {
         if (err instanceof DeployWatchCanceledError) {
-          currentRunTotal = 0;
+          const shouldResetViewerRun =
+            activeDeployWatchRequest === request || request.phase === "starting";
           broadcastDeployWatchEvent({
             state: "canceled",
             message: err.message,
             ca: parsed.ca,
             pairAddress: parsed.pairAddress,
           }, request);
-          broadcast("viewer-run", { total: 0, accounts: [] });
+          if (shouldResetViewerRun) {
+            currentRunTotal = 0;
+            broadcast("viewer-run", { total: 0, accounts: [] });
+          }
           broadcastStatus();
           res.writeHead(200);
           res.end(
