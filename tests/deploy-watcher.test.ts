@@ -63,6 +63,16 @@ class FakeConnection implements DeployWatchConnection {
   }
 }
 
+function createDeferred<T>() {
+  let resolve!: (value: T) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
+}
+
 test("getDeployWatchConfig uses defaults and trims env values", () => {
   assert.deepEqual(getDeployWatchConfig({}), {
     rpcUrl: DEFAULT_SOLANA_RPC_URL,
@@ -204,4 +214,112 @@ test("DeployWatcher cancel rejects the pending watch and cleans up", async () =>
 
   await assert.rejects(promise, DeployWatchCanceledError);
   assert.equal(watcher.isActive(), false);
+});
+
+test("DeployWatcher cancel during initial HTTP read rejects and suppresses detected event", async () => {
+  const parsed = parseDeployWatchInput(
+    "2eCCtb16cJkQs3LbCXRG1p97KKSv1c9cNHZUZVchpump",
+  );
+  const initialRead = createDeferred<{
+    context: { slot: number };
+    value: ReturnType<typeof fakeAccountInfo>;
+  }>();
+  const detectedEvents: unknown[] = [];
+  const fake: DeployWatchConnection = {
+    getAccountInfoAndContext: async () => initialRead.promise,
+    onAccountChange: () => 1,
+    removeAccountChangeListener: async () => {},
+  };
+  const watcher = new DeployWatcher(() => fake);
+  const unsubscribe = watcher.onDeployWatch((event) => {
+    if (event.state === "detected") detectedEvents.push(event);
+  });
+
+  const promise = watcher.waitForDeploy(parsed, {
+    rpcUrl: "http://rpc.local",
+    pollMs: 1000,
+  });
+
+  watcher.cancel("Deploy watch canceled by test.");
+  await assert.rejects(promise, DeployWatchCanceledError);
+  assert.equal(watcher.isActive(), false);
+
+  initialRead.resolve({
+    context: { slot: 444 },
+    value: fakeAccountInfo(parsed.mint),
+  });
+  await new Promise((resolve) => setTimeout(resolve, 0));
+
+  assert.deepEqual(detectedEvents, []);
+  unsubscribe();
+});
+
+test("DeployWatcher cancel during WS confirmation rejects, unsubscribes, and suppresses detected event", async () => {
+  const parsed = parseDeployWatchInput(
+    "2eCCtb16cJkQs3LbCXRG1p97KKSv1c9cNHZUZVchpump",
+  );
+  const confirmationRead = createDeferred<{
+    context: { slot: number };
+    value: ReturnType<typeof fakeAccountInfo> | null;
+  }>();
+  const reads = [null];
+  const detectedEvents: unknown[] = [];
+  const fake = new FakeConnection(reads);
+  const originalRead = fake.getAccountInfoAndContext.bind(fake);
+  let readCount = 0;
+  fake.getAccountInfoAndContext = async (publicKey) => {
+    readCount += 1;
+    if (readCount === 1) {
+      return originalRead(publicKey);
+    }
+    return confirmationRead.promise;
+  };
+  const watcher = new DeployWatcher(() => fake);
+  const unsubscribe = watcher.onDeployWatch((event) => {
+    if (event.state === "detected") detectedEvents.push(event);
+  });
+
+  const promise = watcher.waitForDeploy(parsed, {
+    rpcUrl: "http://rpc.local",
+    wsUrl: "ws://rpc.local",
+    pollMs: 1000,
+  });
+  await new Promise((resolve) => setTimeout(resolve, 0));
+
+  fake.fire(1, parsed.mint);
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  watcher.cancel("Deploy watch canceled by test.");
+
+  await assert.rejects(promise, DeployWatchCanceledError);
+  assert.equal(watcher.isActive(), false);
+  assert.deepEqual(fake.removed, [1]);
+
+  confirmationRead.resolve({
+    context: { slot: 555 },
+    value: fakeAccountInfo(parsed.mint),
+  });
+  await new Promise((resolve) => setTimeout(resolve, 0));
+
+  assert.deepEqual(detectedEvents, []);
+  unsubscribe();
+});
+
+test("DeployWatcher cancel removes an active WS subscription", async () => {
+  const parsed = parseDeployWatchInput(
+    "2eCCtb16cJkQs3LbCXRG1p97KKSv1c9cNHZUZVchpump",
+  );
+  const fake = new FakeConnection([null]);
+  const watcher = new DeployWatcher(() => fake);
+
+  const promise = watcher.waitForDeploy(parsed, {
+    rpcUrl: "http://rpc.local",
+    wsUrl: "ws://rpc.local",
+    pollMs: 1000,
+  });
+  await new Promise((resolve) => setTimeout(resolve, 0));
+
+  watcher.cancel("Deploy watch canceled by test.");
+
+  await assert.rejects(promise, DeployWatchCanceledError);
+  assert.deepEqual(fake.removed, [1]);
 });
