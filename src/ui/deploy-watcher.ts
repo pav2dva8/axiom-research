@@ -8,7 +8,7 @@ import {
   type Context,
   type RpcResponseAndContext,
 } from "@solana/web3.js";
-import { derivePumpPair, isPumpCa } from "../pump-pair";
+import { derivePumpPair } from "../pump-pair";
 import type { TokenInfo } from "./viewer-service";
 
 export const DEFAULT_SOLANA_RPC_URL = "https://api.mainnet-beta.solana.com";
@@ -122,10 +122,6 @@ export function parseDeployWatchInput(input: string): ParsedDeployWatchInput {
     mint = new PublicKey(value);
   } catch {
     throw new Error("Invalid Solana CA.");
-  }
-
-  if (!isPumpCa(value)) {
-    throw new Error("Watch deploy currently supports pump.fun CAs ending in pump.");
   }
 
   const pairAddress = derivePumpPair(value);

@@ -12,7 +12,7 @@
  *
  * Once a token migrates to Raydium, Axiom switches the pair to the AMM pool
  * address — that case still needs the API. The function returns null if the
- * input doesn't look like a pump CA so the caller can fall back to API lookup.
+ * input isn't a valid Solana public key so the caller can fall back to API lookup.
  */
 
 import { PublicKey } from '@solana/web3.js';

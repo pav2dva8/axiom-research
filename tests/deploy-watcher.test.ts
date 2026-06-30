@@ -122,7 +122,16 @@ test("parseDeployWatchInput accepts a bare pump CA and derives the pair", () => 
   assert.equal(tokenInfo.protocol, "Pump V1");
 });
 
-test("parseDeployWatchInput rejects links, invalid keys, and non-pump CAs", () => {
+test("parseDeployWatchInput accepts a bare CA without requiring a pump suffix", () => {
+  const parsed = parseDeployWatchInput(
+    "So11111111111111111111111111111111111111112",
+  );
+
+  assert.equal(parsed.ca, "So11111111111111111111111111111111111111112");
+  assert.match(parsed.pairAddress, /^[1-9A-HJ-NP-Za-km-z]{32,44}$/);
+});
+
+test("parseDeployWatchInput rejects links and invalid keys", () => {
   assert.throws(
     () =>
       parseDeployWatchInput(
@@ -136,11 +145,6 @@ test("parseDeployWatchInput rejects links, invalid keys, and non-pump CAs", () =
   assert.throws(
     () => parseDeployWatchInput("111111111111111111111111111111111"),
     /Invalid Solana CA/i,
-  );
-
-  assert.throws(
-    () => parseDeployWatchInput("11111111111111111111111111111111"),
-    /pump.fun CAs/i,
   );
 });
 
