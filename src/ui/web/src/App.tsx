@@ -9,6 +9,7 @@ interface Status {
   selected: number;
   activeViewers: number;
   keepWarm: boolean;
+  deployWatch: boolean;
 }
 
 export type ViewerState = 'pending' | 'connecting' | 'connected' | 'failed' | 'disconnected';
@@ -17,13 +18,35 @@ export interface ViewerProgress {
   states: Record<string, ViewerState>;
 }
 
+export type DeployWatchState =
+  | 'preparing'
+  | 'watching'
+  | 'detected'
+  | 'starting'
+  | 'canceled'
+  | 'failed';
+
+export interface DeployWatchProgress {
+  state: DeployWatchState;
+  message: string;
+  ca: string;
+  pairAddress?: string;
+}
+
 let logIdCounter = 0;
 
 export default function App() {
-  const [status, setStatus] = useState<Status>({ accounts: 0, selected: 0, activeViewers: 0, keepWarm: false });
+  const [status, setStatus] = useState<Status>({
+    accounts: 0,
+    selected: 0,
+    activeViewers: 0,
+    keepWarm: false,
+    deployWatch: false,
+  });
   const [logEntries, setLogEntries] = useState<LogEntry[]>([]);
   const [accountsRefreshTick, setAccountsRefreshTick] = useState(0);
   const [viewerProgress, setViewerProgress] = useState<ViewerProgress>({ total: 0, states: {} });
+  const [deployWatch, setDeployWatch] = useState<DeployWatchProgress | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
 
   const addLog = useCallback((message: string, type: LogEntry['type'] = 'info') => {
@@ -77,6 +100,7 @@ export default function App() {
             selected: msg.data.selected ?? s.selected,
             activeViewers: msg.data.activeViewers ?? s.activeViewers,
             keepWarm: msg.data.keepWarm ?? s.keepWarm,
+            deployWatch: msg.data.deployWatch ?? s.deployWatch,
           }));
         } else if (msg.type === 'keepwarm') {
           const m: string = msg.data.message ?? '';
@@ -106,6 +130,24 @@ export default function App() {
           if (typeof msg.data.connected === 'number') {
             setStatus((s) => ({ ...s, activeViewers: msg.data.connected }));
           }
+        } else if (msg.type === 'deploy-watch') {
+          const data = msg.data as DeployWatchProgress;
+          setDeployWatch(data);
+          const type: LogEntry['type'] =
+            data.state === 'failed' || data.state === 'canceled'
+              ? 'error'
+              : data.state === 'detected' || data.state === 'starting'
+                ? 'success'
+                : 'info';
+          addLog(`[watch] ${data.message}`, type);
+          setStatus((s) => ({
+            ...s,
+            deployWatch:
+              data.state === 'preparing' ||
+              data.state === 'watching' ||
+              data.state === 'detected' ||
+              data.state === 'starting',
+          }));
         } else if (msg.type === 'probe-progress') {
           const m: string = msg.data.message ?? '';
           const type: LogEntry['type'] = /throttl|FAIL|net::|429|longer than/i.test(m)
@@ -147,7 +189,13 @@ export default function App() {
             </TabsList>
           </div>
           <TabsContent value="run" forceMount className="m-0 flex-1 overflow-auto p-4 data-[state=inactive]:hidden">
-            <RunTab onLog={addLog} refreshTick={accountsRefreshTick} onAccountsChanged={refreshAccounts} viewerProgress={viewerProgress} />
+            <RunTab
+              onLog={addLog}
+              refreshTick={accountsRefreshTick}
+              onAccountsChanged={refreshAccounts}
+              viewerProgress={viewerProgress}
+              deployWatch={deployWatch}
+            />
           </TabsContent>
           <TabsContent value="accounts" className="m-0 flex-1 overflow-auto p-4">
             <AccountsTab onLog={addLog} refreshTick={accountsRefreshTick} onChanged={refreshAccounts} keepWarmRunning={status.keepWarm} />

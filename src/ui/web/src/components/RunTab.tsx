@@ -1,10 +1,10 @@
 import { useCallback, useEffect, useState } from "react";
-import { ClipboardPaste, Loader2, Play, Square } from "lucide-react";
+import { ClipboardPaste, Loader2, Play, Radar, Square } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Checkbox } from "@/components/ui/checkbox";
 import type { LogEntry } from "@/components/LogPanel";
-import type { ViewerProgress, ViewerState } from "@/App";
+import type { DeployWatchProgress, ViewerProgress, ViewerState } from "@/App";
 
 interface ResolvedToken {
   pairAddress: string;
@@ -27,6 +27,7 @@ interface Props {
   refreshTick: number;
   onAccountsChanged: () => void;
   viewerProgress: ViewerProgress;
+  deployWatch: DeployWatchProgress | null;
 }
 
 const STATE_STYLE: Record<ViewerState, string> = {
@@ -82,6 +83,7 @@ export function RunTab({
   refreshTick,
   onAccountsChanged,
   viewerProgress,
+  deployWatch,
 }: Props) {
   const [input, setInput] = useState("");
   const [token, setToken] = useState<ResolvedToken | null>(null);
@@ -90,6 +92,7 @@ export function RunTab({
   const [running, setRunning] = useState(false);
   const [busy, setBusy] = useState(false);
   const [stopping, setStopping] = useState(false);
+  const [watching, setWatching] = useState(false);
   const [pasting, setPasting] = useState(false);
   const [minGapMs, setMinGapMs] = useState<number>(DEFAULT_MIN_GAP_MS);
   const [maxGapMs, setMaxGapMs] = useState<number>(DEFAULT_MAX_GAP_MS);
@@ -230,6 +233,52 @@ export function RunTab({
     }
   }
 
+  async function watchDeployAndStart() {
+    const trimmed = input.trim();
+    if (!BASE58.test(trimmed)) {
+      onLog("Watch deploy requires a bare token CA", "error");
+      return;
+    }
+
+    const safeMin = Math.max(0, Math.floor(minGapMs));
+    const safeMax = Math.max(safeMin, Math.floor(maxGapMs));
+
+    setBusy(true);
+    setRunning(true);
+    setWatching(true);
+    try {
+      const res = await fetch("/api/viewers/watch-deploy-start", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          input: trimmed,
+          minGapMs: safeMin,
+          maxGapMs: safeMax,
+          concurrency: Math.max(1, Math.floor(concurrency)),
+          bootstrapDisabled,
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        onLog(`Watch deploy failed: ${data.error ?? res.statusText}`, "error");
+        setRunning(false);
+        return;
+      }
+      if (data.canceled) {
+        onLog("Watch deploy canceled", "info");
+        setRunning(false);
+        return;
+      }
+      onLog(`Started ${data.connected ?? 0} viewer(s) on TOKEN`, "success");
+    } catch (err: any) {
+      onLog(`Watch deploy error: ${err.message}`, "error");
+      setRunning(false);
+    } finally {
+      setWatching(false);
+      setBusy(false);
+    }
+  }
+
   async function forceStop() {
     setBusy(true);
     try {
@@ -279,8 +328,20 @@ export function RunTab({
     {} as Record<string, number>,
   );
   const connectedCount = counts.connected ?? 0;
+  const watchActive =
+    deployWatch?.state === "preparing" ||
+    deployWatch?.state === "watching" ||
+    deployWatch?.state === "detected" ||
+    deployWatch?.state === "starting";
   const isActive =
-    running || connectedCount > 0 || (counts.connecting ?? 0) > 0;
+    watchActive ||
+    running ||
+    connectedCount > 0 ||
+    (counts.connecting ?? 0) > 0;
+  const canWatchDeploy =
+    BASE58.test(input.trim()) && !isActive && !busy && !stopping;
+  const startPending = resolving || (busy && running && !watching && !watchActive);
+  const watchPending = watching || watchActive;
 
   return (
     <div className="mx-auto flex max-w-xl flex-col gap-4">
@@ -315,12 +376,25 @@ export function RunTab({
             onClick={resolveAndStart}
             disabled={isActive || busy || stopping || !input.trim()}
           >
-            {resolving ? (
+            {startPending ? (
               <Loader2 className="h-4 w-4 animate-spin" />
             ) : (
               <Play className="h-4 w-4" />
             )}
             <span className="ml-2">Start</span>
+          </Button>
+          <Button
+            variant="outline"
+            onClick={watchDeployAndStart}
+            disabled={!canWatchDeploy}
+            title="Wait for the CA mint account to exist on-chain, then start viewers"
+          >
+            {watchPending ? (
+              <Loader2 className="h-4 w-4 animate-spin" />
+            ) : (
+              <Radar className="h-4 w-4" />
+            )}
+            <span className="ml-2">Watch deploy</span>
           </Button>
         </div>
         {isActive && (
@@ -419,7 +493,7 @@ export function RunTab({
             const v = e.target.value === "" ? 1 : Number(e.target.value);
             setConcurrency(Number.isFinite(v) ? Math.max(1, Math.floor(v)) : 1);
           }}
-          disabled={running || busy}
+          disabled={isActive || busy || stopping}
           className="font-mono"
           aria-label="Concurrent handshakes"
         />
@@ -429,7 +503,7 @@ export function RunTab({
         <Checkbox
           checked={bootstrapDisabled}
           onCheckedChange={(v) => setBootstrapDisabled(v === true)}
-          disabled={running || busy}
+          disabled={isActive || busy || stopping}
         />
         <span>Skip bootstrap</span>
       </label>
@@ -440,6 +514,15 @@ export function RunTab({
           <dd className="truncate">{token.pairAddress}</dd>
           <dt className="text-muted-foreground">token</dt>
           <dd className="truncate">{token.tokenAddress || "—"}</dd>
+        </dl>
+      )}
+
+      {!token && deployWatch?.pairAddress && (
+        <dl className="grid grid-cols-[auto_1fr] gap-x-4 gap-y-1 rounded-md border border-border bg-card p-3 font-mono text-xs">
+          <dt className="text-muted-foreground">pair</dt>
+          <dd className="truncate">{deployWatch.pairAddress}</dd>
+          <dt className="text-muted-foreground">token</dt>
+          <dd className="truncate">{deployWatch.ca}</dd>
         </dl>
       )}
 
