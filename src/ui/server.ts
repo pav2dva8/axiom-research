@@ -18,6 +18,14 @@ import {
   parseDeployWatchInput,
   type DeployWatchEvent,
 } from "./deploy-watcher";
+import {
+  cancelDeployWatchRequestState,
+  createDeployWatchRequestState,
+  markDeployWatchPhase,
+  shouldBroadcastDeployWatchEvent,
+  throwIfDeployWatchRequestCanceled,
+  type DeployWatchRequestState,
+} from "./deploy-watch-request";
 import { ViewerService, type TokenInfo } from "./viewer-service";
 import { derivePumpPair, isPumpCa } from "../pump-pair";
 
@@ -28,6 +36,7 @@ const viewerService = new ViewerService();
 const deployWatcher = new DeployWatcher();
 
 const uiClients: Set<WebSocket> = new Set();
+let activeDeployWatchRequest: DeployWatchRequestState | null = null;
 
 function broadcast(type: string, data: any): void {
   const message = JSON.stringify({ type, data });
@@ -36,13 +45,25 @@ function broadcast(type: string, data: any): void {
   }
 }
 
+function isDeployWatchBusy(): boolean {
+  return activeDeployWatchRequest !== null || deployWatcher.isActive();
+}
+
+function isDeployWatchStatusActive(): boolean {
+  return (
+    deployWatcher.isActive() ||
+    (activeDeployWatchRequest !== null &&
+      !activeDeployWatchRequest.canceled)
+  );
+}
+
 function statusPayload() {
   return {
     accounts: accountManager.getAccountCount(),
     selected: accountManager.getSelectedCount(),
     activeViewers: viewerService.getActiveCount(),
     keepWarm: accountManager.isKeepWarmRunning(),
-    deployWatch: deployWatcher.isActive(),
+    deployWatch: isDeployWatchStatusActive(),
   };
 }
 
@@ -50,10 +71,33 @@ function broadcastStatus(): void {
   broadcast("status", statusPayload());
 }
 
+function broadcastDeployWatchEvent(
+  event: DeployWatchEvent,
+  request = activeDeployWatchRequest,
+): void {
+  if (request && !shouldBroadcastDeployWatchEvent(request, event)) {
+    return;
+  }
+
+  broadcast("deploy-watch", event);
+  broadcastStatus();
+}
+
+function cancelActiveDeployWatchRequest(message: string): void {
+  const request = activeDeployWatchRequest;
+  if (request) {
+    const event = cancelDeployWatchRequestState(request, message);
+    if (event) {
+      broadcastDeployWatchEvent(event, request);
+    }
+  }
+
+  deployWatcher.cancel(message);
+}
+
 const stopDeployWatchBroadcast = deployWatcher.onDeployWatch(
   (event: DeployWatchEvent) => {
-    broadcast("deploy-watch", event);
-    broadcastStatus();
+    broadcastDeployWatchEvent(event);
   },
 );
 
@@ -506,7 +550,7 @@ async function handleApi(
 
     // POST /api/viewers/watch-deploy-start  { input, minGapMs?, maxGapMs?, bootstrapDisabled?, concurrency? }
     if (pathname === "/api/viewers/watch-deploy-start" && req.method === "POST") {
-      if (deployWatcher.isActive()) {
+      if (isDeployWatchBusy()) {
         res.writeHead(409);
         res.end(JSON.stringify({ error: "A deploy watch is already active." }));
         return;
@@ -531,6 +575,11 @@ async function handleApi(
       }
 
       const tokenInfo = buildDeployTokenInfo(parsed);
+      const request = createDeployWatchRequestState({
+        ca: parsed.ca,
+        pairAddress: parsed.pairAddress,
+      });
+      activeDeployWatchRequest = request;
       const minGapValid =
         typeof minGapMs === "number" &&
         Number.isFinite(minGapMs) &&
@@ -544,21 +593,30 @@ async function handleApi(
         Number.isFinite(concurrency) &&
         concurrency >= 1;
 
-      broadcast("deploy-watch", {
+      broadcastDeployWatchEvent({
         state: "preparing",
         message: `Preparing browser/accounts for CA ${parsed.ca}.`,
         ca: parsed.ca,
         pairAddress: parsed.pairAddress,
-      });
+      }, request);
 
       let accounts: LoadedAccount[] = [];
 
       try {
+        throwIfDeployWatchRequestCanceled(request);
         await ensureBrowserSession();
+        throwIfDeployWatchRequestCanceled(request);
         viewerService.setTokenInfo(tokenInfo);
 
         accounts = accountManager.loadSelectedAccounts();
         if (accounts.length === 0) {
+          broadcastDeployWatchEvent({
+            state: "failed",
+            message:
+              "No accounts selected or none have valid tokens. Re-login first.",
+            ca: parsed.ca,
+            pairAddress: parsed.pairAddress,
+          }, request);
           res.writeHead(400);
           res.end(
             JSON.stringify({
@@ -569,17 +627,22 @@ async function handleApi(
           return;
         }
 
+        throwIfDeployWatchRequestCanceled(request);
+        markDeployWatchPhase(request, "watching");
         const detection = await deployWatcher.waitForDeploy(
           parsed,
           getDeployWatchConfig(),
         );
+        throwIfDeployWatchRequestCanceled(request);
 
-        broadcast("deploy-watch", {
+        markDeployWatchPhase(request, "starting");
+        viewerService.setTokenInfo(tokenInfo);
+        broadcastDeployWatchEvent({
           state: "starting",
           message: `Mint detected at slot ${detection.slot}; starting viewers.`,
           ca: parsed.ca,
           pairAddress: parsed.pairAddress,
-        });
+        }, request);
 
         currentRunTotal = accounts.length;
         broadcast("viewer-run", {
@@ -609,6 +672,12 @@ async function handleApi(
       } catch (err: any) {
         if (err instanceof DeployWatchCanceledError) {
           currentRunTotal = 0;
+          broadcastDeployWatchEvent({
+            state: "canceled",
+            message: err.message,
+            ca: parsed.ca,
+            pairAddress: parsed.pairAddress,
+          }, request);
           broadcast("viewer-run", { total: 0, accounts: [] });
           broadcastStatus();
           res.writeHead(200);
@@ -622,18 +691,29 @@ async function handleApi(
           return;
         }
 
-        broadcast("deploy-watch", {
+        broadcastDeployWatchEvent({
           state: "failed",
           message: err.message,
           ca: parsed.ca,
           pairAddress: parsed.pairAddress,
-        });
+        }, request);
         throw err;
+      } finally {
+        if (activeDeployWatchRequest === request) {
+          activeDeployWatchRequest = null;
+        }
+        broadcastStatus();
       }
     }
 
     // POST /api/viewers/start  { pairAddress, minGapMs?, maxGapMs?, bootstrapDisabled?, concurrency? }
     if (pathname === "/api/viewers/start" && req.method === "POST") {
+      if (isDeployWatchBusy()) {
+        res.writeHead(409);
+        res.end(JSON.stringify({ error: "A deploy watch is active." }));
+        return;
+      }
+
       const body = JSON.parse(await readBody(req));
       const {
         pairAddress,
@@ -729,7 +809,7 @@ async function handleApi(
         }
       } catch {}
 
-      deployWatcher.cancel("Deploy watch canceled by Stop.");
+      cancelActiveDeployWatchRequest("Deploy watch canceled by Stop.");
 
       if (mode === "slow") {
         const disconnected = await viewerService.disconnectSlowly(delayMs);
@@ -820,7 +900,7 @@ server.listen(PORT, () => {
 
 process.on("SIGINT", () => {
   console.log("\nShutting down...");
-  deployWatcher.cancel("Server shutting down.");
+  cancelActiveDeployWatchRequest("Server shutting down.");
   stopDeployWatchBroadcast();
   viewerService.disconnectAll();
   accountManager.closeBrowserSession().catch(() => {});
