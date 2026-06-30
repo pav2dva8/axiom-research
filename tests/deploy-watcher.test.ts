@@ -323,3 +323,71 @@ test("DeployWatcher cancel removes an active WS subscription", async () => {
   await assert.rejects(promise, DeployWatchCanceledError);
   assert.deepEqual(fake.removed, [1]);
 });
+
+test("DeployWatcher emits failed on non-cancel read errors and rejects with the original error", async () => {
+  const parsed = parseDeployWatchInput(
+    "2eCCtb16cJkQs3LbCXRG1p97KKSv1c9cNHZUZVchpump",
+  );
+  const failure = new Error("read failed");
+  const fake: DeployWatchConnection = {
+    getAccountInfoAndContext: async () => {
+      throw failure;
+    },
+    onAccountChange: () => 1,
+    removeAccountChangeListener: async () => {},
+  };
+  const watcher = new DeployWatcher(() => fake);
+  const events: string[] = [];
+  const unsubscribe = watcher.onDeployWatch((event) => {
+    events.push(event.state);
+  });
+
+  await assert.rejects(
+    watcher.waitForDeploy(parsed, {
+      rpcUrl: "http://rpc.local",
+      pollMs: 1000,
+    }),
+    failure,
+  );
+
+  assert.deepEqual(events, ["failed"]);
+  assert.equal(watcher.isActive(), false);
+  unsubscribe();
+});
+
+test("DeployWatcher rejects a second concurrent watch while the first remains active", async () => {
+  const parsed = parseDeployWatchInput(
+    "2eCCtb16cJkQs3LbCXRG1p97KKSv1c9cNHZUZVchpump",
+  );
+  const initialRead = createDeferred<{
+    context: { slot: number };
+    value: ReturnType<typeof fakeAccountInfo> | null;
+  }>();
+  const fake: DeployWatchConnection = {
+    getAccountInfoAndContext: async () => initialRead.promise,
+    onAccountChange: () => 1,
+    removeAccountChangeListener: async () => {},
+  };
+  const watcher = new DeployWatcher(() => fake);
+
+  const first = watcher.waitForDeploy(parsed, {
+    rpcUrl: "http://rpc.local",
+    pollMs: 1000,
+  });
+  await new Promise((resolve) => setTimeout(resolve, 0));
+
+  await assert.rejects(
+    watcher.waitForDeploy(parsed, {
+      rpcUrl: "http://rpc.local",
+      pollMs: 1000,
+    }),
+    /already active/i,
+  );
+
+  watcher.cancel("Deploy watch canceled by test.");
+  await assert.rejects(first, DeployWatchCanceledError);
+  initialRead.resolve({
+    context: { slot: 666 },
+    value: null,
+  });
+});

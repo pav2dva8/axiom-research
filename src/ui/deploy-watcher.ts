@@ -269,6 +269,13 @@ export class DeployWatcher extends EventEmitter {
               ca: active.ca,
               pairAddress: active.pairAddress,
             });
+          } else {
+            this.emitWatch({
+              state: "failed",
+              message: value.message,
+              ca: active.ca,
+              pairAddress: active.pairAddress,
+            });
           }
           reject(value);
           return;
