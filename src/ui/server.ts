@@ -9,7 +9,7 @@ import * as http from "http";
 import * as fs from "fs";
 import * as path from "path";
 import { WebSocketServer, WebSocket } from "ws";
-import { AccountManager } from "./account-manager";
+import { AccountManager, type LoadedAccount } from "./account-manager";
 import {
   DeployWatchCanceledError,
   DeployWatcher,
@@ -551,11 +551,13 @@ async function handleApi(
         pairAddress: parsed.pairAddress,
       });
 
+      let accounts: LoadedAccount[] = [];
+
       try {
         await ensureBrowserSession();
         viewerService.setTokenInfo(tokenInfo);
 
-        const accounts = accountManager.loadSelectedAccounts();
+        accounts = accountManager.loadSelectedAccounts();
         if (accounts.length === 0) {
           res.writeHead(400);
           res.end(
@@ -606,7 +608,6 @@ async function handleApi(
         return;
       } catch (err: any) {
         if (err instanceof DeployWatchCanceledError) {
-          const accounts = accountManager.loadSelectedAccounts();
           currentRunTotal = 0;
           broadcast("viewer-run", { total: 0, accounts: [] });
           broadcastStatus();
