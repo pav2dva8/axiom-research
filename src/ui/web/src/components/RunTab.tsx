@@ -348,7 +348,7 @@ export function RunTab({
   const watchPending = watching || watchActive;
 
   return (
-    <div className="mx-auto flex w-full max-w-5xl flex-col gap-4">
+    <div className="mx-auto flex w-full max-w-3xl flex-col gap-4">
       <div className="flex flex-col gap-2">
         <label className="text-xs font-medium uppercase tracking-wider text-muted-foreground">
           Token CA or axiom link
