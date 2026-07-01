@@ -348,12 +348,12 @@ export function RunTab({
   const watchPending = watching || watchActive;
 
   return (
-    <div className="mx-auto flex max-w-xl flex-col gap-4">
+    <div className="mx-auto flex w-full max-w-5xl flex-col gap-4">
       <div className="flex flex-col gap-2">
         <label className="text-xs font-medium uppercase tracking-wider text-muted-foreground">
           Token CA or axiom link
         </label>
-        <div className="flex gap-2">
+        <div className="grid grid-cols-1 gap-2 md:grid-cols-[minmax(20rem,1fr)_auto_auto_auto]">
           <Input
             value={input}
             onChange={(e) => setInput(e.target.value)}
@@ -434,7 +434,7 @@ export function RunTab({
         <label className="text-xs font-medium uppercase tracking-wider text-muted-foreground">
           Delay between viewers (ms)
         </label>
-        <div className="flex items-center gap-2">
+        <div className="grid grid-cols-[minmax(0,1fr)_auto_minmax(0,1fr)] items-center gap-2 md:grid-cols-[minmax(0,1fr)_auto_minmax(0,1fr)_auto]">
           <Input
             type="number"
             min={0}
@@ -470,14 +470,14 @@ export function RunTab({
           />
           <Button
             type="button"
-            variant="ghost"
-            size="sm"
+            variant="outline"
             onClick={() => {
               setMinGapMs(DEFAULT_MIN_GAP_MS);
               setMaxGapMs(DEFAULT_MAX_GAP_MS);
             }}
             disabled={isActive || busy || stopping}
             title={`Reset to default ${DEFAULT_MIN_GAP_MS}–${DEFAULT_MAX_GAP_MS} ms`}
+            className="col-span-3 md:col-span-1"
           >
             Default
           </Button>

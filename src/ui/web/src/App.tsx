@@ -175,13 +175,17 @@ export default function App() {
   }, [addLog, refreshAccounts]);
 
   return (
-    <div className="flex h-screen flex-col bg-background text-foreground">
-      <header className="flex items-center justify-between border-b border-border px-4 py-3">
-        <div className="flex items-baseline gap-2">
-          <span className="font-semibold tracking-tight">axiom-viewer</span>
-          <span className="text-xs text-muted-foreground">research</span>
-        </div>
-        <div className="flex items-center gap-4 font-mono text-xs">
+    <Tabs defaultValue="run" className="flex h-screen flex-col bg-background text-foreground">
+      <header className="flex h-14 shrink-0 items-center justify-between gap-4 border-b border-border px-4">
+        <TabsList className="h-8 rounded-md bg-secondary/60 p-0.5">
+          <TabsTrigger value="run" className="h-7 rounded px-4 text-xs">
+            Run
+          </TabsTrigger>
+          <TabsTrigger value="accounts" className="h-7 rounded px-4 text-xs">
+            Accounts
+          </TabsTrigger>
+        </TabsList>
+        <div className="flex shrink-0 items-center gap-4 font-mono text-xs">
           <span className="text-muted-foreground">
             selected <span className="text-foreground">{status.selected}/{status.accounts}</span>
           </span>
@@ -192,13 +196,6 @@ export default function App() {
       </header>
 
       <main className="flex min-h-0 flex-1 flex-col overflow-hidden">
-        <Tabs defaultValue="run" className="flex min-h-0 flex-1 flex-col">
-          <div className="border-b border-border px-4 py-2">
-            <TabsList>
-              <TabsTrigger value="run">Run</TabsTrigger>
-              <TabsTrigger value="accounts">Accounts</TabsTrigger>
-            </TabsList>
-          </div>
           <TabsContent value="run" forceMount className="m-0 flex-1 overflow-auto p-4 data-[state=inactive]:hidden">
             <RunTab
               onLog={addLog}
@@ -212,10 +209,9 @@ export default function App() {
           <TabsContent value="accounts" className="m-0 flex-1 overflow-auto p-4">
             <AccountsTab onLog={addLog} refreshTick={accountsRefreshTick} onChanged={refreshAccounts} keepWarmRunning={status.keepWarm} />
           </TabsContent>
-        </Tabs>
       </main>
 
       <LogPanel entries={logEntries} />
-    </div>
+    </Tabs>
   );
 }
