@@ -15,6 +15,7 @@ import {
   DeployWatcher,
   buildDeployTokenInfo,
   getDeployWatchConfig,
+  loadDeployWatchEnvFile,
   parseDeployWatchInput,
   type DeployWatchEvent,
 } from "./deploy-watcher";
@@ -31,6 +32,7 @@ import { ViewerService, type TokenInfo } from "./viewer-service";
 import { derivePumpPair, isPumpCa } from "../pump-pair";
 
 const PORT = process.env.PORT || 3847;
+loadDeployWatchEnvFile();
 
 const accountManager = new AccountManager();
 const viewerService = new ViewerService();

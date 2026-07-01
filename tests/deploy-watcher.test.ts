@@ -7,6 +7,7 @@ import {
   DEFAULT_SOLANA_RPC_URL,
   DeployWatchCanceledError,
   DeployWatcher,
+  applyDeployWatchEnvFile,
   buildDeployTokenInfo,
   getDeployWatchConfig,
   parseDeployWatchInput,
@@ -78,6 +79,7 @@ test("getDeployWatchConfig uses defaults and trims env values", () => {
     rpcUrl: DEFAULT_SOLANA_RPC_URL,
     wsUrl: undefined,
     pollMs: DEFAULT_DEPLOY_WATCH_POLL_MS,
+    allowInsecureTls: false,
   });
 
   assert.deepEqual(
@@ -85,11 +87,13 @@ test("getDeployWatchConfig uses defaults and trims env values", () => {
       SOLANA_RPC_URL: " https://rpc.example ",
       SOLANA_WS_URL: " wss://rpc.example ",
       DEPLOY_WATCH_POLL_MS: "100",
+      SOLANA_RPC_ALLOW_INSECURE_TLS: "true",
     }),
     {
       rpcUrl: "https://rpc.example",
       wsUrl: "wss://rpc.example",
       pollMs: 100,
+      allowInsecureTls: true,
     },
   );
 
@@ -99,6 +103,30 @@ test("getDeployWatchConfig uses defaults and trims env values", () => {
   );
 
   assert.equal(getDeployWatchConfig({ DEPLOY_WATCH_POLL_MS: "0" }).pollMs, 0);
+});
+
+test("applyDeployWatchEnvFile loads only deploy watch env keys without overwriting existing values", () => {
+  const env: Record<string, string | undefined> = {
+    SOLANA_RPC_URL: "https://existing.example",
+  };
+
+  applyDeployWatchEnvFile(
+    [
+      "SOLANA_RPC_URL=https://from-file.example",
+      "SOLANA_WS_URL=\"wss://from-file.example\"",
+      "DEPLOY_WATCH_POLL_MS=1000",
+      "SOLANA_RPC_ALLOW_INSECURE_TLS=1",
+      "AXIOM_COOKIES=should-not-load",
+    ].join("\n"),
+    env,
+  );
+
+  assert.deepEqual(env, {
+    SOLANA_RPC_URL: "https://existing.example",
+    SOLANA_WS_URL: "wss://from-file.example",
+    DEPLOY_WATCH_POLL_MS: "1000",
+    SOLANA_RPC_ALLOW_INSECURE_TLS: "1",
+  });
 });
 
 test("parseDeployWatchInput accepts a bare pump CA and derives the pair", () => {

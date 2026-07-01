@@ -1,4 +1,7 @@
 import { EventEmitter } from "events";
+import * as fs from "fs";
+import * as path from "path";
+import { Agent as HttpsAgent } from "https";
 import {
   Connection,
   PublicKey,
@@ -18,6 +21,7 @@ export interface DeployWatchConfig {
   rpcUrl: string;
   wsUrl?: string;
   pollMs: number;
+  allowInsecureTls: boolean;
 }
 
 export interface ParsedDeployWatchInput {
@@ -88,6 +92,60 @@ interface ActiveWatch {
 }
 
 const BASE58_ADDRESS = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
+const DEPLOY_WATCH_ENV_KEYS = new Set([
+  "SOLANA_RPC_URL",
+  "SOLANA_WS_URL",
+  "DEPLOY_WATCH_POLL_MS",
+  "SOLANA_RPC_ALLOW_INSECURE_TLS",
+]);
+
+function parseEnvValue(value: string): string {
+  const trimmed = value.trim();
+  const quote = trimmed[0];
+  if (
+    (quote === `"` || quote === "'") &&
+    trimmed.endsWith(quote) &&
+    trimmed.length >= 2
+  ) {
+    return trimmed.slice(1, -1);
+  }
+  return trimmed;
+}
+
+function isTruthyEnv(value: string | undefined): boolean {
+  return /^(1|true|yes|on)$/i.test(value?.trim() ?? "");
+}
+
+export function applyDeployWatchEnvFile(
+  contents: string,
+  env: NodeJS.ProcessEnv | Record<string, string | undefined> = process.env,
+): void {
+  for (const rawLine of contents.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line || line.startsWith("#")) continue;
+
+    const separator = line.indexOf("=");
+    if (separator === -1) continue;
+
+    const key = line.slice(0, separator).trim();
+    if (!DEPLOY_WATCH_ENV_KEYS.has(key) || env[key] !== undefined) {
+      continue;
+    }
+
+    env[key] = parseEnvValue(line.slice(separator + 1));
+  }
+}
+
+export function loadDeployWatchEnvFile(
+  filePath = path.join(process.cwd(), ".env"),
+  env: NodeJS.ProcessEnv | Record<string, string | undefined> = process.env,
+): void {
+  try {
+    applyDeployWatchEnvFile(fs.readFileSync(filePath, "utf8"), env);
+  } catch (err: any) {
+    if (err?.code !== "ENOENT") throw err;
+  }
+}
 
 export function getDeployWatchConfig(
   env: NodeJS.ProcessEnv | Record<string, string | undefined> = process.env,
@@ -104,6 +162,7 @@ export function getDeployWatchConfig(
     rpcUrl: rawRpc || DEFAULT_SOLANA_RPC_URL,
     wsUrl: rawWs || undefined,
     pollMs,
+    allowInsecureTls: isTruthyEnv(env.SOLANA_RPC_ALLOW_INSECURE_TLS),
   };
 }
 
@@ -148,12 +207,13 @@ export function buildDeployTokenInfo(parsed: ParsedDeployWatchInput): TokenInfo 
 export function createSolanaConnection(
   config: DeployWatchConfig,
 ): DeployWatchConnection {
-  return new Connection(
-    config.rpcUrl,
-    config.wsUrl
-      ? { commitment: "processed", wsEndpoint: config.wsUrl }
-      : "processed",
-  );
+  return new Connection(config.rpcUrl, {
+    commitment: "processed",
+    ...(config.wsUrl ? { wsEndpoint: config.wsUrl } : {}),
+    ...(config.allowInsecureTls && config.rpcUrl.startsWith("https:")
+      ? { httpAgent: new HttpsAgent({ rejectUnauthorized: false }) }
+      : {}),
+  });
 }
 
 export class DeployWatcher extends EventEmitter {
