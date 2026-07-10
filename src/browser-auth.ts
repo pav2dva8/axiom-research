@@ -14,6 +14,7 @@ import bs58 from 'bs58';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
+import * as net from 'net';
 import type { AuthTokens, WalletInfo } from './auth';
 import { buildSignMessage } from './auth';
 
@@ -211,16 +212,22 @@ const VIEWER_MANAGER_SCRIPT = `
 
 const TURNSTILE_SITEKEY = '0x4AAAAAACb1mthF4yHVUfUh';
 // Axiom shards its API across apiN.axiom.trade hosts and rotates which one the
-// frontend uses. As of 2026-06 the live site uses api7 for /wallet-nonce +
-// /verify-wallet-v2 (api2 is stale and 500s on verify). If login starts failing
-// with "We can't process this right now", re-check the host the real frontend
-// hits (DevTools → Network) and bump this. (refreshAccount similarly pins api9.)
-const API_BASE = 'https://api7.axiom.trade';
+// frontend uses. As of 2026-06 the live site used api7 for /wallet-nonce +
+// /verify-wallet-v2 (api2 is stale and 500s on verify). Keep api7 first, but
+// try the same live shards as refresh if a shard returns an endpoint/server
+// style failure.
+export const LOGIN_API_HOSTS = [
+  'api7.axiom.trade',
+  'api3.axiom.trade',
+  'api9.axiom.trade',
+] as const;
+export const AXIOM_BROWSER_PAGE_URL = 'https://axiom.trade/terms';
 const DEBUG_PORT = 9222;
 
 export interface BrowserSession {
   loginAccount(wallet: WalletInfo): Promise<AuthTokens>;
   getCfData(): Promise<{ cfCookies: string; userAgent: string }>;
+  fetchPairInfo(pairAddress: string): Promise<any | null>;
   resolvePairFromCa(ca: string, accessToken?: string, refreshToken?: string): Promise<any | null>;
   /**
    * Run the session bootstrap that the real client fires on every page load
@@ -245,6 +252,291 @@ export interface BrowserSession {
   close(): Promise<void>;
 }
 
+export interface BrowserProxyConfig {
+  server: string;
+  username?: string;
+  password?: string;
+  label?: string;
+}
+
+export interface BrowserWindowOptions {
+  width?: number;
+  height?: number;
+  x?: number;
+  y?: number;
+  startMinimized?: boolean;
+  anchor?: 'bottom-right';
+  marginX?: number;
+  marginY?: number;
+}
+
+interface NormalizedBrowserWindowOptions {
+  width: number;
+  height: number;
+  x: number;
+  y: number;
+  startMinimized: boolean;
+  anchor?: 'bottom-right';
+  marginX: number;
+  marginY: number;
+}
+
+const DEFAULT_BROWSER_WINDOW: NormalizedBrowserWindowOptions = {
+  width: 800,
+  height: 600,
+  x: 100,
+  y: 100,
+  startMinimized: false,
+  marginX: 24,
+  marginY: 48,
+};
+
+export const PROXY_BACKGROUND_BROWSER_WINDOW: BrowserWindowOptions = {
+  width: 480,
+  height: 360,
+  x: 1200,
+  y: 700,
+  startMinimized: false,
+  anchor: 'bottom-right',
+  marginX: 24,
+  marginY: 48,
+};
+
+export const MANUAL_CHALLENGE_BROWSER_WINDOW: BrowserWindowOptions = {
+  width: 900,
+  height: 700,
+  x: 80,
+  y: 80,
+  startMinimized: false,
+};
+
+export interface BrowserSessionOptions {
+  proxy?: BrowserProxyConfig;
+  debugPort?: number;
+  killExistingDebugPort?: boolean;
+  label?: string;
+  window?: BrowserWindowOptions;
+  minimizeAfterReady?: boolean;
+  surfaceOnCloudflareChallenge?: boolean;
+  challengeWindow?: BrowserWindowOptions;
+  onCloudflareChallenge?: (message: string) => void;
+}
+
+export function buildChromeProxyArgs(proxy?: BrowserProxyConfig): string[] {
+  if (!proxy?.server) return [];
+  return [`--proxy-server=${proxy.server}`];
+}
+
+export function buildProxyKeepWarmBrowserSessionOptions(
+  proxy: BrowserProxyConfig,
+  label: string,
+  onCloudflareChallenge?: (message: string) => void,
+): BrowserSessionOptions {
+  return {
+    proxy,
+    label,
+    killExistingDebugPort: false,
+    window: PROXY_BACKGROUND_BROWSER_WINDOW,
+    minimizeAfterReady: true,
+    surfaceOnCloudflareChallenge: true,
+    onCloudflareChallenge,
+  };
+}
+
+function normalizeBrowserWindowOptions(browserWindow?: BrowserWindowOptions): NormalizedBrowserWindowOptions {
+  const anchor = browserWindow?.anchor;
+  return {
+    width: Math.max(100, Math.floor(browserWindow?.width ?? DEFAULT_BROWSER_WINDOW.width)),
+    height: Math.max(100, Math.floor(browserWindow?.height ?? DEFAULT_BROWSER_WINDOW.height)),
+    x: Math.floor(browserWindow?.x ?? DEFAULT_BROWSER_WINDOW.x),
+    y: Math.floor(browserWindow?.y ?? DEFAULT_BROWSER_WINDOW.y),
+    startMinimized: browserWindow?.startMinimized ?? DEFAULT_BROWSER_WINDOW.startMinimized,
+    anchor,
+    marginX: Math.max(0, Math.floor(browserWindow?.marginX ?? DEFAULT_BROWSER_WINDOW.marginX)),
+    marginY: Math.max(0, Math.floor(browserWindow?.marginY ?? DEFAULT_BROWSER_WINDOW.marginY)),
+  };
+}
+
+export function buildChromeWindowArgs(browserWindow?: BrowserWindowOptions): string[] {
+  const normalized = normalizeBrowserWindowOptions(browserWindow);
+  const args = [
+    `--window-size=${normalized.width},${normalized.height}`,
+    `--window-position=${normalized.x},${normalized.y}`,
+  ];
+  if (normalized.startMinimized) args.push('--start-minimized');
+  return args;
+}
+
+export function buildAxiomWorkerReadinessUrls(now = Date.now()): string[] {
+  return REFRESH_ACCESS_TOKEN_HOSTS.map((host) => `https://${host}/server-time?v=${now}`);
+}
+
+async function resolveBrowserWindowBounds(
+  page: Page,
+  browserWindow: BrowserWindowOptions | undefined,
+): Promise<NormalizedBrowserWindowOptions> {
+  const normalized = normalizeBrowserWindowOptions(browserWindow);
+  if (normalized.anchor !== 'bottom-right') return normalized;
+
+  const screenSize = await page.evaluate(() => {
+    const screen = (globalThis as any).screen || {};
+    return {
+      width: screen.availWidth || screen.width || 0,
+      height: screen.availHeight || screen.height || 0,
+    };
+  }).catch(() => null);
+
+  if (!screenSize?.width || !screenSize?.height) return normalized;
+
+  return {
+    ...normalized,
+    x: Math.max(0, screenSize.width - normalized.width - normalized.marginX),
+    y: Math.max(0, screenSize.height - normalized.height - normalized.marginY),
+  };
+}
+
+async function applyBrowserWindowOptions(
+  context: BrowserContext,
+  page: Page,
+  browserWindow: BrowserWindowOptions | undefined,
+  opts: { forceNormal?: boolean } = {},
+): Promise<void> {
+  const normalized = await resolveBrowserWindowBounds(page, browserWindow);
+  const cdp = await context.newCDPSession(page);
+  try {
+    const { windowId } = await cdp.send('Browser.getWindowForTarget');
+    await cdp.send('Browser.setWindowBounds', {
+      windowId,
+      bounds: { windowState: 'normal' },
+    }).catch(() => {});
+    await cdp.send('Browser.setWindowBounds', {
+      windowId,
+      bounds: {
+        left: normalized.x,
+        top: normalized.y,
+        width: normalized.width,
+        height: normalized.height,
+      },
+    });
+    if (normalized.startMinimized && !opts.forceNormal) {
+      await cdp.send('Browser.setWindowBounds', {
+        windowId,
+        bounds: { windowState: 'minimized' },
+      }).catch(() => {});
+    }
+  } finally {
+    await cdp.detach().catch(() => {});
+  }
+}
+
+async function minimizeBrowserWindow(context: BrowserContext, page: Page): Promise<void> {
+  const cdp = await context.newCDPSession(page);
+  try {
+    const { windowId } = await cdp.send('Browser.getWindowForTarget');
+    await cdp.send('Browser.setWindowBounds', {
+      windowId,
+      bounds: { windowState: 'minimized' },
+    });
+  } finally {
+    await cdp.detach().catch(() => {});
+  }
+}
+
+export function isRefreshResponseSuccessful(resultOk: boolean, realStatus: number): boolean {
+  return resultOk || (realStatus >= 200 && realStatus < 300);
+}
+
+export function isLoginHostRetryableStatus(status: number): boolean {
+  return status === 0 || status === 404 || status === 408 || status === 418 || status === 429 || status >= 500;
+}
+
+export function isCloudflareChallengePage(url: string, html: string): boolean {
+  if (/\/cdn-cgi\/|challenge/i.test(url)) return true;
+  return /cf-browser-verification|cf-challenge|verify you are human|checking if the site connection is secure|checking your browser|перевірка безпеки|підтверд(?:ьте|іть).*людин|ви не бот/i.test(html);
+}
+
+function isLoginHostRetryableError(stage: string, status: number): boolean {
+  if (stage === 'verify' && (status === 429 || status >= 500)) return false;
+  return isLoginHostRetryableStatus(status);
+}
+
+interface LoginVerifyPayload {
+  walletAddress: string;
+  allowLinking: false;
+  allowRegistration: false;
+  forAddCredential: false;
+  isVerify: false;
+  nonce: string;
+  referrer: null;
+  signature: string;
+  turnstileToken: string;
+  v: number;
+}
+
+export interface RunLoginApiHostVerificationOptions {
+  hosts: readonly string[];
+  walletPublicKey: string;
+  getNonce(host: string, walletPublicKey: string): Promise<string>;
+  signNonce(nonce: string): string;
+  getTurnstileToken(): Promise<string>;
+  verify(host: string, payload: LoginVerifyPayload): Promise<void>;
+  onHostFailure?(host: string, status: number, message: string): void | Promise<void>;
+}
+
+export async function runLoginApiHostVerification(
+  opts: RunLoginApiHostVerificationOptions,
+): Promise<{ host: string; nonce: string }> {
+  let lastHostErr: any;
+
+  const apiStageError = (host: string, stage: string, err: any) => {
+    err.status = typeof err?.status === 'number' ? err.status : 0;
+    err.host = host;
+    err.stage = stage;
+    return err;
+  };
+
+  for (const host of opts.hosts) {
+    try {
+      await opts.getNonce(host, opts.walletPublicKey)
+        .catch((err) => { throw apiStageError(host, 'nonce', err); });
+      const turnstileToken = await opts.getTurnstileToken();
+      const nonce = await opts.getNonce(host, opts.walletPublicKey)
+        .catch((err) => { throw apiStageError(host, 'nonce', err); });
+      const signature = opts.signNonce(nonce);
+      await opts.verify(host, {
+        walletAddress: opts.walletPublicKey,
+        allowLinking: false,
+        allowRegistration: false,
+        forAddCredential: false,
+        isVerify: false,
+        nonce,
+        referrer: null,
+        signature,
+        turnstileToken,
+        v: Date.now(),
+      }).catch((err) => { throw apiStageError(host, 'verify', err); });
+      return { host, nonce };
+    } catch (err: any) {
+      const status = typeof err?.status === 'number' ? err.status : null;
+      const stage = typeof err?.stage === 'string' ? err.stage : '';
+      if (status == null || !isLoginHostRetryableError(stage, status)) throw err;
+
+      lastHostErr = err;
+      await opts.onHostFailure?.(host, status, String(err?.message || err));
+    }
+  }
+
+  throw lastHostErr || new Error('Login failed: no login API hosts tried');
+}
+
+// Observed from the live frontend: api10 can return 418 for refresh, while
+// api3 returns 200. Keep api3 first and avoid the teapot shard.
+export const REFRESH_ACCESS_TOKEN_HOSTS = [
+  'api3.axiom.trade',
+  'api9.axiom.trade',
+  'api7.axiom.trade',
+] as const;
+
 function findChrome(): string {
   const candidates = [
     '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
@@ -257,26 +549,48 @@ function findChrome(): string {
   throw new Error('Chrome not found. Install Google Chrome.');
 }
 
-export async function openBrowserSession(): Promise<BrowserSession> {
-  console.log('[BrowserAuth] Launching real Chrome...');
+async function findAvailablePort(start: number): Promise<number> {
+  for (let port = start; port < start + 200; port++) {
+    const available = await new Promise<boolean>((resolve) => {
+      const server = net.createServer();
+      server.once('error', () => resolve(false));
+      server.once('listening', () => {
+        server.close(() => resolve(true));
+      });
+      server.listen(port, '127.0.0.1');
+    });
+    if (available) return port;
+  }
+  throw new Error(`No available Chrome debug port found near ${start}`);
+}
+
+export async function openBrowserSession(options: BrowserSessionOptions = {}): Promise<BrowserSession> {
+  const label = options.label || options.proxy?.label || '';
+  const logPrefix = label ? `[BrowserAuth:${label}]` : '[BrowserAuth]';
+  console.log(`${logPrefix} Launching real Chrome${options.proxy ? ' with proxy' : ''}...`);
+
+  const debugPort = options.debugPort ?? (options.proxy ? await findAvailablePort(DEBUG_PORT + 1) : DEBUG_PORT);
+  const shouldKillDebugPort = options.killExistingDebugPort ?? !options.proxy;
 
   // Kill any leftover Chrome on the debug port before spawning a new one
-  try {
-    const { execSync } = await import('child_process');
-    execSync(`lsof -ti :${DEBUG_PORT} | xargs kill -9 2>/dev/null || true`, { stdio: 'ignore' });
-    await new Promise(r => setTimeout(r, 500));
-  } catch {}
+  if (shouldKillDebugPort) {
+    try {
+      const { execSync } = await import('child_process');
+      execSync(`lsof -ti :${debugPort} | xargs kill -9 2>/dev/null || true`, { stdio: 'ignore' });
+      await new Promise(r => setTimeout(r, 500));
+    } catch {}
+  }
 
   const tmpProfile = fs.mkdtempSync(path.join(os.tmpdir(), 'axiom-chrome-'));
   const chromePath = findChrome();
 
   const chromeProc: ChildProcess = spawn(chromePath, [
-    `--remote-debugging-port=${DEBUG_PORT}`,
+    `--remote-debugging-port=${debugPort}`,
     `--user-data-dir=${tmpProfile}`,
+    ...buildChromeProxyArgs(options.proxy),
     '--no-first-run',
     '--no-default-browser-check',
-    '--window-size=800,600',
-    '--window-position=100,100',
+    ...buildChromeWindowArgs(options.window),
     'about:blank',
   ], {
     stdio: 'ignore',
@@ -288,7 +602,7 @@ export async function openBrowserSession(): Promise<BrowserSession> {
   // Force IPv4 — Node 22's DNS prefers ::1 but Chrome's --remote-debugging-port
   // binds to 127.0.0.1 only. Retry a few times in case Chrome is still warming
   // up (cold launches on macOS can take a few seconds).
-  const cdpUrl = `http://127.0.0.1:${DEBUG_PORT}`;
+  const cdpUrl = `http://127.0.0.1:${debugPort}`;
   let browser: Browser | null = null;
   let cdpErr: any;
   for (let attempt = 0; attempt < 12; attempt++) {
@@ -305,41 +619,145 @@ export async function openBrowserSession(): Promise<BrowserSession> {
     throw new Error(`Failed to connect to Chrome at ${cdpUrl}: ${cdpErr?.message}`);
   }
 
-  console.log('[BrowserAuth] Connected to Chrome via CDP');
+  console.log(`${logPrefix} Connected to Chrome via CDP`);
 
   const context: BrowserContext = browser.contexts()[0];
   const page: Page = context.pages()[0] || await context.newPage();
+  let browserReadyForMinimize = false;
+  if (options.window) {
+    await applyBrowserWindowOptions(context, page, options.window).catch((err: any) => {
+      console.warn(`${logPrefix} Could not apply Chrome window placement: ${err?.message || err}`);
+    });
+  }
 
-  // Navigate to axiom.trade
-  await page.goto('https://axiom.trade', { waitUntil: 'load', timeout: 30000 });
-  console.log('[BrowserAuth] Page loaded, URL:', page.url());
+  async function parkReadyBrowserWindow(): Promise<void> {
+    if (!options.window) return;
+    await applyBrowserWindowOptions(context, page, options.window).catch((err: any) => {
+      console.warn(`${logPrefix} Could not restore Chrome window placement: ${err?.message || err}`);
+    });
+    if (options.minimizeAfterReady) {
+      await minimizeBrowserWindow(context, page).catch((err: any) => {
+        console.warn(`${logPrefix} Could not minimize Chrome window: ${err?.message || err}`);
+      });
+    }
+  }
+
+  async function attachProxyAuthToPage(p: Page): Promise<void> {
+    const proxy = options.proxy;
+    if (!proxy?.username) return;
+    const cdp = await context.newCDPSession(p);
+    await cdp.send('Fetch.enable', { handleAuthRequests: true });
+    cdp.on('Fetch.authRequired', async ({ requestId }: any) => {
+      await cdp.send('Fetch.continueWithAuth', {
+        requestId,
+        authChallengeResponse: {
+          response: 'ProvideCredentials',
+          username: proxy.username,
+          password: proxy.password || '',
+        },
+      }).catch(() => {});
+    });
+    cdp.on('Fetch.requestPaused', async ({ requestId }: any) => {
+      await cdp.send('Fetch.continueRequest', { requestId }).catch(() => {});
+    });
+  }
+
+  await attachProxyAuthToPage(page);
+
+  // Keep Chrome light: these pages only need the axiom.trade origin, cookies,
+  // Turnstile, and the SDK-patched XHR layer. Video/media from the landing page
+  // burns CPU/GPU and is not needed for auth or WS handshakes.
+  await context.route('**/*', (route) => {
+    const req = route.request();
+    const url = req.url();
+    if (req.resourceType() === 'media' || /\.(?:mp4|webm|mov|m4v)(?:[?#]|$)/i.test(url)) {
+      return route.abort();
+    }
+    return route.continue();
+  }).catch(() => {});
+
+  // Navigate to a lightweight axiom.trade page for Cloudflare/Turnstile.
+  await page.goto(AXIOM_BROWSER_PAGE_URL, { waitUntil: 'load', timeout: 30000 });
+  console.log(`${logPrefix} Page loaded, URL:`, page.url());
 
   // ── Cloudflare / Turnstile readiness helpers ───────────────────────────
-  // The main axiom.trade page runs the live SPA and is the only page under
-  // Cloudflare's *managed* challenge. Both the SPA and CF can navigate it at
-  // any moment, which destroys the JS execution context of any in-flight
+  // The main axiom.trade page is the same-origin browser surface under
+  // Cloudflare's *managed* challenge. The app or CF can navigate it at any
+  // moment, which destroys the JS execution context of any in-flight
   // page.evaluate — including the long-lived Turnstile token render. These
   // helpers let us detect that, wait it out, and re-prime Turnstile before
   // each login attempt.
 
+  async function mainPageChallengeState(): Promise<{ onChallenge: boolean; visibleChallenge: boolean }> {
+    try {
+      const html = await page.content();
+      const onChallenge = isCloudflareChallengePage(page.url(), html);
+      return { onChallenge, visibleChallenge: onChallenge };
+    } catch {
+      // content()/url() can throw if a navigation is in flight. Treat it as
+      // not ready, but don't surface the browser as if manual CF input is needed.
+      return { onChallenge: true, visibleChallenge: false };
+    }
+  }
+
   // Is the main page currently sitting on a Cloudflare interstitial?
   async function mainPageOnChallenge(): Promise<boolean> {
-    try {
-      if (/\/cdn-cgi\/|challenge/i.test(page.url())) return true;
-      const html = await page.content();
-      return /challenges\.cloudflare\.com|challenge-platform|Verify you are human|перевірка безпеки/i.test(html);
-    } catch {
-      // content()/url() can throw if a navigation is in flight — treat as "not ready".
-      return true;
-    }
+    return (await mainPageChallengeState()).onChallenge;
   }
 
   // Wait out a CF challenge on the main page (auto-pass or manual solve, up to 2m).
   async function waitForMainPageClear(): Promise<void> {
-    console.log('[BrowserAuth] Cloudflare challenge on main page — waiting for it to clear (auto or manual)...');
-    await page.waitForURL(/axiom\.trade\/(?!.*challenge)/, { timeout: 120000 });
-    await page.waitForLoadState('load');
-    console.log('[BrowserAuth] Cloudflare challenge passed');
+    console.log(`${logPrefix} Cloudflare challenge on main page — waiting for it to clear (auto or manual)...`);
+    const deadline = Date.now() + 120000;
+    const surfaceAfter = Date.now() + 5000;
+    let nextLogAt = Date.now() + 15000;
+    let surfaced = false;
+
+    const surfaceForManualSolve = async (): Promise<void> => {
+      if (surfaced || !options.surfaceOnCloudflareChallenge) return;
+      surfaced = true;
+      const message = `${label || 'browser'} Cloudflare check needs manual solve — bringing browser to front`;
+      options.onCloudflareChallenge?.(message);
+      console.log(`${logPrefix} ${message}`);
+      await applyBrowserWindowOptions(
+        context,
+        page,
+        options.challengeWindow ?? MANUAL_CHALLENGE_BROWSER_WINDOW,
+        { forceNormal: true },
+      ).catch((err: any) => {
+        console.warn(`${logPrefix} Could not surface Chrome window: ${err?.message || err}`);
+      });
+      await page.bringToFront().catch(() => {});
+    };
+
+    const restoreBackgroundWindow = async (): Promise<void> => {
+      if (!surfaced || !options.window) return;
+      if (browserReadyForMinimize) {
+        await parkReadyBrowserWindow();
+        return;
+      }
+      await applyBrowserWindowOptions(context, page, options.window).catch((err: any) => {
+        console.warn(`${logPrefix} Could not restore Chrome window placement: ${err?.message || err}`);
+      });
+    };
+
+    while (Date.now() < deadline) {
+      await page.waitForLoadState('load', { timeout: 5000 }).catch(() => {});
+      const challengeState = await mainPageChallengeState();
+      if (!challengeState.onChallenge) {
+        console.log(`${logPrefix} Cloudflare challenge passed`);
+        await restoreBackgroundWindow();
+        return;
+      }
+      if (Date.now() >= surfaceAfter && challengeState.visibleChallenge) await surfaceForManualSolve();
+      if (Date.now() >= nextLogAt) {
+        console.log(`${logPrefix} Still waiting for Cloudflare challenge to clear...`);
+        nextLogAt = Date.now() + 15000;
+      }
+      await page.waitForTimeout(1000);
+    }
+
+    throw new Error('Cloudflare challenge did not clear within 120s');
   }
 
   // (Re-)inject the Turnstile container + API script. Idempotent: a navigation
@@ -376,16 +794,16 @@ export async function openBrowserSession(): Promise<BrowserSession> {
     await injectTurnstile();
   }
 
-  // Issue an authenticated API POST from the real SPA page (axiom.trade origin)
-  // to API_BASE, via XMLHttpRequest. We deliberately use the SPA page — not the
-  // bare api page — for two things /verify-wallet-v2 depends on:
+  // Issue an authenticated API POST from the real axiom.trade page to an API
+  // shard, via XMLHttpRequest. We deliberately use this page — not a bare api
+  // page — for two things /verify-wallet-v2 depends on:
   //   1. Origin/Referer become https://axiom.trade. Browsers forbid setting
   //      those headers from JS, so the request must *originate* from that page.
   //   2. Axiom's anti-bot SDK hooks XMLHttpRequest on this page and stamps its
   //      per-request headers (Xa<rand>-A..Z); a fetch from a bare page gets none.
   // XHR (not fetch) because the frontend uses axios/XHR — the layer the SDK patches.
-  async function apiPostFromPage(pathName: string, bodyJson: string): Promise<{ status: number; body: string }> {
-    const url = `${API_BASE}${pathName}`;
+  async function apiPostFromPage(host: string, pathName: string, bodyJson: string): Promise<{ status: number; body: string }> {
+    const url = `https://${host}${pathName}`;
     return page.evaluate(`
       new Promise((resolve, reject) => {
         try {
@@ -407,12 +825,12 @@ export async function openBrowserSession(): Promise<BrowserSession> {
   if (await mainPageOnChallenge()) {
     await waitForMainPageClear();
   } else {
-    console.log('[BrowserAuth] No CF challenge — page loaded directly');
+    console.log(`${logPrefix} No CF challenge — page loaded directly`);
   }
   await page.waitForTimeout(3000);
-  console.log('[BrowserAuth] Current URL:', page.url());
+  console.log(`${logPrefix} Current URL:`, page.url());
   await injectTurnstile();
-  console.log('[BrowserAuth] Turnstile API loaded');
+  console.log(`${logPrefix} Turnstile API loaded`);
 
   // Probe what Axiom's own JS sends — must pass auth tokens so the page loads as a real user
   async function probeEucalyptusMessages(pairAddress: string, accessToken?: string, refreshToken?: string): Promise<void> {
@@ -460,12 +878,6 @@ export async function openBrowserSession(): Promise<BrowserSession> {
   });
   // Viewer manager auto-installs on every page navigation in this context.
   await context.addInitScript({ content: VIEWER_MANAGER_SCRIPT });
-
-  // Open a single api2 tab for all API calls
-  const apiPage = await context.newPage();
-  await apiPage.goto(`${API_BASE}/`, { waitUntil: 'load', timeout: 30000 }).catch(() => {});
-  await apiPage.waitForTimeout(1000);
-  console.log('[BrowserAuth] API page ready');
 
   // Page pool for WS viewer handshakes. Playwright/Chrome serializes
   // page.evaluate calls on the same page — a single shared page is the
@@ -536,22 +948,60 @@ export async function openBrowserSession(): Promise<BrowserSession> {
     });
   }
 
+  async function waitForAxiomWorkerPageReady(p: Page): Promise<void> {
+    let last = 'not checked';
+    for (let attempt = 1; attempt <= 8; attempt++) {
+      const urls = buildAxiomWorkerReadinessUrls();
+      const result = await p.evaluate(async (probeUrls) => {
+        let lastResult = 'no probe urls';
+        for (const url of probeUrls) {
+          try {
+            const r = await fetch(url, { credentials: 'include' });
+            lastResult = `${url} status=${r.status}`;
+            if (r.ok) return { ok: true, detail: lastResult };
+          } catch (e: any) {
+            lastResult = `${url} fetch=${e?.message || String(e)}`;
+          }
+        }
+        return { ok: false, detail: lastResult };
+      }, urls).catch((err: any) => ({ ok: false, detail: `evaluate=${err?.message || err}` }));
+
+      last = result.detail;
+      if (result.ok) {
+        if (attempt > 1) console.log(`${logPrefix} Axiom worker page network ready after ${attempt} probe(s)`);
+        await p.waitForTimeout(1000);
+        return;
+      }
+
+      if (attempt === 1) {
+        console.log(`${logPrefix} Waiting for Axiom worker page network before refresh...`);
+      }
+      await p.waitForTimeout(1000);
+    }
+
+    console.warn(`${logPrefix} Axiom worker page network did not confirm readiness (${last}); continuing`);
+  }
+
   async function setupFriendsPage(): Promise<Page> {
     const p = await context.newPage();
-    await p.goto('https://axiom.trade', { waitUntil: 'load', timeout: 30000 }).catch(() => {});
+    await attachProxyAuthToPage(p);
+    await p.goto(AXIOM_BROWSER_PAGE_URL, { waitUntil: 'load', timeout: 30000 }).catch(() => {});
     await p.waitForTimeout(500);
     p.on('console', msg => {
       const t = msg.text();
       if (t.startsWith('[viewer ') || t.startsWith('[viewer]')) console.log('[Browser]', t);
     });
     await attachCdpListenersTo(p);
+    await waitForAxiomWorkerPageReady(p);
     return p;
   }
 
   const friendsPages: Page[] = [];
   friendsPages.push(await setupFriendsPage());
   const friendsPage = friendsPages[0]; // primary for non-pool operations (resolvePairFromCa, bootstrapSession)
-  console.log('[BrowserAuth] Axiom page ready for WS connections');
+  console.log(`${logPrefix} Axiom page ready for WS connections`);
+  browserReadyForMinimize = true;
+  await parkReadyBrowserWindow();
 
   async function ensurePageSlots(n: number): Promise<void> {
     while (friendsPages.length < n) {
@@ -627,47 +1077,49 @@ export async function openBrowserSession(): Promise<BrowserSession> {
           //    page since the previous attempt, before the long Turnstile evaluate.
           await ensureMainPageReady();
 
-          // 1. Get turnstile token
-          const turnstileToken = await getTurnstileToken();
+          await runLoginApiHostVerification({
+            hosts: LOGIN_API_HOSTS,
+            walletPublicKey: wallet.publicKey,
+            getNonce: async (host, walletPublicKey) => {
+              console.log(`[BrowserAuth] Trying login API host ${host}`);
+              const nonceRes = await apiPostFromPage(host, '/wallet-nonce', JSON.stringify({
+                walletAddress: walletPublicKey,
+                v: Date.now(),
+              }));
+              if (nonceRes.status < 200 || nonceRes.status >= 300) {
+                const err: any = new Error(`Nonce failed on ${host}: ${nonceRes.status} - ${nonceRes.body}`);
+                err.status = nonceRes.status;
+                err.host = host;
+                throw err;
+              }
+              console.log(`[BrowserAuth] Got nonce from ${host}:`, nonceRes.body);
+              return nonceRes.body;
+            },
+            signNonce: (nonce) => {
+              const message = buildSignMessage(nonce);
+              const signature = nacl.sign.detached(new TextEncoder().encode(message), wallet.secretKey);
+              return bs58.encode(signature);
+            },
+            getTurnstileToken,
+            verify: async (host, payload) => {
+              const verifyRes = await apiPostFromPage(host, '/verify-wallet-v2', JSON.stringify(payload));
+              if (verifyRes.status < 200 || verifyRes.status >= 300) {
+                const err: any = new Error(`Verify failed on ${host}: ${verifyRes.status} - ${verifyRes.body}`);
+                err.status = verifyRes.status;
+                err.host = host;
+                throw err;
+              }
+              console.log(`[BrowserAuth] Verify response received from ${host}`);
+            },
+            onHostFailure: async (host, status, message) => {
+              await context.clearCookies({ name: 'auth-access-token' }).catch(() => {});
+              await context.clearCookies({ name: 'auth-refresh-token' }).catch(() => {});
+              console.warn(`[BrowserAuth] Login API host ${host} failed (${status || 'network'}): ${message.split('\n')[0]}; trying next host...`);
+            },
+          });
 
-          // 2. Get nonce — issued from the SPA page → API_BASE (see
-          // apiPostFromPage). `v` is the client epoch-ms the frontend sends.
-          const nonceRes = await apiPostFromPage('/wallet-nonce', JSON.stringify({
-            walletAddress: wallet.publicKey,
-            v: Date.now(),
-          }));
-          if (nonceRes.status < 200 || nonceRes.status >= 300) {
-            throw new Error('Nonce failed: ' + nonceRes.status + ' - ' + nonceRes.body);
-          }
-          const nonce = nonceRes.body;
-          console.log('[BrowserAuth] Got nonce:', nonce);
-
-          // 3. Sign message in Node.js
-          const message = buildSignMessage(nonce);
-          const signature = nacl.sign.detached(new TextEncoder().encode(message), wallet.secretKey);
-          const signatureBase58 = bs58.encode(signature);
-
-          // 4. Verify wallet — same SPA-page path. Field set + `v` mirror the
-          // live frontend's request exactly.
-          const verifyRes = await apiPostFromPage('/verify-wallet-v2', JSON.stringify({
-            walletAddress: wallet.publicKey,
-            allowLinking: false,
-            allowRegistration: false,
-            forAddCredential: false,
-            isVerify: false,
-            nonce,
-            referrer: null,
-            signature: signatureBase58,
-            turnstileToken,
-            v: Date.now(),
-          }));
-          if (verifyRes.status < 200 || verifyRes.status >= 300) {
-            throw new Error('Verify failed: ' + verifyRes.status + ' - ' + verifyRes.body);
-          }
-          console.log('[BrowserAuth] Verify response received');
-
-          // 5. Extract auth + CF cookies from browser
-          await apiPage.waitForTimeout(500);
+          // Extract auth + CF cookies from browser.
+          await page.waitForTimeout(500);
           const browserCookies = await context.cookies();
           let accessToken = '';
           let refreshToken = '';
@@ -737,33 +1189,54 @@ export async function openBrowserSession(): Promise<BrowserSession> {
 
       try {
         const tBefore = Date.now();
-        const result = await friendsPage.evaluate(async () => {
+        const result = await friendsPage.evaluate(async (hosts) => {
           // Best-effort: most rate-limit headers are NOT CORS-safelisted, so a
-          // cross-origin read (api9 from the axiom.trade page) usually returns
+          // cross-origin read (apiN from the axiom.trade page) usually returns
           // null for them. We still try — if the server exposes them we capture
           // the real numbers; otherwise the probe falls back to measuring the
           // ceiling/cooldown empirically.
           const RL_HEADERS = ['retry-after', 'ratelimit-remaining', 'ratelimit-limit',
             'ratelimit-reset', 'x-ratelimit-remaining', 'x-ratelimit-limit', 'x-ratelimit-reset'];
-          const t0 = performance.now();
-          try {
-            const r = await fetch('https://api9.axiom.trade/refresh-access-token', {
-              method: 'POST',
-              credentials: 'include',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({}),
-            });
-            const text = await r.text();
-            const headers: Record<string, string> = {};
-            for (const k of RL_HEADERS) {
-              const v = r.headers.get(k);
-              if (v != null) headers[k] = v;
+          let lastResult = {
+            url: '',
+            ok: false,
+            status: 0,
+            body: 'no refresh hosts tried',
+            elapsedMs: 0,
+            headers: {} as Record<string, string>,
+          };
+
+          for (const host of hosts) {
+            const url = 'https://' + host + '/refresh-access-token';
+            const t0 = performance.now();
+            try {
+              const r = await fetch(url, {
+                method: 'POST',
+                credentials: 'include',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({}),
+              });
+              const text = await r.text();
+              const headers: Record<string, string> = {};
+              for (const k of RL_HEADERS) {
+                const v = r.headers.get(k);
+                if (v != null) headers[k] = v;
+              }
+              lastResult = { url, ok: r.ok, status: r.status, body: text.slice(0, 500), elapsedMs: Math.round(performance.now() - t0), headers };
+              if (r.ok) return lastResult;
+            } catch (e: any) {
+              lastResult = {
+                url,
+                ok: false,
+                status: 0,
+                body: 'fetch error: ' + (e?.message || String(e)),
+                elapsedMs: Math.round(performance.now() - t0),
+                headers: {} as Record<string, string>,
+              };
             }
-            return { ok: r.ok, status: r.status, body: text.slice(0, 500), elapsedMs: Math.round(performance.now() - t0), headers };
-          } catch (e: any) {
-            return { ok: false, status: 0, body: 'fetch error: ' + (e?.message || String(e)), elapsedMs: Math.round(performance.now() - t0), headers: {} as Record<string, string> };
           }
-        });
+          return lastResult;
+        }, [...REFRESH_ACCESS_TOKEN_HOSTS]);
 
         // What CDP saw for this exact request (real status / failure reason),
         // which beats the opaque status 0 the in-page fetch reports when the
@@ -778,10 +1251,10 @@ export async function openBrowserSession(): Promise<BrowserSession> {
         // carrying a rate-limit header gets logged. The probe reads err.status.
         const retryAfter = result.headers?.['retry-after'] ?? null;
         if (realStatus === 429 || retryAfter != null || (cdp?.failed)) {
-          console.log(`[BrowserAuth] refresh signal: js-status=${result.status} wire-status=${cdp?.status ?? '?'} failed=${cdp?.failed ?? false} reason=${cdp?.error ?? '-'} retry-after=${retryAfter ?? '?'} headers=${JSON.stringify(result.headers)}`);
+          console.log(`[BrowserAuth] refresh signal: url=${result.url} js-status=${result.status} wire-status=${cdp?.status ?? '?'} failed=${cdp?.failed ?? false} reason=${cdp?.error ?? '-'} retry-after=${retryAfter ?? '?'} headers=${JSON.stringify(result.headers)}`);
         }
 
-        if (!result.ok) {
+        if (!isRefreshResponseSuccessful(result.ok, realStatus)) {
           const err: any = new Error(`refresh-access-token ${realStatus}${retryAfter != null ? ` retry-after=${retryAfter}` : ''}:${cdpNote} ${result.body}`);
           err.status = realStatus;
           err.retryAfter = retryAfter != null ? Number(retryAfter) : null;
@@ -808,7 +1281,10 @@ export async function openBrowserSession(): Promise<BrowserSession> {
           }
         }
         if (!accessToken) {
-          throw new Error('refresh-access-token returned 200 but no new auth-access-token cookie set');
+          const err: any = new Error(`refresh-access-token returned ${realStatus || 200} but no new auth-access-token cookie set`);
+          err.status = realStatus || 200;
+          err.code = 'NO_ACCESS_COOKIE';
+          throw err;
         }
         console.log(`[BrowserAuth] Refresh OK, new access token ${accessToken.slice(0, 20)}... (refresh ${refreshToken ? 'rotated' : 'kept'})`);
         return {
@@ -877,6 +1353,32 @@ export async function openBrowserSession(): Promise<BrowserSession> {
 
     async ensurePageSlots(n: number): Promise<void> {
       await ensurePageSlots(n);
+    },
+
+    async fetchPairInfo(pairAddress: string): Promise<any | null> {
+      const hosts = ['api9.axiom.trade', 'api7.axiom.trade', 'api3.axiom.trade', 'api2.axiom.trade'];
+      for (const host of hosts) {
+        try {
+          const url = `https://${host}/pair-info?pairAddress=${pairAddress}&v=${Date.now()}`;
+          const result = await friendsPage.evaluate(async (u) => {
+            try {
+              const r = await fetch(u, { credentials: 'include' });
+              if (!r.ok) return { __err: 'status ' + r.status };
+              return await r.json();
+            } catch (e: any) {
+              return { __err: 'fetch ' + (e?.message || String(e)) };
+            }
+          }, url);
+          if (result && !(result as any).__err) {
+            console.log(`[BrowserAuth] fetchPairInfo OK via ${host} pair=${pairAddress}`);
+            return result;
+          }
+          console.log(`[BrowserAuth] fetchPairInfo ${host} -> ${(result as any)?.__err || 'empty response'}`);
+        } catch (e: any) {
+          console.log(`[BrowserAuth] fetchPairInfo evaluate error on ${host}:`, e.message);
+        }
+      }
+      return null;
     },
 
     async connectViewer(accessToken: string, refreshToken: string, tokenInfo: any, pingJitterMs?: number, slotIndex: number = 0): Promise<number> {

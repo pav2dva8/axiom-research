@@ -10,15 +10,15 @@ import * as fs from "fs";
 import * as path from "path";
 import { WebSocketServer, WebSocket } from "ws";
 import { AccountManager, type LoadedAccount } from "./account-manager";
+import type { KeepWarmTimingInput } from "./keepwarm-config";
 import {
   DeployWatchCanceledError,
   DeployWatcher,
-  buildDeployTokenInfo,
   getDeployWatchConfig,
   loadDeployWatchEnvFile,
-  parseDeployWatchInput,
   type DeployWatchEvent,
 } from "./deploy-watcher";
+import { resolveDeployWatchTarget } from "./deploy-watch-target";
 import {
   cancelDeployWatchRequestState,
   createDeployWatchRequestState,
@@ -28,8 +28,11 @@ import {
   throwIfDeployWatchRequestCanceled,
   type DeployWatchRequestState,
 } from "./deploy-watch-request";
-import { ViewerService, type TokenInfo } from "./viewer-service";
-import { derivePumpPair, isPumpCa } from "../pump-pair";
+import { ViewerService } from "./viewer-service";
+import {
+  TokenResolveError,
+  resolveTokenInput,
+} from "./token-resolver";
 
 const PORT = process.env.PORT || 3847;
 loadDeployWatchEnvFile();
@@ -67,7 +70,9 @@ function isDeployWatchStatusActive(): boolean {
 function statusPayload() {
   return {
     accounts: accountManager.getAccountCount(),
-    selected: accountManager.getSelectedCount(),
+    selected: accountManager.getSelectedCount('run'),
+    accountsSelected: accountManager.getSelectedCount('accounts'),
+    runSelected: accountManager.getSelectedCount('run'),
     activeViewers: viewerService.getActiveCount(),
     keepWarm: accountManager.isKeepWarmRunning(),
     deployWatch: isDeployWatchStatusActive(),
@@ -144,20 +149,6 @@ function readBody(req: http.IncomingMessage): Promise<string> {
   });
 }
 
-/**
- * The input is always either a bare token CA or a full axiom.trade link
- * (e.g. https://axiom.trade/meme/<pair>?chain=sol) whose embedded address is
- * the pair. Pull the base58 address out of whatever was pasted; a bare CA is
- * returned unchanged. Whether the input was a bare address (CA) or a link
- * (pair) is what classifies it below — not the address suffix.
- */
-const BASE58_ADDRESS = /[1-9A-HJ-NP-Za-km-z]{32,44}/;
-function extractAddress(input: string): string {
-  const trimmed = input.trim();
-  const match = trimmed.match(BASE58_ADDRESS);
-  return match ? match[0] : trimmed;
-}
-
 async function ensureBrowserSession(): Promise<
   NonNullable<ReturnType<typeof viewerService.getBrowserSession>>
 > {
@@ -178,44 +169,6 @@ async function ensureBrowserSession(): Promise<
     message: "Browser ready.",
   });
   return session;
-}
-
-/**
- * /clipboard-pair-info is authenticated — it 502s with "Session invalid"
- * unless the request carries a valid auth-access-token. Return a logged-in
- * account's tokens for the CA lookup: prefer a selected account with a still
- * valid access token, otherwise refresh one (fast, uses the refresh token).
- * Returns null if no account has usable credentials (user must log in first).
- */
-async function authTokensForResolve(
-  session: NonNullable<ReturnType<typeof viewerService.getBrowserSession>>,
-): Promise<{ accessToken: string; refreshToken: string } | null> {
-  const selected = accountManager.loadSelectedAccounts();
-  const pool =
-    selected.length > 0 ? selected : accountManager.loadAllAccounts();
-  if (pool.length === 0) return null;
-
-  const valid = pool.find((a) => accountManager.isTokenValid(a.publicKey));
-  if (valid)
-    return { accessToken: valid.accessToken, refreshToken: valid.refreshToken };
-
-  // No valid cached token — refresh one. Try a few in case some refresh
-  // tokens are also stale.
-  for (const a of pool.slice(0, 3)) {
-    const ok = await accountManager
-      .refreshAccount(a.publicKey, session)
-      .catch(() => false);
-    if (ok) {
-      const fresh = accountManager.loadAccount(a.publicKey);
-      if (fresh?.accessToken) {
-        return {
-          accessToken: fresh.accessToken,
-          refreshToken: fresh.refreshToken,
-        };
-      }
-    }
-  }
-  return null;
 }
 
 async function handleApi(
@@ -251,6 +204,27 @@ async function handleApi(
       return;
     }
 
+    // GET /api/proxy-groups
+    if (pathname === "/api/proxy-groups" && req.method === "GET") {
+      res.writeHead(200);
+      res.end(JSON.stringify(accountManager.listProxyGroups()));
+      return;
+    }
+
+    // GET /api/run/accounts — viewer-only selection/status.
+    if (pathname === "/api/run/accounts" && req.method === "GET") {
+      res.writeHead(200);
+      res.end(JSON.stringify(accountManager.listRunAccounts()));
+      return;
+    }
+
+    // GET /api/run/proxy-groups — viewer-only selection/status, stable proxy layout.
+    if (pathname === "/api/run/proxy-groups" && req.method === "GET") {
+      res.writeHead(200);
+      res.end(JSON.stringify(accountManager.listRunProxyGroups()));
+      return;
+    }
+
     // POST /api/accounts/select  { publicKey, selected }
     if (pathname === "/api/accounts/select" && req.method === "POST") {
       const { publicKey, selected } = JSON.parse(await readBody(req));
@@ -283,6 +257,41 @@ async function handleApi(
       broadcastStatus();
       res.writeHead(200);
       res.end(JSON.stringify({ ok: true, selected: publicKeys.length }));
+      return;
+    }
+
+    // POST /api/run/select  { publicKey, selected }
+    if (pathname === "/api/run/select" && req.method === "POST") {
+      const { publicKey, selected } = JSON.parse(await readBody(req));
+      if (typeof publicKey !== "string" || typeof selected !== "boolean") {
+        res.writeHead(400);
+        res.end(JSON.stringify({ error: "publicKey + selected required" }));
+        return;
+      }
+      accountManager.setRunSelected(publicKey, selected);
+      broadcast("accounts-changed", {});
+      broadcastStatus();
+      res.writeHead(200);
+      res.end(JSON.stringify({ ok: true }));
+      return;
+    }
+
+    // POST /api/run/selection  { publicKeys: string[] }
+    if (pathname === "/api/run/selection" && req.method === "POST") {
+      const { publicKeys } = JSON.parse(await readBody(req));
+      if (
+        !Array.isArray(publicKeys) ||
+        !publicKeys.every((k) => typeof k === "string")
+      ) {
+        res.writeHead(400);
+        res.end(JSON.stringify({ error: "publicKeys array required" }));
+        return;
+      }
+      accountManager.setRunSelection(publicKeys);
+      broadcast("accounts-changed", {});
+      broadcastStatus();
+      res.writeHead(200);
+      res.end(JSON.stringify({ ok: true, selected: accountManager.getSelectedCount('run') }));
       return;
     }
 
@@ -351,33 +360,36 @@ async function handleApi(
       return;
     }
 
-    // POST /api/accounts/keepwarm/start  { publicKeys?, delayMs?, thresholdMin? }
+    // POST /api/accounts/keepwarm/start  { publicKeys?, delayMs?, thresholdMin?, timing ranges... }
     // Refresh-only: keeps selected accounts logged in indefinitely. Never re-logins.
     if (pathname === "/api/accounts/keepwarm/start" && req.method === "POST") {
       const body = await readBody(req).catch(() => "");
       let targets: string[] | undefined;
-      let delayMs: number | undefined;
-      let thresholdMin: number | undefined;
+      const timing: KeepWarmTimingInput = {};
       try {
         if (body) {
           const parsed = JSON.parse(body);
           if (Array.isArray(parsed.publicKeys)) targets = parsed.publicKeys;
-          if (
-            typeof parsed.delayMs === "number" &&
-            Number.isFinite(parsed.delayMs)
-          )
-            delayMs = parsed.delayMs;
-          if (
-            typeof parsed.thresholdMin === "number" &&
-            Number.isFinite(parsed.thresholdMin)
-          )
-            thresholdMin = parsed.thresholdMin;
+          for (const key of [
+            "delayMs",
+            "thresholdMin",
+            "groupStartDelayMinMs",
+            "groupStartDelayMaxMs",
+            "refreshDelayMinMs",
+            "refreshDelayMaxMs",
+            "refreshThresholdMinMin",
+            "refreshThresholdMaxMin",
+          ] as const) {
+            if (typeof parsed[key] === "number" && Number.isFinite(parsed[key])) {
+              timing[key] = parsed[key];
+            }
+          }
         }
       } catch {}
 
       await accountManager.startKeepLoggedIn(
         targets,
-        { delayMs, thresholdMin },
+        timing,
         (message, running) => {
           broadcast("keepwarm", { running, message });
         },
@@ -452,110 +464,23 @@ async function handleApi(
     // POST /api/resolve  { input }  — accepts a token CA or an axiom.trade link
     if (pathname === "/api/resolve" && req.method === "POST") {
       const { input } = JSON.parse(await readBody(req));
-      if (typeof input !== "string" || !input.trim()) {
-        res.writeHead(400);
-        res.end(JSON.stringify({ error: "input required" }));
-        return;
-      }
-      const value = extractAddress(input);
-      // A bare address is a token CA (any suffix, not only "pump"); a full
-      // axiom.trade link wraps the pair. The input is never a bare pair.
-      const fromLink = value !== input.trim();
-
-      if (!/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(value)) {
-        res.writeHead(400);
-        res.end(
-          JSON.stringify({ error: "No token CA or axiom link found in input" }),
-        );
-        return;
-      }
-
-      let pairAddress: string | null = null;
-      let pairData: any = null;
-
-      if (fromLink) {
-        // The address inside an axiom.trade link is already the pair.
-        pairAddress = value;
-      } else {
-        // Bare token CA → resolve to its pair. A pump.fun CA has a
-        // deterministic bonding-curve PDA we can derive locally (fast, and it
-        // survives a flaky api9/api2 502). Any other CA needs the
-        // authenticated /clipboard-pair-info lookup.
-        if (isPumpCa(value)) {
-          pairAddress = derivePumpPair(value);
+      try {
+        const result = resolveTokenInput(input);
+        viewerService.setTokenInfo(result.tokenInfo);
+        res.writeHead(200);
+        res.end(JSON.stringify(result));
+      } catch (err: any) {
+        if (err instanceof TokenResolveError) {
+          res.writeHead(err.status);
+          res.end(JSON.stringify({ error: err.message }));
+          return;
         }
-        if (!pairAddress) {
-          const session = await ensureBrowserSession();
-          const auth = await authTokensForResolve(session);
-          if (!auth) {
-            res.writeHead(401);
-            res.end(
-              JSON.stringify({
-                error:
-                  "No logged-in account. Open the Accounts tab and log in an account, then resolve the CA.",
-              }),
-            );
-            return;
-          }
-          const resolved = await session.resolvePairFromCa(
-            value,
-            auth.accessToken,
-            auth.refreshToken,
-          );
-          if (resolved?.pairAddress) {
-            pairAddress = resolved.pairAddress;
-            pairData = resolved;
-          }
-        }
+        throw err;
       }
-
-      if (!pairAddress) {
-        res.writeHead(404);
-        res.end(JSON.stringify({ error: "Could not resolve CA to pair" }));
-        return;
-      }
-
-      // pairData (from resolvePairFromCa) may be null. Build minimal tokenInfo
-      // from what we know — the WS protocol only requires pairAddress + chain.
-      const tokenInfo: TokenInfo = pairData
-        ? {
-            pairAddress: pairData.pairAddress || pairAddress,
-            tokenAddress:
-              pairData.tokenAddress || pairData.baseToken?.address || "",
-            ticker:
-              pairData.ticker ||
-              pairData.tokenTicker ||
-              pairData.baseToken?.symbol ||
-              "UNKNOWN",
-            name:
-              pairData.name ||
-              pairData.tokenName ||
-              pairData.baseToken?.name ||
-              "Unknown Token",
-            protocol: pairData.protocol || "Pump V1",
-            isMigrated: pairData.isMigrated || false,
-            supply:
-              pairData.supply || pairData.baseToken?.totalSupply || 1000000000,
-            price: pairData.price || pairData.priceUsd || 0,
-          }
-        : {
-            pairAddress,
-            tokenAddress: fromLink ? "" : value,
-            ticker: "TOKEN",
-            name: "Token",
-            protocol: isPumpCa(value) ? "Pump V1" : "Unknown",
-            isMigrated: false,
-            supply: 1000000000,
-            price: 0,
-          };
-
-      viewerService.setTokenInfo(tokenInfo);
-      res.writeHead(200);
-      res.end(JSON.stringify({ tokenInfo, derived: !pairData }));
       return;
     }
 
-    // POST /api/viewers/watch-deploy-start  { input, minGapMs?, maxGapMs?, bootstrapDisabled?, concurrency? }
+    // POST /api/viewers/watch-deploy-start  { input, minGapMs?, maxGapMs?, groupStartDelayMinMs?, groupStartDelayMaxMs?, bootstrapDisabled?, concurrency? }
     if (pathname === "/api/viewers/watch-deploy-start" && req.method === "POST") {
       if (isDeployWatchBusy()) {
         res.writeHead(409);
@@ -564,24 +489,31 @@ async function handleApi(
       }
 
       const body = JSON.parse(await readBody(req));
-      const { input, minGapMs, maxGapMs, bootstrapDisabled, concurrency } =
-        body ?? {};
+      const {
+        input,
+        minGapMs,
+        maxGapMs,
+        groupStartDelayMinMs,
+        groupStartDelayMaxMs,
+        bootstrapDisabled,
+        concurrency,
+      } = body ?? {};
       if (typeof input !== "string" || !input.trim()) {
         res.writeHead(400);
         res.end(JSON.stringify({ error: "input required" }));
         return;
       }
 
-      let parsed;
+      let target;
       try {
-        parsed = parseDeployWatchInput(input);
+        target = resolveDeployWatchTarget(input);
       } catch (err: any) {
         res.writeHead(400);
         res.end(JSON.stringify({ error: err.message }));
         return;
       }
 
-      const tokenInfo = buildDeployTokenInfo(parsed);
+      const { parsed, tokenInfo } = target;
       const request = createDeployWatchRequestState({
         ca: parsed.ca,
         pairAddress: parsed.pairAddress,
@@ -599,10 +531,18 @@ async function handleApi(
         typeof concurrency === "number" &&
         Number.isFinite(concurrency) &&
         concurrency >= 1;
+      const groupStartDelayMinValid =
+        typeof groupStartDelayMinMs === "number" &&
+        Number.isFinite(groupStartDelayMinMs) &&
+        groupStartDelayMinMs >= 0;
+      const groupStartDelayMaxValid =
+        typeof groupStartDelayMaxMs === "number" &&
+        Number.isFinite(groupStartDelayMaxMs) &&
+        groupStartDelayMaxMs >= 0;
 
       broadcastDeployWatchEvent({
         state: "preparing",
-        message: `Preparing browser/accounts for CA ${parsed.ca}.`,
+        message: `Preparing watch for CA ${parsed.ca}.`,
         ca: parsed.ca,
         pairAddress: parsed.pairAddress,
       }, request);
@@ -611,11 +551,14 @@ async function handleApi(
 
       try {
         throwIfDeployWatchRequestCanceled(request);
-        await ensureBrowserSession();
+        const proxyMode = accountManager.hasConfiguredProxies();
+        if (!proxyMode) {
+          await ensureBrowserSession();
+        }
         throwIfDeployWatchRequestCanceled(request);
         viewerService.setTokenInfo(tokenInfo);
 
-        accounts = accountManager.loadSelectedAccounts();
+        accounts = accountManager.loadExplicitRunSelectedAccounts();
         if (accounts.length === 0) {
           broadcastDeployWatchEvent({
             state: "failed",
@@ -629,6 +572,27 @@ async function handleApi(
             JSON.stringify({
               error:
                 "No accounts selected or none have valid tokens. Re-login first.",
+            }),
+          );
+          return;
+        }
+
+        let groupPlan = proxyMode
+          ? accountManager.getWarmProxyViewerGroups(accounts)
+          : null;
+        if (groupPlan && !groupPlan.ready) {
+          broadcastDeployWatchEvent({
+            state: "failed",
+            message: groupPlan.error ?? "Start keep-warm first so proxy groups are ready.",
+            ca: parsed.ca,
+            pairAddress: parsed.pairAddress,
+          }, request);
+          res.writeHead(400);
+          res.end(
+            JSON.stringify({
+              error: groupPlan.error ?? "Start keep-warm first so proxy groups are ready.",
+              missingGroups: groupPlan.missingGroups,
+              missingAccounts: groupPlan.missingAccounts,
             }),
           );
           return;
@@ -651,18 +615,54 @@ async function handleApi(
           pairAddress: parsed.pairAddress,
         }, request);
 
+        if (proxyMode) {
+          groupPlan = accountManager.getWarmProxyViewerGroups(accounts);
+          if (!groupPlan.ready) {
+            broadcastDeployWatchEvent({
+              state: "failed",
+              message: groupPlan.error ?? "Start keep-warm first so proxy groups are ready.",
+              ca: parsed.ca,
+              pairAddress: parsed.pairAddress,
+            }, request);
+            res.writeHead(400);
+            res.end(
+              JSON.stringify({
+                error: groupPlan.error ?? "Start keep-warm first so proxy groups are ready.",
+                missingGroups: groupPlan.missingGroups,
+                missingAccounts: groupPlan.missingAccounts,
+              }),
+            );
+            return;
+          }
+        }
+
         currentRunTotal = accounts.length;
         broadcast("viewer-run", {
           total: accounts.length,
           accounts: accounts.map((a) => a.publicKey),
+          groups: groupPlan
+            ? groupPlan.groups.map((group) => ({
+                id: group.id,
+                label: group.label,
+                accounts: group.accounts.map((a) => a.publicKey),
+              }))
+            : undefined,
         });
 
-        const connected = await viewerService.connectAll(accounts, {
-          ...(minGapValid ? { minGapMs } : {}),
-          ...(maxGapValid ? { maxGapMs } : {}),
-          ...(concurrencyValid ? { concurrency } : {}),
-          bootstrapDisabled: bootstrapDisabled === true,
-        });
+        const connected = groupPlan
+          ? await viewerService.connectGroups(groupPlan.groups, {
+              ...(minGapValid ? { minGapMs } : {}),
+              ...(maxGapValid ? { maxGapMs } : {}),
+              ...(groupStartDelayMinValid ? { groupStartDelayMinMs } : {}),
+              ...(groupStartDelayMaxValid ? { groupStartDelayMaxMs } : {}),
+              bootstrapDisabled: bootstrapDisabled === true,
+            })
+          : await viewerService.connectAll(accounts, {
+              ...(minGapValid ? { minGapMs } : {}),
+              ...(maxGapValid ? { maxGapMs } : {}),
+              ...(concurrencyValid ? { concurrency } : {}),
+              bootstrapDisabled: bootstrapDisabled === true,
+            });
         throwIfDeployWatchRequestCanceled(request);
 
         broadcastStatus();
@@ -718,7 +718,7 @@ async function handleApi(
       }
     }
 
-    // POST /api/viewers/start  { pairAddress, minGapMs?, maxGapMs?, bootstrapDisabled?, concurrency? }
+    // POST /api/viewers/start  { pairAddress, minGapMs?, maxGapMs?, groupStartDelayMinMs?, groupStartDelayMaxMs?, bootstrapDisabled?, concurrency? }
     if (pathname === "/api/viewers/start" && req.method === "POST") {
       if (isDeployWatchBusy()) {
         res.writeHead(409);
@@ -731,6 +731,8 @@ async function handleApi(
         pairAddress,
         minGapMs,
         maxGapMs,
+        groupStartDelayMinMs,
+        groupStartDelayMaxMs,
         bootstrapDisabled,
         concurrency,
       } = body ?? {};
@@ -751,8 +753,14 @@ async function handleApi(
         typeof concurrency === "number" &&
         Number.isFinite(concurrency) &&
         concurrency >= 1;
-
-      await ensureBrowserSession();
+      const groupStartDelayMinValid =
+        typeof groupStartDelayMinMs === "number" &&
+        Number.isFinite(groupStartDelayMinMs) &&
+        groupStartDelayMinMs >= 0;
+      const groupStartDelayMaxValid =
+        typeof groupStartDelayMaxMs === "number" &&
+        Number.isFinite(groupStartDelayMaxMs) &&
+        groupStartDelayMaxMs >= 0;
 
       // /api/resolve normally sets tokenInfo for the same pair. If somehow
       // missing, build a minimal placeholder — the WS protocol only requires
@@ -771,7 +779,7 @@ async function handleApi(
         });
       }
 
-      const accounts = accountManager.loadSelectedAccounts();
+      const accounts = accountManager.loadExplicitRunSelectedAccounts();
       if (accounts.length === 0) {
         res.writeHead(400);
         res.end(
@@ -785,17 +793,54 @@ async function handleApi(
 
       // Reset the live progress display: every account starts "pending".
       currentRunTotal = accounts.length;
-      broadcast("viewer-run", {
-        total: accounts.length,
-        accounts: accounts.map((a) => a.publicKey),
-      });
+      let connected = 0;
 
-      const connected = await viewerService.connectAll(accounts, {
-        ...(minGapValid ? { minGapMs } : {}),
-        ...(maxGapValid ? { maxGapMs } : {}),
-        ...(concurrencyValid ? { concurrency } : {}),
-        bootstrapDisabled: bootstrapDisabled === true,
-      });
+      if (accountManager.hasConfiguredProxies()) {
+        const groupPlan = accountManager.getWarmProxyViewerGroups(accounts);
+        if (!groupPlan.ready) {
+          res.writeHead(400);
+          res.end(
+            JSON.stringify({
+              error: groupPlan.error ?? "Start keep-warm first so proxy groups are ready.",
+              missingGroups: groupPlan.missingGroups,
+              missingAccounts: groupPlan.missingAccounts,
+            }),
+          );
+          return;
+        }
+
+        broadcast("viewer-run", {
+          total: accounts.length,
+          accounts: accounts.map((a) => a.publicKey),
+          groups: groupPlan.groups.map((group) => ({
+            id: group.id,
+            label: group.label,
+            accounts: group.accounts.map((a) => a.publicKey),
+          })),
+        });
+
+        connected = await viewerService.connectGroups(groupPlan.groups, {
+          ...(minGapValid ? { minGapMs } : {}),
+          ...(maxGapValid ? { maxGapMs } : {}),
+          ...(groupStartDelayMinValid ? { groupStartDelayMinMs } : {}),
+          ...(groupStartDelayMaxValid ? { groupStartDelayMaxMs } : {}),
+          bootstrapDisabled: bootstrapDisabled === true,
+        });
+      } else {
+        await ensureBrowserSession();
+
+        broadcast("viewer-run", {
+          total: accounts.length,
+          accounts: accounts.map((a) => a.publicKey),
+        });
+
+        connected = await viewerService.connectAll(accounts, {
+          ...(minGapValid ? { minGapMs } : {}),
+          ...(maxGapValid ? { maxGapMs } : {}),
+          ...(concurrencyValid ? { concurrency } : {}),
+          bootstrapDisabled: bootstrapDisabled === true,
+        });
+      }
 
       broadcastStatus();
       res.writeHead(200);

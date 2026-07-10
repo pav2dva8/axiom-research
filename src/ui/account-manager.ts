@@ -3,7 +3,8 @@
  *
  * Source of truth: ./keys.txt — one base58 Solana secret key per line.
  * Token cache: ./accounts/tokens/{publicKey}.json
- * Selection:   ./accounts/selection.json — array of selected publicKeys.
+ * Account selection: ./accounts/selection.json — refresh/re-login/keep-warm selection.
+ * Run selection:     ./accounts/run-selection.json — viewer-only selection.
  *
  * No more index.json, no wallet_*.json. Edit keys.txt to add/remove accounts.
  */
@@ -14,6 +15,14 @@ import { Keypair } from '@solana/web3.js';
 import bs58 from 'bs58';
 import { login, loadWalletFromPrivateKey, type AuthTokens, type WalletInfo } from '../auth';
 import type { BrowserSession } from '../browser-auth';
+import { assignAccountsToProxyGroups, loadProxyFile, type ProxyAccountGroup, type ProxyConfig } from '../proxy-groups';
+import {
+  ACCESS_TOKEN_LIFETIME_MS,
+  keepWarmRefreshThresholdMs,
+  normalizeKeepWarmOptions,
+  type KeepWarmTimingInput,
+  type NormalizedKeepWarmOptions,
+} from './keepwarm-config';
 
 export interface AccountRecord {
   publicKey: string;
@@ -52,15 +61,77 @@ export interface LoadedAccount {
   refreshToken: string;
 }
 
+export interface RefreshAccountsResult {
+  /** Actual /refresh-access-token successes. Fresh skipped accounts are not counted as refreshed. */
+  success: number;
+  /** Number of requested accounts. */
+  total: number;
+  /** Requested accounts with a refresh token whose access token is still fresh. */
+  skippedFresh: number;
+}
+
+interface RefreshAttemptResult {
+  ok: boolean;
+  status: number | null;
+  retryAfter: number | null;
+  cdpError: string | null;
+  message: string;
+  throttled: boolean;
+  deadToken: boolean;
+}
+
+interface KeepWarmStartOptions extends KeepWarmTimingInput {
+  openProxySession?: (group: ProxyAccountGroup) => Promise<BrowserSession>;
+}
+
+export interface WarmProxyViewerGroup {
+  id: number;
+  label: string;
+  session: BrowserSession;
+  accounts: LoadedAccount[];
+}
+
+export interface WarmProxyViewerGroupsResult {
+  ready: boolean;
+  groups: WarmProxyViewerGroup[];
+  missingGroups: { id: number; label: string; accounts: string[] }[];
+  missingAccounts: string[];
+  error?: string;
+}
+
+export interface AccountProxyGroupRecord {
+  id: number;
+  label: string;
+  accounts: AccountRecord[];
+}
+
+export interface AccountProxyGroupsPayload {
+  enabled: boolean;
+  totalProxies: number;
+  groups: AccountProxyGroupRecord[];
+}
+
 const KEYS_FILE = path.join(process.cwd(), 'keys.txt');
 const ACCOUNTS_DIR = path.join(process.cwd(), 'accounts');
 const TOKENS_DIR = path.join(ACCOUNTS_DIR, 'tokens');
 const SELECTION_FILE = path.join(ACCOUNTS_DIR, 'selection.json');
+const RUN_SELECTION_FILE = path.join(ACCOUNTS_DIR, 'run-selection.json');
 const LEGACY_INDEX = path.join(ACCOUNTS_DIR, 'index.json');
+const DEFAULT_REFRESH_THRESHOLD_MS = 3 * 60_000;
+const DEFAULT_REFRESH_DELAY_MIN_MS = 2500;
+const DEFAULT_REFRESH_DELAY_MAX_MS = 3500;
+const VERIFY_WEIRD_ERROR_BACKOFF_MS = 15_000;
+
+export function reloginFailureBackoffMs(message: string): number {
+  if (/verify failed .*500 .*weird error/i.test(message)) return VERIFY_WEIRD_ERROR_BACKOFF_MS;
+  return 0;
+}
 
 interface SelectionFile {
   selected: string[];
 }
+
+type SelectionScope = 'accounts' | 'run';
 
 export class AccountManager {
   // Cache: publicKey -> base58 secret. Rebuilt every time keys.txt changes.
@@ -197,35 +268,56 @@ export class AccountManager {
 
   // ─── selection.json handling ───────────────────────────────────────────
 
-  private readSelection(): Set<string> {
-    if (!fs.existsSync(SELECTION_FILE)) return new Set();
+  private selectionPath(scope: SelectionScope): string {
+    return scope === 'run' ? RUN_SELECTION_FILE : SELECTION_FILE;
+  }
+
+  private readSelection(scope: SelectionScope = 'accounts'): Set<string> {
+    const filePath = this.selectionPath(scope);
+    if (!fs.existsSync(filePath)) return new Set();
     try {
-      const data = JSON.parse(fs.readFileSync(SELECTION_FILE, 'utf-8')) as SelectionFile;
+      const data = JSON.parse(fs.readFileSync(filePath, 'utf-8')) as SelectionFile;
       return new Set(Array.isArray(data.selected) ? data.selected : []);
     } catch {
       return new Set();
     }
   }
 
-  private writeSelection(selected: Set<string>): void {
+  private writeSelection(selected: Set<string>, scope: SelectionScope = 'accounts'): void {
     const file: SelectionFile = { selected: [...selected] };
-    fs.writeFileSync(SELECTION_FILE, JSON.stringify(file, null, 2));
+    fs.writeFileSync(this.selectionPath(scope), JSON.stringify(file, null, 2));
   }
 
   setSelected(publicKey: string, selected: boolean): void {
     this.refreshKeys();
     if (!this.keyCache.has(publicKey)) return;
-    const cur = this.readSelection();
+    const cur = this.readSelection('accounts');
     if (selected) cur.add(publicKey);
     else cur.delete(publicKey);
-    this.writeSelection(cur);
+    this.writeSelection(cur, 'accounts');
+  }
+
+  setRunSelected(publicKey: string, selected: boolean): void {
+    this.refreshKeys();
+    if (!this.keyCache.has(publicKey)) return;
+    const cur = this.readSelection('run');
+    if (selected && this.isTokenValid(publicKey)) cur.add(publicKey);
+    else cur.delete(publicKey);
+    this.writeSelection(cur, 'run');
   }
 
   /** Replace the current selection with the given public keys (unknown keys ignored). */
   setSelection(publicKeys: string[]): void {
     this.refreshKeys();
     const valid = new Set(publicKeys.filter((pk) => this.keyCache.has(pk)));
-    this.writeSelection(valid);
+    this.writeSelection(valid, 'accounts');
+  }
+
+  /** Replace the viewer-only selection with public keys that currently have valid tokens. */
+  setRunSelection(publicKeys: string[]): void {
+    this.refreshKeys();
+    const valid = new Set(publicKeys.filter((pk) => this.keyCache.has(pk) && this.isTokenValid(pk)));
+    this.writeSelection(valid, 'run');
   }
 
   // ─── tokens cache ──────────────────────────────────────────────────────
@@ -258,15 +350,43 @@ export class AccountManager {
     return null;
   }
 
+  private readTokenMtime(publicKey: string): number | null {
+    try {
+      return fs.statSync(this.tokenPath(publicKey)).mtimeMs;
+    } catch {
+      return null;
+    }
+  }
+
+  /** Effective access expiry, capped to the observed 15-minute token lifetime. */
+  private readAccessExpiresAt(publicKey: string): number | null {
+    const exp = this.readAccessExp(publicKey);
+    if (exp == null) return null;
+    const mtime = this.readTokenMtime(publicKey);
+    return mtime == null ? exp : Math.min(exp, mtime + ACCESS_TOKEN_LIFETIME_MS);
+  }
+
   /** True if cached access-token JWT hasn't expired (with 60s safety). */
   isTokenValid(publicKey: string): boolean {
-    const exp = this.readAccessExp(publicKey);
+    const exp = this.readAccessExpiresAt(publicKey);
     if (exp != null) return exp - Date.now() > 60_000;
     // Fallback: file < 12h old (token present but no parseable exp)
     try {
       const stat = fs.statSync(this.tokenPath(publicKey));
       return Date.now() - stat.mtimeMs < 12 * 60 * 60 * 1000;
     } catch { return false; }
+  }
+
+  /** True when an account should consume refresh quota now. */
+  private isRefreshDue(publicKey: string, thresholdMs = DEFAULT_REFRESH_THRESHOLD_MS): boolean {
+    const tokens = this.readTokens(publicKey);
+    if (!tokens?.refreshToken) return false;
+    if (!tokens.accessToken) return true;
+
+    const exp = this.readAccessExpiresAt(publicKey);
+    if (exp != null) return exp - Date.now() <= thresholdMs;
+
+    return !this.isTokenValid(publicKey);
   }
 
   // ─── public API ────────────────────────────────────────────────────────
@@ -276,23 +396,26 @@ export class AccountManager {
     return this.keyCache.size;
   }
 
-  getSelectedCount(): number {
+  getSelectedCount(scope: SelectionScope = 'accounts'): number {
     this.refreshKeys();
-    const selected = this.readSelection();
+    const selected = this.readSelection(scope);
     let count = 0;
     for (const pk of selected) {
-      if (this.keyCache.has(pk)) count++;
+      if (!this.keyCache.has(pk)) continue;
+      if (scope === 'run' && !this.isTokenValid(pk)) continue;
+      count++;
     }
     return count;
   }
 
   /** All accounts derived from keys.txt, with status + selection merged. */
-  listAccounts(): AccountRecord[] {
+  listAccounts(scope: SelectionScope = 'accounts'): AccountRecord[] {
     this.refreshKeys();
-    const selected = this.readSelection();
+    const selected = this.readSelection(scope);
     const out: AccountRecord[] = [];
     for (const pk of this.keyCache.keys()) {
       const tokens = this.readTokens(pk);
+      const tokenValid = this.isTokenValid(pk);
       let lastUsed: string | undefined;
       try {
         const stat = fs.statSync(this.tokenPath(pk));
@@ -301,13 +424,42 @@ export class AccountManager {
       out.push({
         publicKey: pk,
         hasTokens: !!tokens,
-        tokenValid: this.isTokenValid(pk),
-        selected: selected.has(pk),
+        tokenValid,
+        selected: selected.has(pk) && (scope !== 'run' || tokenValid),
         lastUsed,
-        accessExpiresAt: this.readAccessExp(pk) ?? undefined,
+        accessExpiresAt: this.readAccessExpiresAt(pk) ?? undefined,
       });
     }
     return out;
+  }
+
+  listRunAccounts(): AccountRecord[] {
+    return this.listAccounts('run');
+  }
+
+  listProxyGroups(scope: SelectionScope = 'accounts'): AccountProxyGroupsPayload {
+    this.refreshKeys();
+    const proxies = loadProxyFile();
+    if (proxies.length === 0) {
+      return { enabled: false, totalProxies: 0, groups: [] };
+    }
+
+    const accounts = this.listAccounts(scope);
+    const accountByPk = new Map(accounts.map((account) => [account.publicKey, account]));
+    const groups = assignAccountsToProxyGroups(accounts.map((account) => account.publicKey), proxies)
+      .map((group) => ({
+        id: group.id,
+        label: group.label,
+        accounts: group.accounts
+          .map((publicKey) => accountByPk.get(publicKey))
+          .filter((account): account is AccountRecord => !!account),
+      }));
+
+    return { enabled: true, totalProxies: proxies.length, groups };
+  }
+
+  listRunProxyGroups(): AccountProxyGroupsPayload {
+    return this.listProxyGroups('run');
   }
 
   loadAccount(publicKey: string): LoadedAccount | null {
@@ -332,6 +484,32 @@ export class AccountManager {
       : [...this.keyCache.keys()];
     const out: LoadedAccount[] = [];
     for (const pk of pool) {
+      const a = this.loadAccount(pk);
+      if (a) out.push(a);
+    }
+    return out;
+  }
+
+  /** Explicitly selected accounts only. Empty selection means no accounts. */
+  loadExplicitSelectedAccounts(): LoadedAccount[] {
+    this.refreshKeys();
+    const selected = this.readSelection();
+    const out: LoadedAccount[] = [];
+    for (const pk of this.keyCache.keys()) {
+      if (!selected.has(pk)) continue;
+      const a = this.loadAccount(pk);
+      if (a) out.push(a);
+    }
+    return out;
+  }
+
+  /** Viewer-only selected accounts with valid tokens. Empty selection means no accounts. */
+  loadExplicitRunSelectedAccounts(): LoadedAccount[] {
+    this.refreshKeys();
+    const selected = this.readSelection('run');
+    const out: LoadedAccount[] = [];
+    for (const pk of this.keyCache.keys()) {
+      if (!selected.has(pk) || !this.isTokenValid(pk)) continue;
       const a = this.loadAccount(pk);
       if (a) out.push(a);
     }
@@ -365,19 +543,65 @@ export class AccountManager {
    * full re-login.
    */
   async refreshAccount(publicKey: string, browserSession: BrowserSession): Promise<boolean> {
+    return (await this.refreshAccountDetailed(publicKey, browserSession)).ok;
+  }
+
+  private classifyRefreshError(err: any): RefreshAttemptResult {
+    const status = typeof err?.status === 'number' ? err.status : null;
+    const retryAfter = typeof err?.retryAfter === 'number' && !Number.isNaN(err.retryAfter)
+      ? err.retryAfter
+      : null;
+    const cdpError = typeof err?.cdpError === 'string' ? err.cdpError : null;
+    const message = String(err?.message || err || 'refresh failed');
+    const throttled = status === 429 || retryAfter != null || (status === 0 && !!cdpError);
+    const noAccessCookie = err?.code === 'NO_ACCESS_COOKIE' || /no new auth-access-token cookie set/i.test(message);
+    const deadToken = !throttled && (noAccessCookie || (status != null && [400, 401, 403, 404].includes(status)));
+    return { ok: false, status, retryAfter, cdpError, message, throttled, deadToken };
+  }
+
+  private formatRefreshFailureDetail(result: RefreshAttemptResult): string {
+    const parts: string[] = [];
+    if (result.status != null) parts.push(`status=${result.status}`);
+    if (result.retryAfter != null) parts.push(`retry-after=${result.retryAfter}s`);
+    if (result.cdpError) parts.push(`net=${result.cdpError}`);
+    return parts.length > 0 ? ` (${parts.join(', ')})` : '';
+  }
+
+  private async refreshAccountDetailed(
+    publicKey: string,
+    browserSession: BrowserSession,
+    opts: { exclusive?: boolean } = {},
+  ): Promise<RefreshAttemptResult> {
     const tokens = this.readTokens(publicKey);
     if (!tokens?.refreshToken) {
       console.log(`[AccountManager] ${publicKey.slice(0, 8)}: no refresh token — needs full login`);
-      return false;
+      return {
+        ok: false,
+        status: null,
+        retryAfter: null,
+        cdpError: null,
+        message: 'no refresh token',
+        throttled: false,
+        deadToken: true,
+      };
     }
     try {
-      const fresh = await this.runExclusive(() => browserSession.refreshAccount(tokens.refreshToken));
+      const refresh = () => browserSession.refreshAccount(tokens.refreshToken);
+      const fresh = opts.exclusive === false ? await refresh() : await this.runExclusive(refresh);
       this.writeTokens(publicKey, fresh);
       console.log(`[AccountManager] ${publicKey.slice(0, 8)}... refreshed`);
-      return true;
+      return {
+        ok: true,
+        status: null,
+        retryAfter: null,
+        cdpError: null,
+        message: '',
+        throttled: false,
+        deadToken: false,
+      };
     } catch (err: any) {
       console.error(`[AccountManager] Refresh failed for ${publicKey.slice(0, 8)}: ${err.message}`);
-      return false;
+      return this.classifyRefreshError(err);
     }
   }
 
@@ -388,8 +612,7 @@ export class AccountManager {
   async refreshAccounts(
     targets: string[] | undefined,
     onProgress?: (done: number, total: number, message: string) => void,
-  ): Promise<{ success: number; total: number }> {
-    const { openBrowserSession } = await import('../browser-auth');
+  ): Promise<RefreshAccountsResult> {
     this.refreshKeys();
     this.stopRelogin = false;
 
@@ -405,40 +628,72 @@ export class AccountManager {
 
     const total = pool.length;
     let success = 0;
+    let completed = 0;
     if (total === 0) {
       onProgress?.(0, 0, 'No accounts selected');
-      return { success, total };
+      return { success, total, skippedFresh: 0 };
+    }
+
+    const refreshable = pool.filter((pk) => !!this.readTokens(pk)?.refreshToken);
+    const noRefreshToken = total - refreshable.length;
+    const due = refreshable.filter((pk) => this.isRefreshDue(pk));
+    const skippedFresh = refreshable.length - due.length;
+
+    if (skippedFresh > 0) {
+      completed += skippedFresh;
+      onProgress?.(completed, total, `${skippedFresh} already fresh, skipping`);
+    }
+    if (noRefreshToken > 0) {
+      completed += noRefreshToken;
+      onProgress?.(completed, total, `${noRefreshToken} account(s) have no refresh token, skipping`);
+    }
+    if (due.length === 0) {
+      onProgress?.(
+        total,
+        total,
+        skippedFresh > 0
+          ? `All ${skippedFresh} refreshable account(s) are already fresh`
+          : 'No selected accounts can be refreshed',
+      );
+      return { success, total, skippedFresh };
     }
 
     let session = this.reloginSession;
     let opened = false;
     if (!session) {
-      onProgress?.(0, total, 'Opening browser — complete the Cloudflare challenge...');
+      onProgress?.(completed, total, 'Opening browser — complete the Cloudflare challenge...');
+      const { openBrowserSession } = await import('../browser-auth');
       session = await openBrowserSession();
       this.reloginSession = session;
       opened = true;
     }
 
-    onProgress?.(0, total, `Refreshing ${total} account(s)...`);
-    for (let i = 0; i < pool.length; i++) {
+    const delayMinMs = DEFAULT_REFRESH_DELAY_MIN_MS;
+    const delayMaxMs = DEFAULT_REFRESH_DELAY_MAX_MS;
+
+    onProgress?.(completed, total, `Refreshing ${due.length} due account(s), 2.5-3.5s apart...`);
+    for (let i = 0; i < due.length; i++) {
       if (this.stopRelogin) {
-        onProgress?.(i, total, 'Stopped by user');
+        onProgress?.(completed, total, 'Stopped by user');
         break;
       }
-      const pk = pool[i];
-      onProgress?.(i, total, `Refreshing ${pk.slice(0, 8)}...`);
+      const pk = due[i];
+      onProgress?.(completed, total, `Refreshing ${pk.slice(0, 8)}...`);
       const ok = await this.refreshAccount(pk, session).catch(() => false);
       if (ok) success++;
-      const done = i + 1;
-      onProgress?.(done, total, ok
-        ? `${pk.slice(0, 8)} OK (${success}/${done})`
-        : `${pk.slice(0, 8)} FAIL (${success}/${done})`);
+      completed++;
+      onProgress?.(completed, total, ok
+        ? `${pk.slice(0, 8)} OK (${success}/${i + 1} refreshed; ${this.formatRefreshEta(due.length - i - 1, delayMinMs, delayMaxMs)})`
+        : `${pk.slice(0, 8)} FAIL (${success}/${i + 1} refreshed; ${this.formatRefreshEta(due.length - i - 1, delayMinMs, delayMaxMs)})`);
+      if (i < due.length - 1 && !this.stopRelogin) {
+        await this.sleepUnlessReloginStopped(this.nextRefreshDelayMs(delayMinMs, delayMaxMs));
+      }
     }
 
     // Leave session open if WE opened it AND viewers might use it. Caller
     // can close via stopReloginAll if they want to discard it.
     void opened;
-    return { success, total };
+    return { success, total, skippedFresh };
   }
 
   /**
@@ -604,6 +859,8 @@ export class AccountManager {
 
   private stopRelogin = false;
   private reloginSession: BrowserSession | undefined;
+  private keepWarmProxySessions: Map<number, BrowserSession> = new Map();
+  private keepWarmProxyGroups: Map<number, ProxyAccountGroup> = new Map();
 
   // Keep-logged-in (background refresh loop) state.
   private keepWarm = { running: false, fails: new Map<string, number>(), dead: new Set<string>() };
@@ -636,6 +893,37 @@ export class AccountManager {
     }
   }
 
+  /** Sleep that wakes early if a manual refresh/re-login is stopped. */
+  private async sleepUnlessReloginStopped(ms: number): Promise<void> {
+    const step = 250;
+    let waited = 0;
+    while (waited < ms && !this.stopRelogin) {
+      await new Promise((r) => setTimeout(r, Math.min(step, ms - waited)));
+      waited += step;
+    }
+  }
+
+  private nextRefreshDelayMs(minMs: number, maxMs: number): number {
+    if (maxMs <= minMs) return minMs;
+    return minMs + Math.floor(Math.random() * (maxMs - minMs + 1));
+  }
+
+  private formatDuration(ms: number): string {
+    const totalSec = Math.max(0, Math.ceil(ms / 1000));
+    if (totalSec < 60) return `${totalSec}s`;
+    const min = Math.floor(totalSec / 60);
+    const sec = totalSec % 60;
+    return sec > 0 ? `${min}m ${sec}s` : `${min}m`;
+  }
+
+  private formatRefreshEta(remaining: number, minDelayMs: number, maxDelayMs: number): string {
+    if (remaining <= 0) return 'all due accounts refreshed';
+    const minMs = remaining * minDelayMs;
+    const maxMs = remaining * maxDelayMs;
+    if (minMs === maxMs) return `ETA ~${this.formatDuration(minMs)} left`;
+    return `ETA ~${this.formatDuration(minMs)}-${this.formatDuration(maxMs)} left`;
+  }
+
   isKeepWarmRunning(): boolean {
     return this.keepWarm.running;
   }
@@ -643,6 +931,7 @@ export class AccountManager {
   stopReloginAll(): void {
     this.stopRelogin = true;
     this.keepWarm.running = false;
+    this.closeKeepWarmProxySessions();
     if (this.reloginSession) {
       this.reloginSession.close().catch(() => {});
       this.reloginSession = undefined;
@@ -657,9 +946,89 @@ export class AccountManager {
     this.reloginSession = session;
   }
 
+  private buildProxyGroupsForPool(pool: string[], proxies: ProxyConfig[]): ProxyAccountGroup[] {
+    const poolSet = new Set(pool);
+    return assignAccountsToProxyGroups([...this.keyCache.keys()], proxies)
+      .map((group) => ({
+        ...group,
+        accounts: group.accounts.filter((publicKey) => poolSet.has(publicKey)),
+      }))
+      .filter((group) => group.accounts.length > 0);
+  }
+
+  hasConfiguredProxies(): boolean {
+    return loadProxyFile().length > 0;
+  }
+
+  getWarmProxyViewerGroups(accounts: LoadedAccount[]): WarmProxyViewerGroupsResult {
+    const result: WarmProxyViewerGroupsResult = {
+      ready: false,
+      groups: [],
+      missingGroups: [],
+      missingAccounts: [],
+    };
+
+    if (accounts.length === 0) {
+      result.error = 'No accounts selected or none have valid tokens. Re-login first.';
+      return result;
+    }
+
+    if (loadProxyFile().length === 0) {
+      result.error = 'No proxies configured.';
+      return result;
+    }
+
+    if (!this.keepWarm.running || this.keepWarmProxyGroups.size === 0) {
+      result.error = 'Start keep-warm first so proxy groups are ready.';
+      result.missingAccounts = accounts.map((account) => account.publicKey);
+      return result;
+    }
+
+    const accountByPk = new Map(accounts.map((account) => [account.publicKey, account]));
+    const assigned = new Set<string>();
+
+    for (const group of this.keepWarmProxyGroups.values()) {
+      const groupAccounts = group.accounts
+        .map((publicKey) => accountByPk.get(publicKey))
+        .filter((account): account is LoadedAccount => !!account);
+      if (groupAccounts.length === 0) continue;
+
+      for (const account of groupAccounts) assigned.add(account.publicKey);
+      const session = this.keepWarmProxySessions.get(group.id);
+      if (!session) {
+        result.missingGroups.push({
+          id: group.id,
+          label: group.label,
+          accounts: groupAccounts.map((account) => account.publicKey),
+        });
+        continue;
+      }
+
+      result.groups.push({
+        id: group.id,
+        label: group.label,
+        session,
+        accounts: groupAccounts,
+      });
+    }
+
+    result.missingAccounts = accounts
+      .map((account) => account.publicKey)
+      .filter((publicKey) => !assigned.has(publicKey));
+
+    result.ready = result.groups.length > 0 &&
+      result.missingGroups.length === 0 &&
+      result.missingAccounts.length === 0;
+    if (!result.ready && !result.error) {
+      result.error = 'Start keep-warm first so proxy groups are ready.';
+    }
+    return result;
+  }
+
   async closeBrowserSession(): Promise<void> {
     await this.reloginSession?.close();
     this.reloginSession = undefined;
+    this.closeKeepWarmProxySessions();
   }
 
   /**
@@ -730,7 +1099,13 @@ export class AccountManager {
           : `${pk.slice(0, 8)} FAIL: ${error} (${success}/${done})`);
 
         if (i < needsLogin.length - 1 && !this.stopRelogin) {
-          await new Promise(r => setTimeout(r, 500));
+          const backoffMs = ok ? 0 : reloginFailureBackoffMs(error);
+          if (backoffMs > 0) {
+            onProgress?.(done, total, `Verify returned Weird Error — backing off ${Math.round(backoffMs / 1000)}s before next login...`);
+            await this.sleepUnlessReloginStopped(backoffMs);
+          } else {
+            await new Promise(r => setTimeout(r, 500));
+          }
         }
       }
     } catch (err: any) {
@@ -746,33 +1121,36 @@ export class AccountManager {
 
   /**
    * Keep selected accounts logged in by refreshing them forever (refresh-only —
-   * never a full re-login, since login has its own stricter limits). The first
-   * pass refreshes every selected account that has a refresh token; later passes
-   * only refresh accounts whose access token expires within `thresholdMin`.
-   * Paced `delayMs` apart so it stays under the measured ~16-per-IP refresh wall
-   * (≈12–14 per 31s at 2.5s spacing). On the wall it backs off ~35s; an account
+   * never a full re-login, since login has its own stricter limits). Every pass
+   * refreshes each account when it falls into that account's configured
+   * refresh-age window. Proxy mode runs one independent worker per proxy group.
+   * On the wall it backs off ~35s; an account
    * whose refresh keeps failing is flagged dead (needs a manual re-login) and
    * skipped. Runs in the background; the returned promise resolves once the loop
    * has started. Stop with stopKeepLoggedIn() or stopReloginAll().
    */
   async startKeepLoggedIn(
     targets: string[] | undefined,
-    opts: { delayMs?: number; thresholdMin?: number } = {},
+    opts: KeepWarmStartOptions = {},
     onProgress?: (message: string, running: boolean) => void,
   ): Promise<void> {
     if (this.keepWarm.running) {
       onProgress?.('Keep-logged-in already running', true);
       return;
     }
-    const { openBrowserSession } = await import('../browser-auth');
+    const { openBrowserSession, buildProxyKeepWarmBrowserSessionOptions } = await import('../browser-auth');
     this.refreshKeys();
     this.stopRelogin = false;
     this.keepWarm.running = true;
     this.keepWarm.fails.clear();
     this.keepWarm.dead.clear();
+    this.keepWarmProxyGroups.clear();
 
-    const delayMs = Math.max(500, Math.floor(opts.delayMs ?? 2500));
-    const thresholdMs = Math.max(60_000, Math.floor((opts.thresholdMin ?? 5) * 60_000));
+    const timing = normalizeKeepWarmOptions(opts);
+    const delayMinMs = timing.refreshDelayMs.min;
+    const delayMaxMs = timing.refreshDelayMs.max;
+    const proxies = loadProxyFile();
+    const proxyMode = proxies.length > 0;
 
     const resolvePool = (): string[] => {
       this.refreshKeys();
@@ -784,7 +1162,7 @@ export class AccountManager {
     };
 
     let session = this.reloginSession;
-    if (!session) {
+    if (!proxyMode && !session) {
       onProgress?.('Opening browser — complete the Cloudflare challenge...', true);
       try {
         session = await openBrowserSession();
@@ -797,68 +1175,201 @@ export class AccountManager {
     }
     const browser = session;
 
-    onProgress?.('Keep-logged-in started — refreshing selected accounts...', true);
+    const getProxySession = async (group: ProxyAccountGroup): Promise<BrowserSession> => {
+      const existing = this.keepWarmProxySessions.get(group.id);
+      if (existing) return existing;
 
-    let initial = true;
-    let consecutiveFails = 0;
+      onProgress?.(`[${group.label}] opening browser for ${group.accounts.length} account(s)...`, true);
+      const next = opts.openProxySession
+        ? await opts.openProxySession(group)
+        : await openBrowserSession(buildProxyKeepWarmBrowserSessionOptions(
+            group.proxy,
+            group.label,
+            (message) => onProgress?.(message, true),
+          ));
+      this.keepWarmProxySessions.set(group.id, next);
+      return next;
+    };
 
-    // Background loop — intentionally not awaited by the caller.
-    void (async () => {
+    const isDueForKeepWarm = (pk: string): boolean =>
+      this.isRefreshDue(pk, keepWarmRefreshThresholdMs(pk, timing));
+
+    const initialPool = resolvePool();
+    if (initialPool.length === 0) {
+      this.keepWarm.running = false;
+      onProgress?.('No accounts selected', false);
+      return;
+    }
+
+    const groups = proxyMode
+      ? this.buildProxyGroupsForPool(initialPool, proxies)
+      : [{
+          id: 0,
+          label: 'direct',
+          accounts: initialPool,
+          proxy: { id: 0, label: 'direct', server: '' },
+        }];
+
+    if (groups.length === 0) {
+      this.keepWarm.running = false;
+      onProgress?.('No accounts selected', false);
+      return;
+    }
+    if (proxyMode) {
+      this.keepWarmProxyGroups = new Map(groups.map((group) => [group.id, group]));
+    }
+
+    onProgress?.(
+      proxyMode
+        ? `Keep-logged-in started in proxy mode — ${groups.length} group(s), ${this.formatDuration(timing.groupStartDelayMs.min)}-${this.formatDuration(timing.groupStartDelayMs.max)} group stagger, ${this.formatDuration(delayMinMs)}-${this.formatDuration(delayMaxMs)} in-group delay.`
+        : `Keep-logged-in started — refresh-only, ${this.formatDuration(delayMinMs)}-${this.formatDuration(delayMaxMs)} apart.`,
+      true,
+    );
+
+    const runGroup = async (
+      group: ProxyAccountGroup,
+      startDelayMs: number,
+      options: NormalizedKeepWarmOptions,
+    ): Promise<void> => {
+      const groupPrefix = proxyMode ? `[${group.label}] ` : '';
+      if (startDelayMs > 0) {
+        onProgress?.(`${groupPrefix}starting in ${this.formatDuration(startDelayMs)}...`, true);
+        await this.sleepUnlessStopped(startDelayMs);
+      }
+
+      let initialGroupPass = true;
+      let consecutiveNetworkFails = 0;
+      let cooldownUntil = 0;
+      let groupBrowser: BrowserSession | undefined;
+
       while (this.keepWarm.running) {
-        const pool = resolvePool().filter((pk) => !this.keepWarm.dead.has(pk));
-        const withRt = pool.filter((pk) => !!this.readTokens(pk)?.refreshToken);
-        const noRt = pool.filter((pk) => !this.readTokens(pk)?.refreshToken);
-        if (initial && noRt.length > 0) {
-          onProgress?.(`${noRt.length} selected account(s) have no refresh token — they need a manual re-login and won't be kept warm.`, true);
+        this.refreshKeys();
+
+        if (cooldownUntil > Date.now()) {
+          await this.sleepUnlessStopped(Math.min(cooldownUntil - Date.now(), 5000));
+          continue;
         }
 
-        const due = initial
-          ? withRt
-          : withRt.filter((pk) => {
-              const e = this.readAccessExp(pk);
-              return e == null || e - Date.now() <= thresholdMs;
-            });
-        initial = false;
+        if (proxyMode && !groupBrowser) {
+          try {
+            groupBrowser = await getProxySession(group);
+          } catch (err: any) {
+            onProgress?.(`${groupPrefix}browser error: ${err.message}; cooling down 60s`, true);
+            cooldownUntil = Date.now() + 60_000;
+            continue;
+          }
+        }
+
+        const groupAccounts = group.accounts
+          .filter((pk) => this.keyCache.has(pk))
+          .filter((pk) => !this.keepWarm.dead.has(pk));
+        const withRt = groupAccounts.filter((pk) => !!this.readTokens(pk)?.refreshToken);
+        const noRt = groupAccounts.filter((pk) => !this.readTokens(pk)?.refreshToken);
+
+        const due = withRt.filter(isDueForKeepWarm);
+        if (initialGroupPass) {
+          if (noRt.length > 0) {
+            onProgress?.(`${groupPrefix}${noRt.length} account(s) have no refresh token — they need a manual re-login and won't be kept warm.`, true);
+          }
+          const skippedFresh = withRt.length - due.length;
+          if (skippedFresh > 0) {
+            onProgress?.(`${groupPrefix}${skippedFresh} account(s) already fresh — skipping until near expiry.`, true);
+          }
+          initialGroupPass = false;
+        }
 
         if (due.length === 0) {
           await this.sleepUnlessStopped(5000);
           continue;
         }
 
-        for (const pk of due) {
+        try {
+          groupBrowser = proxyMode ? groupBrowser ?? await getProxySession(group) : browser!;
+        } catch (err: any) {
+          onProgress?.(`${groupPrefix}browser error: ${err.message}; cooling down 60s`, true);
+          cooldownUntil = Date.now() + 60_000;
+          continue;
+        }
+
+        for (let i = 0; i < due.length; i++) {
+          const pk = due[i];
           if (!this.keepWarm.running) break;
-          const ok = await this.refreshAccount(pk, browser).catch(() => false);
-          if (ok) {
-            consecutiveFails = 0;
+          const result = await this.refreshAccountDetailed(pk, groupBrowser, { exclusive: !proxyMode })
+            .catch((err: any) => this.classifyRefreshError(err));
+
+          if (result.ok) {
+            consecutiveNetworkFails = 0;
             this.keepWarm.fails.delete(pk);
-            const e = this.readAccessExp(pk);
-            const mins = e != null ? Math.max(0, Math.round((e - Date.now()) / 60000)) : 0;
-            onProgress?.(`refreshed ${pk.slice(0, 8)} (good for ~${mins}m)`, true);
+            onProgress?.(
+              `${groupPrefix}refreshed ${pk.slice(0, 8)} (${i + 1}/${due.length}; ${this.formatRefreshEta(due.length - i - 1, options.refreshDelayMs.min, options.refreshDelayMs.max)})`,
+              true,
+            );
+          } else if (result.deadToken) {
+            consecutiveNetworkFails = 0;
+            this.keepWarm.fails.delete(pk);
+            this.keepWarm.dead.add(pk);
+            onProgress?.(`${groupPrefix}${pk.slice(0, 8)} can't be refreshed${this.formatRefreshFailureDetail(result)} — needs manual re-login. Skipping.`, true);
+          } else if (result.throttled) {
+            consecutiveNetworkFails = 0;
+            const cooldownMs = result.retryAfter != null ? Math.max(35_000, result.retryAfter * 1000) : 35_000;
+            cooldownUntil = Date.now() + cooldownMs;
+            onProgress?.(`${groupPrefix}hit the refresh rate limit${this.formatRefreshFailureDetail(result)} — cooling this group for ${this.formatDuration(cooldownMs)}...`, true);
+            break;
+          } else if (result.status === 0) {
+            consecutiveNetworkFails++;
+            onProgress?.(`${groupPrefix}refresh failed for ${pk.slice(0, 8)}${this.formatRefreshFailureDetail(result)} (will retry)`, true);
+            if (consecutiveNetworkFails >= 3) {
+              onProgress?.(`${groupPrefix}browser/network refresh failures (status=0) — backing off this group for 30s...`, true);
+              cooldownUntil = Date.now() + 30_000;
+              consecutiveNetworkFails = 0;
+              break;
+            }
           } else {
-            consecutiveFails++;
+            consecutiveNetworkFails = 0;
             const f = (this.keepWarm.fails.get(pk) ?? 0) + 1;
             this.keepWarm.fails.set(pk, f);
-            if (consecutiveFails >= 2) {
-              onProgress?.('Hit the refresh rate limit — backing off 35s...', true);
-              await this.sleepUnlessStopped(35_000);
-              consecutiveFails = 0;
-            } else if (f >= 3) {
-              this.keepWarm.dead.add(pk);
-              onProgress?.(`${pk.slice(0, 8)} can't be refreshed (dead token) — needs manual re-login. Skipping.`, true);
-            } else {
-              onProgress?.(`refresh failed for ${pk.slice(0, 8)} (will retry)`, true);
-            }
+            onProgress?.(`${groupPrefix}refresh failed for ${pk.slice(0, 8)}${this.formatRefreshFailureDetail(result)} (will retry)`, true);
           }
+
           if (!this.keepWarm.running) break;
-          await this.sleepUnlessStopped(delayMs);
+          if (i < due.length - 1) {
+            await this.sleepUnlessStopped(this.nextRefreshDelayMs(options.refreshDelayMs.min, options.refreshDelayMs.max));
+          }
         }
       }
-      onProgress?.('Keep-logged-in stopped', false);
+    };
+
+    let nextGroupStartOffsetMs = 0;
+    const workers = groups.map((group) => {
+      const startDelayMs = proxyMode ? nextGroupStartOffsetMs : 0;
+      if (proxyMode) {
+        nextGroupStartOffsetMs += this.nextRefreshDelayMs(timing.groupStartDelayMs.min, timing.groupStartDelayMs.max);
+      }
+      return runGroup(group, startDelayMs, timing);
+    });
+
+    // Background loop — intentionally not awaited by the caller.
+    void (async () => {
+      try {
+        await Promise.all(workers);
+      } finally {
+        if (proxyMode) this.closeKeepWarmProxySessions();
+        onProgress?.('Keep-logged-in stopped', false);
+      }
     })();
   }
 
   stopKeepLoggedIn(): void {
     this.keepWarm.running = false;
+    this.closeKeepWarmProxySessions();
+  }
+
+  private closeKeepWarmProxySessions(): void {
+    for (const session of this.keepWarmProxySessions.values()) {
+      session.close().catch(() => {});
+    }
+    this.keepWarmProxySessions.clear();
+    this.keepWarmProxyGroups.clear();
   }
 }
 

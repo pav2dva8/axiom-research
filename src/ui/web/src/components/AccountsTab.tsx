@@ -3,6 +3,7 @@ import { Copy, Loader2, RefreshCw, Square } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Checkbox } from '@/components/ui/checkbox';
 import { Badge } from '@/components/ui/badge';
+import { Input } from '@/components/ui/input';
 import {
   Table,
   TableHeader,
@@ -49,6 +50,14 @@ export function AccountsTab({ onLog, refreshTick, onChanged, keepWarmRunning }: 
   const [bulkRunning, setBulkRunning] = useState(false);
   const [pendingKey, setPendingKey] = useState<string | null>(null);
   const [now, setNow] = useState(() => Date.now());
+  const [keepWarmSettings, setKeepWarmSettings] = useState({
+    groupStartMinSec: 5,
+    groupStartMaxSec: 15,
+    refreshDelayMinSec: 5,
+    refreshDelayMaxSec: 10,
+    refreshAgeMinMin: 2,
+    refreshAgeMaxMin: 6,
+  });
 
   // Tick once a second so the expiry countdowns stay live between 4s polls.
   useEffect(() => {
@@ -126,6 +135,12 @@ export function AccountsTab({ onLog, refreshTick, onChanged, keepWarmRunning }: 
     onChanged();
   }
 
+  function updateKeepWarmSetting(key: keyof typeof keepWarmSettings, value: string) {
+    const next = Number(value);
+    if (!Number.isFinite(next)) return;
+    setKeepWarmSettings((prev) => ({ ...prev, [key]: next }));
+  }
+
   async function reloginRow(publicKey: string) {
     setPendingKey(publicKey);
     try {
@@ -171,7 +186,7 @@ export function AccountsTab({ onLog, refreshTick, onChanged, keepWarmRunning }: 
 
   async function refreshSelected() {
     setBulkRunning(true);
-    onLog('Refreshing selected accounts...', 'info');
+    onLog('Refreshing due selected accounts...', 'info');
     try {
       const selected = accounts.filter((a) => a.selected).map((a) => a.publicKey);
       const res = await fetch('/api/accounts/refresh', {
@@ -180,7 +195,13 @@ export function AccountsTab({ onLog, refreshTick, onChanged, keepWarmRunning }: 
         body: JSON.stringify({ publicKeys: selected }),
       });
       const data = await res.json();
-      onLog(`Refreshed ${data.success}/${data.total} accounts`, 'success');
+      const skippedFresh = Number(data.skippedFresh ?? 0);
+      onLog(
+        skippedFresh > 0
+          ? `Refreshed ${data.success}/${data.total} accounts; skipped ${skippedFresh} fresh`
+          : `Refreshed ${data.success}/${data.total} accounts`,
+        data.success > 0 || skippedFresh > 0 ? 'success' : 'info',
+      );
     } catch (err: any) {
       onLog(`Error: ${err.message}`, 'error');
     } finally {
@@ -195,12 +216,23 @@ export function AccountsTab({ onLog, refreshTick, onChanged, keepWarmRunning }: 
       onLog('Select accounts first', 'error');
       return;
     }
-    onLog(`Keeping ${selected.length} account(s) logged in (refresh-only, ~2.5s apart)...`, 'info');
+    onLog(
+      `Keeping ${selected.length} account(s) logged in (groups ${keepWarmSettings.groupStartMinSec}-${keepWarmSettings.groupStartMaxSec}s, gap ${keepWarmSettings.refreshDelayMinSec}-${keepWarmSettings.refreshDelayMaxSec}s, refresh ${keepWarmSettings.refreshAgeMinMin}-${keepWarmSettings.refreshAgeMaxMin}m)...`,
+      'info',
+    );
     try {
       await fetch('/api/accounts/keepwarm/start', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ publicKeys: selected }),
+        body: JSON.stringify({
+          publicKeys: selected,
+          groupStartDelayMinMs: keepWarmSettings.groupStartMinSec * 1000,
+          groupStartDelayMaxMs: keepWarmSettings.groupStartMaxSec * 1000,
+          refreshDelayMinMs: keepWarmSettings.refreshDelayMinSec * 1000,
+          refreshDelayMaxMs: keepWarmSettings.refreshDelayMaxSec * 1000,
+          refreshThresholdMinMin: keepWarmSettings.refreshAgeMinMin,
+          refreshThresholdMaxMin: keepWarmSettings.refreshAgeMaxMin,
+        }),
       });
     } catch (err: any) {
       onLog(`Keep-logged-in failed: ${err.message}`, 'error');
@@ -261,7 +293,7 @@ export function AccountsTab({ onLog, refreshTick, onChanged, keepWarmRunning }: 
               size="sm"
               onClick={startKeepWarm}
               disabled={selectedCount === 0 || bulkRunning}
-              title="Refresh all selected now, then keep them logged in indefinitely — refresh-only (no re-login), ~2.5s apart, auto-throttled under the rate limit. Keeps the accounts selected when you click."
+              title="Refresh selected accounts when they enter the configured refresh-age window, then keep them logged in indefinitely. Uses proxies.txt automatically when present."
             >
               <RefreshCw className="mr-2 h-3.5 w-3.5" />
               Keep logged in ({selectedCount})
@@ -303,7 +335,7 @@ export function AccountsTab({ onLog, refreshTick, onChanged, keepWarmRunning }: 
                   variant="outline"
                   onClick={refreshSelected}
                   disabled={selectedCount === 0 || keepWarmRunning}
-                  title="One-off refresh of selected (no Turnstile). Disabled while keep-logged-in is running."
+                  title="One-off refresh of selected accounts that are expired or within 3 minutes of expiry (no Turnstile), paced 2.5-3.5s apart. Disabled while keep-warm is running."
                 >
                   <RefreshCw className="mr-2 h-3.5 w-3.5" />
                   Refresh selected
@@ -326,6 +358,80 @@ export function AccountsTab({ onLog, refreshTick, onChanged, keepWarmRunning }: 
               </Button>
             )}
           </div>
+        </div>
+        <div className="grid grid-cols-1 gap-2 text-xs sm:grid-cols-3">
+          <label className="flex flex-col gap-1 text-muted-foreground">
+            <span>Group start (s)</span>
+            <span className="flex items-center gap-1.5">
+              <Input
+                type="number"
+                min={0}
+                step={1}
+                value={keepWarmSettings.groupStartMinSec}
+                disabled={keepWarmRunning || bulkRunning}
+                onChange={(event) => updateKeepWarmSetting('groupStartMinSec', event.target.value)}
+                className="h-8"
+              />
+              <span>-</span>
+              <Input
+                type="number"
+                min={0}
+                step={1}
+                value={keepWarmSettings.groupStartMaxSec}
+                disabled={keepWarmRunning || bulkRunning}
+                onChange={(event) => updateKeepWarmSetting('groupStartMaxSec', event.target.value)}
+                className="h-8"
+              />
+            </span>
+          </label>
+          <label className="flex flex-col gap-1 text-muted-foreground">
+            <span>Group gap (s)</span>
+            <span className="flex items-center gap-1.5">
+              <Input
+                type="number"
+                min={0.5}
+                step={0.5}
+                value={keepWarmSettings.refreshDelayMinSec}
+                disabled={keepWarmRunning || bulkRunning}
+                onChange={(event) => updateKeepWarmSetting('refreshDelayMinSec', event.target.value)}
+                className="h-8"
+              />
+              <span>-</span>
+              <Input
+                type="number"
+                min={0.5}
+                step={0.5}
+                value={keepWarmSettings.refreshDelayMaxSec}
+                disabled={keepWarmRunning || bulkRunning}
+                onChange={(event) => updateKeepWarmSetting('refreshDelayMaxSec', event.target.value)}
+                className="h-8"
+              />
+            </span>
+          </label>
+          <label className="flex flex-col gap-1 text-muted-foreground">
+            <span>Refresh at (m)</span>
+            <span className="flex items-center gap-1.5">
+              <Input
+                type="number"
+                min={1}
+                step={1}
+                value={keepWarmSettings.refreshAgeMinMin}
+                disabled={keepWarmRunning || bulkRunning}
+                onChange={(event) => updateKeepWarmSetting('refreshAgeMinMin', event.target.value)}
+                className="h-8"
+              />
+              <span>-</span>
+              <Input
+                type="number"
+                min={1}
+                step={1}
+                value={keepWarmSettings.refreshAgeMaxMin}
+                disabled={keepWarmRunning || bulkRunning}
+                onChange={(event) => updateKeepWarmSetting('refreshAgeMaxMin', event.target.value)}
+                className="h-8"
+              />
+            </span>
+          </label>
         </div>
       </div>
 

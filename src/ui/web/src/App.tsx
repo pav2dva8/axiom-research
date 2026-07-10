@@ -7,15 +7,23 @@ import { LogPanel, type LogEntry } from '@/components/LogPanel';
 interface Status {
   accounts: number;
   selected: number;
+  accountsSelected?: number;
+  runSelected?: number;
   activeViewers: number;
   keepWarm: boolean;
   deployWatch: boolean;
 }
 
 export type ViewerState = 'pending' | 'connecting' | 'connected' | 'failed' | 'disconnected';
+export interface ViewerProgressGroup {
+  id: number;
+  label: string;
+  accounts: string[];
+}
 export interface ViewerProgress {
   total: number;
   states: Record<string, ViewerState>;
+  groups?: ViewerProgressGroup[];
 }
 
 export type DeployWatchState =
@@ -72,13 +80,14 @@ export default function App() {
 
   const syncAccountsSummary = useCallback(async () => {
     try {
-      const res = await fetch('/api/accounts');
+      const res = await fetch('/api/run/accounts');
       const data = await res.json();
       if (!Array.isArray(data)) return;
       setStatus((s) => ({
         ...s,
         accounts: data.length,
         selected: data.filter((a) => a.selected).length,
+        runSelected: data.filter((a) => a.selected).length,
       }));
     } catch {
       // ignore — WS status will retry
@@ -108,6 +117,8 @@ export default function App() {
             ...s,
             accounts: msg.data.accounts ?? s.accounts,
             selected: msg.data.selected ?? s.selected,
+            accountsSelected: msg.data.accountsSelected ?? s.accountsSelected,
+            runSelected: msg.data.runSelected ?? msg.data.selected ?? s.runSelected,
             activeViewers: msg.data.activeViewers ?? s.activeViewers,
             keepWarm: msg.data.keepWarm ?? s.keepWarm,
             deployWatch: deployWatchStatus ?? s.deployWatch,
@@ -136,11 +147,16 @@ export default function App() {
         } else if (msg.type === 'viewer-run') {
           const states: Record<string, ViewerState> = {};
           for (const pk of msg.data.accounts ?? []) states[pk] = 'pending';
-          setViewerProgress({ total: msg.data.total ?? 0, states });
+          setViewerProgress({
+            total: msg.data.total ?? 0,
+            states,
+            groups: Array.isArray(msg.data.groups) ? msg.data.groups : undefined,
+          });
         } else if (msg.type === 'viewer-progress') {
           setViewerProgress((p) => ({
             total: msg.data.total ?? p.total,
             states: { ...p.states, [msg.data.publicKey]: msg.data.state as ViewerState },
+            groups: p.groups,
           }));
           if (typeof msg.data.connected === 'number') {
             setStatus((s) => ({ ...s, activeViewers: msg.data.connected }));
@@ -187,7 +203,7 @@ export default function App() {
         </TabsList>
         <div className="flex shrink-0 items-center gap-4 font-mono text-xs">
           <span className="text-muted-foreground">
-            selected <span className="text-foreground">{status.selected}/{status.accounts}</span>
+            run selected <span className="text-foreground">{status.runSelected ?? status.selected}/{status.accounts}</span>
           </span>
           <span className="text-muted-foreground">
             active <span className="text-foreground">{status.activeViewers}</span>
@@ -204,6 +220,7 @@ export default function App() {
               viewerProgress={viewerProgress}
               deployWatch={deployWatch}
               deployWatchActive={status.deployWatch}
+              keepWarmRunning={status.keepWarm}
             />
           </TabsContent>
           <TabsContent value="accounts" className="m-0 flex-1 overflow-auto p-4">

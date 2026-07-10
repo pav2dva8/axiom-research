@@ -10,9 +10,9 @@
  *   2eCCtb16cJkQs3LbCXRG1p97KKSv1c9cNHZUZVchpump -> Amk61ySm6z9hWSRSEsCKiMMb3i1G8ph89wNP9FzhBzsN
  *   DDiGq2FZNmiKFgALGKg5JQBfXqYz6awvNojGYGyrpump -> AEHwGx7ycZKKXD9egXx4ASWUUx5QtwPBgNyYkj1hnUbs
  *
- * Once a token migrates to Raydium, Axiom switches the pair to the AMM pool
- * address — that case still needs the API. The function returns null if the
- * input isn't a valid Solana public key so the caller can fall back to API lookup.
+ * Once a token migrates, Axiom may show a different AMM pool address. The
+ * no-auth path cannot infer that Axiom-specific pair from only the mint; paste
+ * the full Axiom link when a specific pair address is required.
  */
 
 import { PublicKey } from '@solana/web3.js';
