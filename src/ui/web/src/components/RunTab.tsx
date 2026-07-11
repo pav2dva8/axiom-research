@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState } from "react";
 import { CheckCheck, ClipboardPaste, Loader2, Radar, Square } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { Checkbox } from "@/components/ui/checkbox";
 import type { LogEntry } from "@/components/LogPanel";
 import type { DeployWatchProgress, ViewerProgress, ViewerState } from "@/App";
 import {
@@ -26,6 +27,7 @@ interface Account {
   selected: boolean;
   hasTokens: boolean;
   tokenValid: boolean;
+  banned?: boolean;
 }
 
 interface ProxyAccountGroup {
@@ -50,12 +52,15 @@ interface Props {
   keepWarmRunning: boolean;
 }
 
+type BootstrapMode = "skip" | "run";
+
 const BASE58 = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
 const BASE58_ADDRESS = /[1-9A-HJ-NP-Za-km-z]{32,44}/;
 const DEFAULT_MIN_GAP_MS = 5000;
 const DEFAULT_MAX_GAP_MS = 10000;
 const DEFAULT_GROUP_START_MIN_MS = 5000;
 const DEFAULT_GROUP_START_MAX_MS = 15000;
+const DEFAULT_SAFETY_MAX_ACCOUNTS = 2;
 
 /**
  * The input is always either a bare token CA or a full axiom.trade link
@@ -128,6 +133,8 @@ export function RunTab({
   const [maxGapMs, setMaxGapMs] = useState<number>(DEFAULT_MAX_GAP_MS);
   const [groupStartMinMs, setGroupStartMinMs] = useState<number>(DEFAULT_GROUP_START_MIN_MS);
   const [groupStartMaxMs, setGroupStartMaxMs] = useState<number>(DEFAULT_GROUP_START_MAX_MS);
+  const [safetyMaxAccounts, setSafetyMaxAccounts] = useState<number>(DEFAULT_SAFETY_MAX_ACCOUNTS);
+  const [bootstrapMode, setBootstrapMode] = useState<BootstrapMode>("skip");
 
   const fetchAccounts = useCallback(async () => {
     try {
@@ -319,6 +326,8 @@ export function RunTab({
           maxGapMs: viewerDelay.max,
           groupStartDelayMinMs: groupDelay.min,
           groupStartDelayMaxMs: groupDelay.max,
+          bootstrapDisabled: bootstrapMode === "skip",
+          safetyMaxAccounts,
         }),
       });
       const startData = await startRes.json();
@@ -332,7 +341,9 @@ export function RunTab({
         return;
       }
       onLog(
-        `Started ${startData.connected} viewer(s) on ${t.ticker}`,
+        startData.safetyLimited
+          ? `Safety cap: started ${startData.connected}/${startData.selectedTotal} selected viewer(s) on ${t.ticker}`
+          : `Started ${startData.connected} viewer(s) on ${t.ticker}`,
         "success",
       );
     } catch (err: any) {
@@ -375,6 +386,8 @@ export function RunTab({
           maxGapMs: viewerDelay.max,
           groupStartDelayMinMs: groupDelay.min,
           groupStartDelayMaxMs: groupDelay.max,
+          bootstrapDisabled: bootstrapMode === "skip",
+          safetyMaxAccounts,
         }),
       });
       const data = await res.json();
@@ -388,7 +401,12 @@ export function RunTab({
         setRunning(false);
         return;
       }
-      onLog(`Started ${data.connected ?? 0} viewer(s) on TOKEN`, "success");
+      onLog(
+        data.safetyLimited
+          ? `Safety cap: started ${data.connected ?? 0}/${data.selectedTotal} selected viewer(s) on TOKEN`
+          : `Started ${data.connected ?? 0} viewer(s) on TOKEN`,
+        "success",
+      );
     } catch (err: any) {
       onLog(`Watch deploy error: ${err.message}`, "error");
       setRunning(false);
@@ -476,6 +494,7 @@ export function RunTab({
   const goodCount = accounts.filter((account) => account.tokenValid).length;
   const selectionDisabled = isActive || busy || stopping || selectionBusy;
   const accountStatus = (account: Account): AccountAuthStatus => {
+    if (account.banned) return "banned";
     if (account.tokenValid) return "loggedIn";
     if (account.hasTokens) return "expired";
     return "needsLogin";
@@ -728,6 +747,63 @@ export function RunTab({
             className="col-span-3 md:col-span-1"
           >
             Default
+          </Button>
+        </div>
+      </div>
+
+      <div className="flex flex-col gap-2">
+        <label className="text-xs font-medium uppercase tracking-wider text-muted-foreground">
+          Safety cap (accounts this run)
+        </label>
+        <div className="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-2">
+          <Input
+            type="number"
+            min={0}
+            step={1}
+            value={Number.isFinite(safetyMaxAccounts) ? safetyMaxAccounts : ""}
+            onChange={(e) => {
+              const v = e.target.value === "" ? 0 : Number(e.target.value);
+              setSafetyMaxAccounts(Number.isFinite(v) ? Math.max(0, Math.floor(v)) : DEFAULT_SAFETY_MAX_ACCOUNTS);
+            }}
+            disabled={isActive || busy || stopping}
+            className="font-mono"
+            aria-label="Safety cap accounts"
+            title="Default 2. Set 0 only when you intentionally want all selected accounts in one run."
+          />
+          <Button
+            type="button"
+            variant="outline"
+            onClick={() => setSafetyMaxAccounts(DEFAULT_SAFETY_MAX_ACCOUNTS)}
+            disabled={isActive || busy || stopping}
+            title={`Reset to default ${DEFAULT_SAFETY_MAX_ACCOUNTS} account canary`}
+          >
+            Default
+          </Button>
+        </div>
+      </div>
+
+      <div className="flex flex-col gap-2">
+        <label className="text-xs font-medium uppercase tracking-wider text-muted-foreground">
+          Bootstrap
+        </label>
+        <div className="grid grid-cols-2 gap-2">
+          <Button
+            type="button"
+            variant={bootstrapMode === "skip" ? "secondary" : "outline"}
+            onClick={() => setBootstrapMode("skip")}
+            disabled={isActive || busy || stopping}
+            title="Default. Do not send the pre-viewer bootstrap request burst."
+          >
+            Skip
+          </Button>
+          <Button
+            type="button"
+            variant={bootstrapMode === "run" ? "secondary" : "outline"}
+            onClick={() => setBootstrapMode("run")}
+            disabled={isActive || busy || stopping}
+            title="Run bootstrap before viewer handshakes when you intentionally want to test it."
+          >
+            Run
           </Button>
         </div>
       </div>

@@ -19,6 +19,9 @@ interface Account {
   tokenValid: boolean;
   hasTokens: boolean;
   selected: boolean;
+  banned?: boolean;
+  banReason?: string;
+  bannedAt?: string;
   lastUsed?: string;
   accessExpiresAt?: number;
 }
@@ -263,9 +266,10 @@ export function AccountsTab({ onLog, refreshTick, onChanged, keepWarmRunning }: 
   const selectedCount = accounts.filter((a) => a.selected).length;
   const allSelected = accounts.length > 0 && selectedCount === accounts.length;
   const someSelected = selectedCount > 0 && !allSelected;
-  const loggedInCount = accounts.filter((a) => a.tokenValid).length;
-  const expiredCount = accounts.filter((a) => a.hasTokens && !a.tokenValid).length;
-  const needsLoginCount = accounts.filter((a) => !a.tokenValid && !a.hasTokens).length;
+  const bannedCount = accounts.filter((a) => a.banned).length;
+  const loggedInCount = accounts.filter((a) => a.tokenValid && !a.banned).length;
+  const needsRefreshCount = accounts.filter((a) => a.hasTokens && !a.tokenValid && !a.banned).length;
+  const needsLoginCount = accounts.filter((a) => !a.tokenValid && !a.hasTokens && !a.banned).length;
 
   return (
     <div className="mx-auto flex max-w-3xl flex-col gap-4">
@@ -273,9 +277,12 @@ export function AccountsTab({ onLog, refreshTick, onChanged, keepWarmRunning }: 
         <div className="flex items-center justify-between gap-3">
           <div className="flex items-baseline gap-2">
             <span className="text-sm font-medium">Accounts</span>
-            <span className="text-xs text-muted-foreground">
-              {selectedCount}/{accounts.length} selected
-            </span>
+              <span className="text-xs text-muted-foreground">
+                {selectedCount}/{accounts.length} selected
+              </span>
+              {bannedCount > 0 && (
+                <span className="text-xs text-red-400">{bannedCount} banned</span>
+              )}
             {keepWarmRunning && (
               <span className="flex items-center gap-1.5 text-xs text-emerald-400">
                 <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-emerald-400" />
@@ -313,15 +320,15 @@ export function AccountsTab({ onLog, refreshTick, onChanged, keepWarmRunning }: 
             <Button
               size="sm"
               variant="outline"
-              onClick={() => selectByStatus((a) => a.hasTokens && !a.tokenValid)}
-              disabled={expiredCount === 0 || bulkRunning}
+              onClick={() => selectByStatus((a) => a.hasTokens && !a.tokenValid && !a.banned)}
+              disabled={needsRefreshCount === 0 || bulkRunning}
             >
-              Expired ({expiredCount})
+              Needs refresh ({needsRefreshCount})
             </Button>
             <Button
               size="sm"
               variant="outline"
-              onClick={() => selectByStatus((a) => !a.tokenValid && !a.hasTokens)}
+              onClick={() => selectByStatus((a) => !a.tokenValid && !a.hasTokens && !a.banned)}
               disabled={needsLoginCount === 0 || bulkRunning}
             >
               Needs login ({needsLoginCount})
@@ -335,7 +342,7 @@ export function AccountsTab({ onLog, refreshTick, onChanged, keepWarmRunning }: 
                   variant="outline"
                   onClick={refreshSelected}
                   disabled={selectedCount === 0 || keepWarmRunning}
-                  title="One-off refresh of selected accounts that are expired or within 3 minutes of expiry (no Turnstile), paced 2.5-3.5s apart. Disabled while keep-warm is running."
+                  title="One-off refresh of selected accounts that are due or within 3 minutes of expiry (no Turnstile), paced 2.5-3.5s apart. Disabled while keep-warm is running."
                 >
                   <RefreshCw className="mr-2 h-3.5 w-3.5" />
                   Refresh selected
@@ -489,10 +496,12 @@ export function AccountsTab({ onLog, refreshTick, onChanged, keepWarmRunning }: 
                   </TableCell>
                   <TableCell>
                     <div className="flex items-center gap-2">
-                      {a.tokenValid ? (
+                      {a.banned ? (
+                        <Badge variant="destructive">Banned</Badge>
+                      ) : a.tokenValid ? (
                         <Badge variant="success">Logged in</Badge>
                       ) : a.hasTokens ? (
-                        <Badge variant="secondary">Expired</Badge>
+                        <Badge variant="secondary">Needs refresh</Badge>
                       ) : (
                         <Badge variant="outline">Needs login</Badge>
                       )}

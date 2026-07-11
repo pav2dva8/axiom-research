@@ -1,5 +1,5 @@
 export type RunViewerState = "pending" | "connecting" | "connected" | "failed" | "disconnected";
-export type AccountAuthStatus = "loggedIn" | "expired" | "needsLogin";
+export type AccountAuthStatus = "loggedIn" | "expired" | "needsLogin" | "banned";
 
 export const VIEWER_STATUS_META: Record<RunViewerState, { label: string; className: string }> = {
   pending: {
@@ -31,14 +31,19 @@ export const ACCOUNT_AUTH_STATUS_META: Record<AccountAuthStatus, { label: string
     className: "border-emerald-500/25 bg-emerald-500/10 text-emerald-300",
   },
   expired: {
-    label: "exp",
-    title: "Expired",
+    label: "due",
+    title: "Needs refresh",
     className: "border-amber-500/25 bg-amber-500/10 text-amber-300",
   },
   needsLogin: {
     label: "login",
     title: "Needs login",
     className: "border-red-500/25 bg-red-500/10 text-red-300",
+  },
+  banned: {
+    label: "ban",
+    title: "Banned",
+    className: "border-red-500/45 bg-red-500/15 text-red-300 line-through",
   },
 };
 

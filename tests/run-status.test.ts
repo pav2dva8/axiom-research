@@ -20,13 +20,18 @@ test("account auth status is used before a viewer state exists", () => {
   const loggedIn = accountRunStatus("loggedIn");
   const expired = accountRunStatus("expired");
   const needsLogin = accountRunStatus("needsLogin");
+  const banned = accountRunStatus("banned");
 
   assert.equal(loggedIn.label, "ok");
   assert.match(loggedIn.className, /emerald/);
-  assert.equal(expired.label, "exp");
+  assert.equal(expired.label, "due");
+  assert.equal(expired.title, "Needs refresh");
   assert.match(expired.className, /amber/);
   assert.equal(needsLogin.label, "login");
   assert.match(needsLogin.className, /red/);
+  assert.equal(banned.label, "ban");
+  assert.equal(banned.title, "Banned");
+  assert.match(banned.className, /line-through/);
 });
 
 test("every live viewer state has a visible status label and color", () => {

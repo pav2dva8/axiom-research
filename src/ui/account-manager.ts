@@ -29,6 +29,9 @@ export interface AccountRecord {
   hasTokens: boolean;
   tokenValid: boolean;
   selected: boolean;
+  banned?: boolean;
+  banReason?: string;
+  bannedAt?: string;
   lastUsed?: string;
   /** Access-token JWT expiry, epoch-ms. Absent if no token or unparseable. */
   accessExpiresAt?: number;
@@ -68,6 +71,23 @@ export interface RefreshAccountsResult {
   total: number;
   /** Requested accounts with a refresh token whose access token is still fresh. */
   skippedFresh: number;
+  banDetected?: boolean;
+  bannedPublicKey?: string;
+  banReason?: string;
+}
+
+export interface ReloginAccountsResult {
+  success: number;
+  total: number;
+  banDetected?: boolean;
+  bannedPublicKey?: string;
+  banReason?: string;
+}
+
+export interface BanSignalInfo {
+  banDetected: true;
+  bannedPublicKey: string;
+  banReason: string;
 }
 
 interface RefreshAttemptResult {
@@ -82,6 +102,7 @@ interface RefreshAttemptResult {
 
 interface KeepWarmStartOptions extends KeepWarmTimingInput {
   openProxySession?: (group: ProxyAccountGroup) => Promise<BrowserSession>;
+  onBanSignal?: (info: BanSignalInfo) => void;
 }
 
 export interface WarmProxyViewerGroup {
@@ -94,6 +115,21 @@ export interface WarmProxyViewerGroup {
 export interface WarmProxyViewerGroupsResult {
   ready: boolean;
   groups: WarmProxyViewerGroup[];
+  missingGroups: { id: number; label: string; accounts: string[] }[];
+  missingAccounts: string[];
+  error?: string;
+}
+
+interface WarmProxyAccountGroup {
+  id: number;
+  label: string;
+  session: BrowserSession;
+  accounts: string[];
+}
+
+interface WarmProxyAccountGroupsResult {
+  ready: boolean;
+  groups: WarmProxyAccountGroup[];
   missingGroups: { id: number; label: string; accounts: string[] }[];
   missingAccounts: string[];
   error?: string;
@@ -116,6 +152,7 @@ const ACCOUNTS_DIR = path.join(process.cwd(), 'accounts');
 const TOKENS_DIR = path.join(ACCOUNTS_DIR, 'tokens');
 const SELECTION_FILE = path.join(ACCOUNTS_DIR, 'selection.json');
 const RUN_SELECTION_FILE = path.join(ACCOUNTS_DIR, 'run-selection.json');
+const BANNED_FILE = path.join(ACCOUNTS_DIR, 'banned.json');
 const LEGACY_INDEX = path.join(ACCOUNTS_DIR, 'index.json');
 const DEFAULT_REFRESH_THRESHOLD_MS = 3 * 60_000;
 const DEFAULT_REFRESH_DELAY_MIN_MS = 2500;
@@ -123,12 +160,25 @@ const DEFAULT_REFRESH_DELAY_MAX_MS = 3500;
 const VERIFY_WEIRD_ERROR_BACKOFF_MS = 15_000;
 
 export function reloginFailureBackoffMs(message: string): number {
-  if (/verify failed .*500 .*weird error/i.test(message)) return VERIFY_WEIRD_ERROR_BACKOFF_MS;
+  if (isBanSignalMessage(message)) return VERIFY_WEIRD_ERROR_BACKOFF_MS;
   return 0;
+}
+
+export function isBanSignalMessage(message: string): boolean {
+  return /weird error/i.test(message);
 }
 
 interface SelectionFile {
   selected: string[];
+}
+
+interface BannedAccountRecord {
+  reason: string;
+  bannedAt: string;
+}
+
+interface BannedAccountsFile {
+  accounts: Record<string, BannedAccountRecord>;
 }
 
 type SelectionScope = 'accounts' | 'run';
@@ -288,9 +338,55 @@ export class AccountManager {
     fs.writeFileSync(this.selectionPath(scope), JSON.stringify(file, null, 2));
   }
 
+  private readBannedAccounts(): BannedAccountsFile {
+    if (!fs.existsSync(BANNED_FILE)) return { accounts: {} };
+    try {
+      const parsed = JSON.parse(fs.readFileSync(BANNED_FILE, 'utf-8')) as BannedAccountsFile;
+      return parsed && typeof parsed.accounts === 'object'
+        ? { accounts: parsed.accounts ?? {} }
+        : { accounts: {} };
+    } catch {
+      return { accounts: {} };
+    }
+  }
+
+  private writeBannedAccounts(file: BannedAccountsFile): void {
+    fs.writeFileSync(BANNED_FILE, JSON.stringify(file, null, 2));
+  }
+
+  isAccountBanned(publicKey: string): boolean {
+    return !!this.readBannedAccounts().accounts[publicKey];
+  }
+
+  markAccountBanned(publicKey: string, reason: string): void {
+    this.refreshKeys();
+    if (!this.keyCache.has(publicKey)) return;
+    const banned = this.readBannedAccounts();
+    banned.accounts[publicKey] = {
+      reason: reason || 'ban signal',
+      bannedAt: new Date().toISOString(),
+    };
+    this.writeBannedAccounts(banned);
+    this.setSelected(publicKey, false);
+    this.setRunSelected(publicKey, false);
+  }
+
+  private recordBanSignal(publicKey: string, reason: string): BanSignalInfo {
+    const banReason = reason || 'ban signal';
+    this.markAccountBanned(publicKey, banReason);
+    this.stopRelogin = true;
+    this.stopKeepLoggedIn();
+    return {
+      banDetected: true,
+      bannedPublicKey: publicKey,
+      banReason,
+    };
+  }
+
   setSelected(publicKey: string, selected: boolean): void {
     this.refreshKeys();
     if (!this.keyCache.has(publicKey)) return;
+    if (selected && this.isAccountBanned(publicKey)) return;
     const cur = this.readSelection('accounts');
     if (selected) cur.add(publicKey);
     else cur.delete(publicKey);
@@ -300,6 +396,7 @@ export class AccountManager {
   setRunSelected(publicKey: string, selected: boolean): void {
     this.refreshKeys();
     if (!this.keyCache.has(publicKey)) return;
+    if (selected && this.isAccountBanned(publicKey)) return;
     const cur = this.readSelection('run');
     if (selected && this.isTokenValid(publicKey)) cur.add(publicKey);
     else cur.delete(publicKey);
@@ -309,14 +406,14 @@ export class AccountManager {
   /** Replace the current selection with the given public keys (unknown keys ignored). */
   setSelection(publicKeys: string[]): void {
     this.refreshKeys();
-    const valid = new Set(publicKeys.filter((pk) => this.keyCache.has(pk)));
+    const valid = new Set(publicKeys.filter((pk) => this.keyCache.has(pk) && !this.isAccountBanned(pk)));
     this.writeSelection(valid, 'accounts');
   }
 
   /** Replace the viewer-only selection with public keys that currently have valid tokens. */
   setRunSelection(publicKeys: string[]): void {
     this.refreshKeys();
-    const valid = new Set(publicKeys.filter((pk) => this.keyCache.has(pk) && this.isTokenValid(pk)));
+    const valid = new Set(publicKeys.filter((pk) => this.keyCache.has(pk) && !this.isAccountBanned(pk) && this.isTokenValid(pk)));
     this.writeSelection(valid, 'run');
   }
 
@@ -368,6 +465,7 @@ export class AccountManager {
 
   /** True if cached access-token JWT hasn't expired (with 60s safety). */
   isTokenValid(publicKey: string): boolean {
+    if (this.isAccountBanned(publicKey)) return false;
     const exp = this.readAccessExpiresAt(publicKey);
     if (exp != null) return exp - Date.now() > 60_000;
     // Fallback: file < 12h old (token present but no parseable exp)
@@ -379,6 +477,7 @@ export class AccountManager {
 
   /** True when an account should consume refresh quota now. */
   private isRefreshDue(publicKey: string, thresholdMs = DEFAULT_REFRESH_THRESHOLD_MS): boolean {
+    if (this.isAccountBanned(publicKey)) return false;
     const tokens = this.readTokens(publicKey);
     if (!tokens?.refreshToken) return false;
     if (!tokens.accessToken) return true;
@@ -402,6 +501,7 @@ export class AccountManager {
     let count = 0;
     for (const pk of selected) {
       if (!this.keyCache.has(pk)) continue;
+      if (this.isAccountBanned(pk)) continue;
       if (scope === 'run' && !this.isTokenValid(pk)) continue;
       count++;
     }
@@ -412,9 +512,11 @@ export class AccountManager {
   listAccounts(scope: SelectionScope = 'accounts'): AccountRecord[] {
     this.refreshKeys();
     const selected = this.readSelection(scope);
+    const bannedAccounts = this.readBannedAccounts().accounts;
     const out: AccountRecord[] = [];
     for (const pk of this.keyCache.keys()) {
       const tokens = this.readTokens(pk);
+      const banned = bannedAccounts[pk];
       const tokenValid = this.isTokenValid(pk);
       let lastUsed: string | undefined;
       try {
@@ -425,7 +527,10 @@ export class AccountManager {
         publicKey: pk,
         hasTokens: !!tokens,
         tokenValid,
-        selected: selected.has(pk) && (scope !== 'run' || tokenValid),
+        selected: !banned && selected.has(pk) && (scope !== 'run' || tokenValid),
+        banned: !!banned,
+        banReason: banned?.reason,
+        bannedAt: banned?.bannedAt,
         lastUsed,
         accessExpiresAt: this.readAccessExpiresAt(pk) ?? undefined,
       });
@@ -465,6 +570,7 @@ export class AccountManager {
   loadAccount(publicKey: string): LoadedAccount | null {
     this.refreshKeys();
     if (!this.keyCache.has(publicKey)) return null;
+    if (this.isAccountBanned(publicKey)) return null;
     const tokens = this.readTokens(publicKey);
     if (!tokens) return null;
     return {
@@ -618,17 +724,18 @@ export class AccountManager {
 
     let pool: string[];
     if (targets && targets.length > 0) {
-      pool = targets.filter(k => this.keyCache.has(k));
+      pool = targets.filter(k => this.keyCache.has(k) && !this.isAccountBanned(k));
     } else {
       const selected = this.readSelection();
       pool = selected.size > 0
-        ? [...this.keyCache.keys()].filter(k => selected.has(k))
-        : [...this.keyCache.keys()];
+        ? [...this.keyCache.keys()].filter(k => selected.has(k) && !this.isAccountBanned(k))
+        : [...this.keyCache.keys()].filter(k => !this.isAccountBanned(k));
     }
 
     const total = pool.length;
     let success = 0;
     let completed = 0;
+    let banSignal: BanSignalInfo | undefined;
     if (total === 0) {
       onProgress?.(0, 0, 'No accounts selected');
       return { success, total, skippedFresh: 0 };
@@ -658,9 +765,15 @@ export class AccountManager {
       return { success, total, skippedFresh };
     }
 
+    const proxySessions = this.proxySessionByAccount(due);
+    if (!proxySessions.ok) {
+      onProgress?.(completed, total, `${proxySessions.error} Manual refresh will not use a direct browser while proxies are configured.`);
+      return { success, total, skippedFresh };
+    }
+
     let session = this.reloginSession;
     let opened = false;
-    if (!session) {
+    if (!this.hasConfiguredProxies() && !session) {
       onProgress?.(completed, total, 'Opening browser — complete the Cloudflare challenge...');
       const { openBrowserSession } = await import('../browser-auth');
       session = await openBrowserSession();
@@ -679,12 +792,26 @@ export class AccountManager {
       }
       const pk = due[i];
       onProgress?.(completed, total, `Refreshing ${pk.slice(0, 8)}...`);
-      const ok = await this.refreshAccount(pk, session).catch(() => false);
+      const refreshSession = proxySessions.sessions.get(pk) ?? session;
+      if (!refreshSession) {
+        onProgress?.(completed, total, 'No warm proxy session available; stopping refresh.');
+        break;
+      }
+      const result = await this.refreshAccountDetailed(pk, refreshSession, { exclusive: !this.hasConfiguredProxies() })
+        .catch((err: any) => this.classifyRefreshError(err));
+      const ok = result.ok;
       if (ok) success++;
+      const banned = !ok && isBanSignalMessage(result.message);
+      if (banned) {
+        banSignal = this.recordBanSignal(pk, result.message);
+      }
       completed++;
       onProgress?.(completed, total, ok
         ? `${pk.slice(0, 8)} OK (${success}/${i + 1} refreshed; ${this.formatRefreshEta(due.length - i - 1, delayMinMs, delayMaxMs)})`
-        : `${pk.slice(0, 8)} FAIL (${success}/${i + 1} refreshed; ${this.formatRefreshEta(due.length - i - 1, delayMinMs, delayMaxMs)})`);
+        : banned
+          ? `${pk.slice(0, 8)} BAN signal — marked banned locally and stopped all account automation`
+          : `${pk.slice(0, 8)} FAIL (${success}/${i + 1} refreshed; ${this.formatRefreshEta(due.length - i - 1, delayMinMs, delayMaxMs)})`);
+      if (banned) break;
       if (i < due.length - 1 && !this.stopRelogin) {
         await this.sleepUnlessReloginStopped(this.nextRefreshDelayMs(delayMinMs, delayMaxMs));
       }
@@ -693,7 +820,7 @@ export class AccountManager {
     // Leave session open if WE opened it AND viewers might use it. Caller
     // can close via stopReloginAll if they want to discard it.
     void opened;
-    return { success, total, skippedFresh };
+    return { success, total, skippedFresh, ...banSignal };
   }
 
   /**
@@ -709,18 +836,17 @@ export class AccountManager {
     cap: number,
     onProgress?: (message: string) => void,
   ): Promise<ProbeResult> {
-    const { openBrowserSession } = await import('../browser-auth');
     this.refreshKeys();
     this.stopRelogin = false;
 
     let pool: string[];
     if (targets && targets.length > 0) {
-      pool = targets.filter(k => this.keyCache.has(k));
+      pool = targets.filter(k => this.keyCache.has(k) && !this.isAccountBanned(k));
     } else {
       const selected = this.readSelection();
       pool = selected.size > 0
-        ? [...this.keyCache.keys()].filter(k => selected.has(k))
-        : [...this.keyCache.keys()];
+        ? [...this.keyCache.keys()].filter(k => selected.has(k) && !this.isAccountBanned(k))
+        : [...this.keyCache.keys()].filter(k => !this.isAccountBanned(k));
     }
     // Only accounts that actually have a refresh token can be probed.
     pool = pool
@@ -737,9 +863,16 @@ export class AccountManager {
       return result;
     }
 
+    const proxySessions = this.proxySessionByAccount(pool);
+    if (!proxySessions.ok) {
+      onProgress?.(`${proxySessions.error} Probe will not use a direct browser while proxies are configured.`);
+      return result;
+    }
+
     let session = this.reloginSession;
-    if (!session) {
+    if (!this.hasConfiguredProxies() && !session) {
       onProgress?.('Opening browser — complete the Cloudflare challenge...');
+      const { openBrowserSession } = await import('../browser-auth');
       session = await openBrowserSession();
       this.reloginSession = session;
     }
@@ -759,7 +892,9 @@ export class AccountManager {
       const pk = pool[i];
       result.attempted++;
       try {
-        const fresh = await this.runExclusive(() => session.refreshAccount(this.readTokens(pk)!.refreshToken));
+        const refreshSession = proxySessions.sessions.get(pk) ?? session;
+        if (!refreshSession) throw new Error('No warm proxy session available');
+        const fresh = await this.runExclusive(() => refreshSession.refreshAccount(this.readTokens(pk)!.refreshToken));
         this.writeTokens(pk, fresh);
         result.successesBeforeThrottle++;
         consecutiveFails = 0;
@@ -791,7 +926,9 @@ export class AccountManager {
       onProgress?.('Confirming with a known-good account...');
       let blocked = false;
       try {
-        const fresh = await this.runExclusive(() => session.refreshAccount(this.readTokens(probePk)!.refreshToken));
+        const refreshSession = proxySessions.sessions.get(probePk) ?? session;
+        if (!refreshSession) throw new Error('No warm proxy session available');
+        const fresh = await this.runExclusive(() => refreshSession.refreshAccount(this.readTokens(probePk)!.refreshToken));
         this.writeTokens(probePk, fresh);
         onProgress?.('Known-good account still refreshes — those failures were account-specific (likely stale tokens), NOT an IP rate limit.');
       } catch (err: any) {
@@ -809,7 +946,9 @@ export class AccountManager {
           if (this.stopRelogin) { onProgress?.('Stopped by user'); break; }
           await new Promise(r => setTimeout(r, POLL_MS));
           try {
-            const fresh = await session.refreshAccount(this.readTokens(probePk)!.refreshToken);
+            const refreshSession = proxySessions.sessions.get(probePk) ?? session;
+            if (!refreshSession) throw new Error('No warm proxy session available');
+            const fresh = await refreshSession.refreshAccount(this.readTokens(probePk)!.refreshToken);
             this.writeTokens(probePk, fresh);
             result.cooldownSec = Math.round((Date.now() - tThrottle) / 1000);
             onProgress?.(`Recovered after ${result.cooldownSec}s — cooldown measured`);
@@ -1025,6 +1164,78 @@ export class AccountManager {
     return result;
   }
 
+  private getWarmProxyAccountGroups(publicKeys: string[]): WarmProxyAccountGroupsResult {
+    const result: WarmProxyAccountGroupsResult = {
+      ready: false,
+      groups: [],
+      missingGroups: [],
+      missingAccounts: [],
+    };
+
+    if (publicKeys.length === 0) {
+      result.ready = true;
+      return result;
+    }
+
+    if (loadProxyFile().length === 0) {
+      result.error = 'No proxies configured.';
+      return result;
+    }
+
+    if (!this.keepWarm.running || this.keepWarmProxyGroups.size === 0) {
+      result.error = 'Start keep-warm first so proxy groups are ready.';
+      result.missingAccounts = [...publicKeys];
+      return result;
+    }
+
+    const requested = new Set(publicKeys);
+    const assigned = new Set<string>();
+    for (const group of this.keepWarmProxyGroups.values()) {
+      const groupAccounts = group.accounts.filter((publicKey) => requested.has(publicKey));
+      if (groupAccounts.length === 0) continue;
+      for (const publicKey of groupAccounts) assigned.add(publicKey);
+
+      const session = this.keepWarmProxySessions.get(group.id);
+      if (!session) {
+        result.missingGroups.push({
+          id: group.id,
+          label: group.label,
+          accounts: groupAccounts,
+        });
+        continue;
+      }
+
+      result.groups.push({
+        id: group.id,
+        label: group.label,
+        session,
+        accounts: groupAccounts,
+      });
+    }
+
+    result.missingAccounts = publicKeys.filter((publicKey) => !assigned.has(publicKey));
+    result.ready = result.groups.length > 0 &&
+      result.missingGroups.length === 0 &&
+      result.missingAccounts.length === 0;
+    if (!result.ready && !result.error) {
+      result.error = 'Start keep-warm first so proxy groups are ready.';
+    }
+    return result;
+  }
+
+  private proxySessionByAccount(publicKeys: string[]): { ok: true; sessions: Map<string, BrowserSession> } | { ok: false; error: string } {
+    if (!this.hasConfiguredProxies()) return { ok: true, sessions: new Map() };
+    const plan = this.getWarmProxyAccountGroups(publicKeys);
+    if (!plan.ready) {
+      return { ok: false, error: plan.error ?? 'Start keep-warm first so proxy groups are ready.' };
+    }
+    const sessions = new Map<string, BrowserSession>();
+    for (const group of plan.groups) {
+      for (const publicKey of group.accounts) sessions.set(publicKey, group.session);
+    }
+    return { ok: true, sessions };
+  }
+
   async closeBrowserSession(): Promise<void> {
     await this.reloginSession?.close();
     this.reloginSession = undefined;
@@ -1038,25 +1249,25 @@ export class AccountManager {
   async reloginAccounts(
     targets: string[] | undefined,
     onProgress?: (done: number, total: number, message: string) => void,
-  ): Promise<{ success: number; total: number }> {
-    const { openBrowserSession } = await import('../browser-auth');
+  ): Promise<ReloginAccountsResult> {
     this.refreshKeys();
     this.stopRelogin = false;
 
     let pool: string[];
     if (targets && targets.length > 0) {
-      pool = targets.filter(k => this.keyCache.has(k));
+      pool = targets.filter(k => this.keyCache.has(k) && !this.isAccountBanned(k));
     } else {
       const selected = this.readSelection();
       pool = selected.size > 0
-        ? [...this.keyCache.keys()].filter(k => selected.has(k))
-        : [...this.keyCache.keys()];
+        ? [...this.keyCache.keys()].filter(k => selected.has(k) && !this.isAccountBanned(k))
+        : [...this.keyCache.keys()].filter(k => !this.isAccountBanned(k));
     }
 
     const total = pool.length;
     const needsLogin = pool.filter(k => !this.isTokenValid(k));
     const alreadyValid = pool.filter(k => this.isTokenValid(k));
     let success = alreadyValid.length;
+    let banSignal: BanSignalInfo | undefined;
 
     if (alreadyValid.length > 0) {
       onProgress?.(0, total, `${alreadyValid.length} already logged in, skipping`);
@@ -1066,14 +1277,23 @@ export class AccountManager {
       return { success, total };
     }
 
-    if (this.reloginSession) {
+    const proxySessions = this.proxySessionByAccount(needsLogin);
+    if (!proxySessions.ok) {
+      onProgress?.(alreadyValid.length, total, `${proxySessions.error} Re-login will not use a direct browser while proxies are configured.`);
+      return { success, total };
+    }
+
+    if (!this.hasConfiguredProxies() && this.reloginSession) {
       await this.reloginSession.close().catch(() => {});
       this.reloginSession = undefined;
     }
 
     try {
-      onProgress?.(alreadyValid.length, total, 'Opening browser — complete the Cloudflare challenge...');
-      this.reloginSession = await openBrowserSession();
+      if (!this.hasConfiguredProxies()) {
+        onProgress?.(alreadyValid.length, total, 'Opening browser — complete the Cloudflare challenge...');
+        const { openBrowserSession } = await import('../browser-auth');
+        this.reloginSession = await openBrowserSession();
+      }
       onProgress?.(alreadyValid.length, total, `Browser ready. Logging in ${needsLogin.length} account(s)...`);
 
       for (let i = 0; i < needsLogin.length; i++) {
@@ -1085,18 +1305,29 @@ export class AccountManager {
         onProgress?.(alreadyValid.length + i, total, `Logging in ${pk.slice(0, 8)}...`);
 
         let error = '';
-        const ok = await this.reloginAccount(pk, this.reloginSession).catch((err: any) => {
+        const loginSession = proxySessions.sessions.get(pk) ?? this.reloginSession;
+        if (!loginSession) {
+          onProgress?.(alreadyValid.length + i, total, 'No warm proxy session available; stopping re-login.');
+          break;
+        }
+        const ok = await this.reloginAccount(pk, loginSession).catch((err: any) => {
           const msg = err.message || '';
           const m = msg.match(/Error: (.+?)(?:\n|$)/);
           error = m ? m[1] : msg.split('\n')[0];
           return false;
         });
         if (ok) success++;
+        const isBanSignal = !ok && isBanSignalMessage(error);
+        if (isBanSignal) {
+          banSignal = this.recordBanSignal(pk, error);
+        }
 
         const done = alreadyValid.length + i + 1;
         onProgress?.(done, total, ok
           ? `${pk.slice(0, 8)} OK (${success}/${done})`
-          : `${pk.slice(0, 8)} FAIL: ${error} (${success}/${done})`);
+          : isBanSignal
+            ? `${pk.slice(0, 8)} BAN signal — marked banned locally and stopped all account automation`
+            : `${pk.slice(0, 8)} FAIL: ${error} (${success}/${done})`);
 
         if (i < needsLogin.length - 1 && !this.stopRelogin) {
           const backoffMs = ok ? 0 : reloginFailureBackoffMs(error);
@@ -1116,7 +1347,7 @@ export class AccountManager {
     }
     // NOTE: session stays open for viewer WS connections
 
-    return { success, total };
+    return { success, total, ...banSignal };
   }
 
   /**
@@ -1154,11 +1385,11 @@ export class AccountManager {
 
     const resolvePool = (): string[] => {
       this.refreshKeys();
-      if (targets && targets.length > 0) return targets.filter((k) => this.keyCache.has(k));
+      if (targets && targets.length > 0) return targets.filter((k) => this.keyCache.has(k) && !this.isAccountBanned(k));
       const selected = this.readSelection();
       return selected.size > 0
-        ? [...this.keyCache.keys()].filter((k) => selected.has(k))
-        : [...this.keyCache.keys()];
+        ? [...this.keyCache.keys()].filter((k) => selected.has(k) && !this.isAccountBanned(k))
+        : [...this.keyCache.keys()].filter((k) => !this.isAccountBanned(k));
     };
 
     let session = this.reloginSession;
@@ -1304,6 +1535,13 @@ export class AccountManager {
               `${groupPrefix}refreshed ${pk.slice(0, 8)} (${i + 1}/${due.length}; ${this.formatRefreshEta(due.length - i - 1, options.refreshDelayMs.min, options.refreshDelayMs.max)})`,
               true,
             );
+          } else if (isBanSignalMessage(result.message)) {
+            consecutiveNetworkFails = 0;
+            this.keepWarm.fails.delete(pk);
+            const ban = this.recordBanSignal(pk, result.message);
+            opts.onBanSignal?.(ban);
+            onProgress?.(`${groupPrefix}${pk.slice(0, 8)} BAN signal — marked banned locally and stopped all account automation.`, false);
+            break;
           } else if (result.deadToken) {
             consecutiveNetworkFails = 0;
             this.keepWarm.fails.delete(pk);
