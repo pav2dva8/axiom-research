@@ -37,10 +37,11 @@ test("banned accounts are disabled from run selection and viewer loading", async
 
     const wallets = Array.from({ length: 2 }, () => Keypair.generate());
     const publicKeys = wallets.map((wallet) => wallet.publicKey.toBase58());
+    const privateKeys = wallets.map((wallet) => bs58.encode(wallet.secretKey));
 
     fs.writeFileSync(
       path.join(tmp, "keys.txt"),
-      `${wallets.map((wallet) => bs58.encode(wallet.secretKey)).join("\n")}\n`,
+      `${privateKeys.join("\n")}\n`,
     );
 
     const tokensDir = path.join(tmp, "accounts", "tokens");
@@ -55,10 +56,13 @@ test("banned accounts are disabled from run selection and viewer loading", async
     const listed = manager.listRunAccounts();
     const banned = listed.find((account) => account.publicKey === publicKeys[0]);
     const healthy = listed.find((account) => account.publicKey === publicKeys[1]);
+    const activeKeys = fs.readFileSync(path.join(tmp, "keys.txt"), "utf-8");
+    const badKeys = fs.readFileSync(path.join(tmp, "keys.bad.txt"), "utf-8");
 
-    assert.equal(banned?.banned, true);
-    assert.equal(banned?.tokenValid, false);
-    assert.equal(banned?.selected, false);
+    assert.equal(banned, undefined);
+    assert.ok(!activeKeys.includes(privateKeys[0]));
+    assert.ok(activeKeys.includes(privateKeys[1]));
+    assert.ok(badKeys.includes(privateKeys[0]));
     assert.equal(healthy?.selected, true);
     assert.deepEqual(
       manager.loadExplicitRunSelectedAccounts().map((account) => account.publicKey),

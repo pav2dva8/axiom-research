@@ -404,6 +404,78 @@ async function handleApi(
       return;
     }
 
+    // POST /api/accounts/filter-banned  { publicKeys?: string[], delayMinMs?, delayMaxMs? }
+    // Explicit audit mode: force-refresh every selected account, continue after
+    // Weird Error ban signals, and let AccountManager remove banned keys.
+    if (pathname === "/api/accounts/filter-banned" && req.method === "POST") {
+      const body = await readBody(req).catch(() => "");
+      let targets: string[] | undefined;
+      let delayMinMs = 5_000;
+      let delayMaxMs = 10_000;
+      try {
+        if (body) {
+          const parsed = JSON.parse(body);
+          if (Array.isArray(parsed.publicKeys)) targets = parsed.publicKeys;
+          if (typeof parsed.delayMinMs === "number" && Number.isFinite(parsed.delayMinMs)) {
+            delayMinMs = Math.max(0, parsed.delayMinMs);
+          }
+          if (typeof parsed.delayMaxMs === "number" && Number.isFinite(parsed.delayMaxMs)) {
+            delayMaxMs = Math.max(delayMinMs, parsed.delayMaxMs);
+          }
+        }
+      } catch {}
+
+      res.writeHead(200);
+      const warmProxy = await accountManager.warmProxySessionsForAccounts(
+        targets,
+        {},
+        (message, running) => {
+          broadcast("keepwarm", { running, message });
+        },
+      );
+      if (!warmProxy.ok) {
+        broadcast("relogin-progress", {
+          done: 0,
+          total: warmProxy.accounts,
+          message: warmProxy.error ?? "Could not warm proxy sessions for ban filter.",
+        });
+        broadcastStatus();
+        res.end(JSON.stringify({
+          success: 0,
+          total: warmProxy.accounts,
+          skippedFresh: 0,
+          error: warmProxy.error ?? "Could not warm proxy sessions for ban filter.",
+        }));
+        return;
+      }
+      let result;
+      try {
+        result = await accountManager.refreshAccounts(
+          targets,
+          (done, total, message) => {
+            broadcast("relogin-progress", { done, total, message });
+          },
+          {
+            force: true,
+            continueOnBan: true,
+            delayMinMs,
+            delayMaxMs,
+          },
+        );
+      } finally {
+        if (warmProxy.temporary) {
+          accountManager.stopKeepLoggedIn();
+        }
+      }
+
+      const session = accountManager.getBrowserSession();
+      if (session && !accountManager.hasConfiguredProxies()) viewerService.setBrowserSession(session);
+      broadcast("accounts-changed", {});
+      broadcastStatus();
+      res.end(JSON.stringify(result));
+      return;
+    }
+
     // POST /api/accounts/keepwarm/start  { publicKeys?, delayMs?, thresholdMin?, timing ranges... }
     // Refresh-only: keeps selected accounts logged in indefinitely. Never re-logins.
     if (pathname === "/api/accounts/keepwarm/start" && req.method === "POST") {

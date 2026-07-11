@@ -12,6 +12,7 @@
     "viewers": "tsx src/viewers.ts",
     "viewer-bot": "tsx src/ui/cli.ts",
     "viewer-ui": "tsx src/ui/server.ts",
+    "filter-banned": "tsx src/ui/filter-banned.ts",
     "dev:server": "tsx src/ui/server.ts",
     "build:web": "vite build --config src/ui/web/vite.config.ts",
     "dev:web": "vite --config src/ui/web/vite.config.ts",

@@ -73,6 +73,7 @@ export interface RefreshAccountsResult {
   skippedFresh: number;
   banDetected?: boolean;
   bannedPublicKey?: string;
+  bannedPublicKeys?: string[];
   banReason?: string;
 }
 
@@ -100,9 +101,30 @@ interface RefreshAttemptResult {
   deadToken: boolean;
 }
 
+interface RefreshAccountsOptions {
+  /** Refresh even when the cached access token is still fresh. Used for explicit ban filtering. */
+  force?: boolean;
+  /** Continue scanning after a Weird Error ban signal instead of stopping at the first one. */
+  continueOnBan?: boolean;
+  delayMinMs?: number;
+  delayMaxMs?: number;
+}
+
 interface KeepWarmStartOptions extends KeepWarmTimingInput {
   openProxySession?: (group: ProxyAccountGroup) => Promise<BrowserSession>;
   onBanSignal?: (info: BanSignalInfo) => void;
+}
+
+interface WarmProxySessionsOptions extends KeepWarmTimingInput {
+  openProxySession?: (group: ProxyAccountGroup) => Promise<BrowserSession>;
+}
+
+export interface WarmProxySessionsResult {
+  ok: boolean;
+  accounts: number;
+  groups: number;
+  temporary: boolean;
+  error?: string;
 }
 
 export interface WarmProxyViewerGroup {
@@ -148,6 +170,8 @@ export interface AccountProxyGroupsPayload {
 }
 
 const KEYS_FILE = path.join(process.cwd(), 'keys.txt');
+const GOOD_KEYS_FILE = path.join(process.cwd(), 'keys.good.txt');
+const BAD_KEYS_FILE = path.join(process.cwd(), 'keys.bad.txt');
 const ACCOUNTS_DIR = path.join(process.cwd(), 'accounts');
 const TOKENS_DIR = path.join(ACCOUNTS_DIR, 'tokens');
 const SELECTION_FILE = path.join(ACCOUNTS_DIR, 'selection.json');
@@ -187,6 +211,7 @@ export class AccountManager {
   // Cache: publicKey -> base58 secret. Rebuilt every time keys.txt changes.
   private keyCache: Map<string, string> = new Map();
   private keysMtime = 0;
+  private bannedRemovalBackupPath: string | null = null;
 
   constructor() {
     this.ensureDirs();
@@ -354,6 +379,92 @@ export class AccountManager {
     fs.writeFileSync(BANNED_FILE, JSON.stringify(file, null, 2));
   }
 
+  private publicKeyFromKeyLine(line: string): string | null {
+    try {
+      return loadWalletFromPrivateKey(line).publicKey;
+    } catch {
+      return null;
+    }
+  }
+
+  private ensureBannedRemovalBackup(): void {
+    if (this.bannedRemovalBackupPath || !fs.existsSync(KEYS_FILE)) return;
+    const stamp = new Date().toISOString()
+      .replace(/[-:]/g, '')
+      .replace('T', '-')
+      .slice(0, 15);
+    const backupPath = path.join(process.cwd(), `keys.backup-before-banned-remove-${stamp}.txt`);
+    fs.copyFileSync(KEYS_FILE, backupPath);
+    this.bannedRemovalBackupPath = backupPath;
+  }
+
+  private removePublicKeyFromKeyFile(filePath: string, publicKey: string): string[] {
+    if (!fs.existsSync(filePath)) return [];
+
+    const raw = fs.readFileSync(filePath, 'utf-8');
+    const hadTrailingNewline = raw.endsWith('\n');
+    const lines = raw.split(/\r?\n/);
+    if (hadTrailingNewline && lines[lines.length - 1] === '') lines.pop();
+
+    const kept: string[] = [];
+    const removedKeys: string[] = [];
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed || trimmed.startsWith('#')) {
+        kept.push(line);
+        continue;
+      }
+
+      if (this.publicKeyFromKeyLine(trimmed) === publicKey) {
+        removedKeys.push(trimmed);
+      } else {
+        kept.push(line);
+      }
+    }
+
+    if (removedKeys.length > 0) {
+      fs.writeFileSync(filePath, kept.length > 0 ? `${kept.join('\n')}\n` : '');
+    } else if (!hadTrailingNewline && raw.length > 0) {
+      fs.writeFileSync(filePath, raw);
+    }
+
+    return removedKeys;
+  }
+
+  private appendBadKeys(keys: string[]): void {
+    const unique = [...new Set(keys)];
+    if (unique.length === 0) return;
+
+    const existingRaw = fs.existsSync(BAD_KEYS_FILE) ? fs.readFileSync(BAD_KEYS_FILE, 'utf-8') : '';
+    const existing = new Set(
+      existingRaw
+        .split(/\r?\n/)
+        .map((line) => line.trim())
+        .filter(Boolean),
+    );
+    const missing = unique.filter((key) => !existing.has(key));
+    if (missing.length === 0) return;
+
+    const prefix = existingRaw.length > 0 && !existingRaw.endsWith('\n') ? '\n' : '';
+    fs.writeFileSync(BAD_KEYS_FILE, `${existingRaw}${prefix}${missing.join('\n')}\n`, { mode: 0o600 });
+  }
+
+  private removeBannedKeyFromActiveFiles(publicKey: string): void {
+    const secret = this.keyCache.get(publicKey);
+    if (!secret) return;
+
+    this.ensureBannedRemovalBackup();
+    const removed = [
+      ...this.removePublicKeyFromKeyFile(KEYS_FILE, publicKey),
+      ...this.removePublicKeyFromKeyFile(GOOD_KEYS_FILE, publicKey),
+    ];
+    this.appendBadKeys(removed.length > 0 ? removed : [secret]);
+
+    try { fs.unlinkSync(this.tokenPath(publicKey)); } catch {}
+    this.keysMtime = 0;
+    this.refreshKeys();
+  }
+
   isAccountBanned(publicKey: string): boolean {
     return !!this.readBannedAccounts().accounts[publicKey];
   }
@@ -369,13 +480,16 @@ export class AccountManager {
     this.writeBannedAccounts(banned);
     this.setSelected(publicKey, false);
     this.setRunSelected(publicKey, false);
+    this.removeBannedKeyFromActiveFiles(publicKey);
   }
 
-  private recordBanSignal(publicKey: string, reason: string): BanSignalInfo {
+  private recordBanSignal(publicKey: string, reason: string, opts: { stopAutomation?: boolean } = {}): BanSignalInfo {
     const banReason = reason || 'ban signal';
     this.markAccountBanned(publicKey, banReason);
-    this.stopRelogin = true;
-    this.stopKeepLoggedIn();
+    if (opts.stopAutomation !== false) {
+      this.stopRelogin = true;
+      this.stopKeepLoggedIn();
+    }
     return {
       banDetected: true,
       bannedPublicKey: publicKey,
@@ -718,6 +832,7 @@ export class AccountManager {
   async refreshAccounts(
     targets: string[] | undefined,
     onProgress?: (done: number, total: number, message: string) => void,
+    options: RefreshAccountsOptions = {},
   ): Promise<RefreshAccountsResult> {
     this.refreshKeys();
     this.stopRelogin = false;
@@ -736,6 +851,7 @@ export class AccountManager {
     let success = 0;
     let completed = 0;
     let banSignal: BanSignalInfo | undefined;
+    const banSignals: BanSignalInfo[] = [];
     if (total === 0) {
       onProgress?.(0, 0, 'No accounts selected');
       return { success, total, skippedFresh: 0 };
@@ -743,8 +859,8 @@ export class AccountManager {
 
     const refreshable = pool.filter((pk) => !!this.readTokens(pk)?.refreshToken);
     const noRefreshToken = total - refreshable.length;
-    const due = refreshable.filter((pk) => this.isRefreshDue(pk));
-    const skippedFresh = refreshable.length - due.length;
+    const due = options.force ? refreshable : refreshable.filter((pk) => this.isRefreshDue(pk));
+    const skippedFresh = options.force ? 0 : refreshable.length - due.length;
 
     if (skippedFresh > 0) {
       completed += skippedFresh;
@@ -781,10 +897,16 @@ export class AccountManager {
       opened = true;
     }
 
-    const delayMinMs = DEFAULT_REFRESH_DELAY_MIN_MS;
-    const delayMaxMs = DEFAULT_REFRESH_DELAY_MAX_MS;
+    const delayMinMs = options.delayMinMs ?? DEFAULT_REFRESH_DELAY_MIN_MS;
+    const delayMaxMs = options.delayMaxMs ?? DEFAULT_REFRESH_DELAY_MAX_MS;
 
-    onProgress?.(completed, total, `Refreshing ${due.length} due account(s), 2.5-3.5s apart...`);
+    onProgress?.(
+      completed,
+      total,
+      options.force
+        ? `Filtering ${due.length} account(s) for bans via refresh, ${this.formatDuration(delayMinMs)}-${this.formatDuration(delayMaxMs)} apart...`
+        : `Refreshing ${due.length} due account(s), 2.5-3.5s apart...`,
+    );
     for (let i = 0; i < due.length; i++) {
       if (this.stopRelogin) {
         onProgress?.(completed, total, 'Stopped by user');
@@ -803,15 +925,19 @@ export class AccountManager {
       if (ok) success++;
       const banned = !ok && isBanSignalMessage(result.message);
       if (banned) {
-        banSignal = this.recordBanSignal(pk, result.message);
+        const signal = this.recordBanSignal(pk, result.message, {
+          stopAutomation: !options.continueOnBan,
+        });
+        banSignal ??= signal;
+        banSignals.push(signal);
       }
       completed++;
       onProgress?.(completed, total, ok
         ? `${pk.slice(0, 8)} OK (${success}/${i + 1} refreshed; ${this.formatRefreshEta(due.length - i - 1, delayMinMs, delayMaxMs)})`
         : banned
-          ? `${pk.slice(0, 8)} BAN signal — marked banned locally and stopped all account automation`
+          ? `${pk.slice(0, 8)} BAN signal — marked banned locally and removed from keys.txt`
           : `${pk.slice(0, 8)} FAIL (${success}/${i + 1} refreshed; ${this.formatRefreshEta(due.length - i - 1, delayMinMs, delayMaxMs)})`);
-      if (banned) break;
+      if (banned && !options.continueOnBan) break;
       if (i < due.length - 1 && !this.stopRelogin) {
         await this.sleepUnlessReloginStopped(this.nextRefreshDelayMs(delayMinMs, delayMaxMs));
       }
@@ -820,7 +946,13 @@ export class AccountManager {
     // Leave session open if WE opened it AND viewers might use it. Caller
     // can close via stopReloginAll if they want to discard it.
     void opened;
-    return { success, total, skippedFresh, ...banSignal };
+    return {
+      success,
+      total,
+      skippedFresh,
+      ...(banSignal ?? {}),
+      ...(banSignals.length > 0 ? { bannedPublicKeys: banSignals.map((signal) => signal.bannedPublicKey) } : {}),
+    };
   }
 
   /**
@@ -1234,6 +1366,142 @@ export class AccountManager {
       for (const publicKey of group.accounts) sessions.set(publicKey, group.session);
     }
     return { ok: true, sessions };
+  }
+
+  async warmProxySessionsForAccounts(
+    targets: string[] | undefined,
+    opts: WarmProxySessionsOptions = {},
+    onProgress?: (message: string, running: boolean) => void,
+  ): Promise<WarmProxySessionsResult> {
+    this.refreshKeys();
+    const proxies = loadProxyFile();
+    if (proxies.length === 0) {
+      return { ok: true, accounts: 0, groups: 0, temporary: false };
+    }
+
+    const selected = this.readSelection();
+    const pool = (targets && targets.length > 0
+      ? targets
+      : selected.size > 0
+        ? [...this.keyCache.keys()].filter((publicKey) => selected.has(publicKey))
+        : [...this.keyCache.keys()]
+    ).filter((publicKey) => this.keyCache.has(publicKey) && !this.isAccountBanned(publicKey));
+    const refreshable = pool.filter((publicKey) => !!this.readTokens(publicKey)?.refreshToken);
+
+    if (refreshable.length === 0) {
+      return {
+        ok: false,
+        accounts: 0,
+        groups: 0,
+        temporary: false,
+        error: 'No selected accounts have refresh tokens.',
+      };
+    }
+
+    const existing = this.getWarmProxyAccountGroups(refreshable);
+    if (existing.ready) {
+      return {
+        ok: true,
+        accounts: refreshable.length,
+        groups: existing.groups.length,
+        temporary: false,
+      };
+    }
+
+    if (this.keepWarm.running && this.keepWarmProxySessions.size > 0) {
+      return {
+        ok: false,
+        accounts: refreshable.length,
+        groups: existing.groups.length,
+        temporary: false,
+        error: existing.error ?? 'Existing warm proxy sessions do not cover the selected accounts.',
+      };
+    }
+
+    const groups = this.buildProxyGroupsForPool(refreshable, proxies);
+    if (groups.length === 0) {
+      return {
+        ok: false,
+        accounts: refreshable.length,
+        groups: 0,
+        temporary: false,
+        error: 'No proxy groups available for selected accounts.',
+      };
+    }
+
+    const { openBrowserSession, buildProxyKeepWarmBrowserSessionOptions } = await import('../browser-auth');
+    const timing = normalizeKeepWarmOptions(opts);
+
+    this.stopRelogin = false;
+    this.keepWarm.running = true;
+    this.keepWarm.fails.clear();
+    this.keepWarm.dead.clear();
+    this.keepWarmProxyGroups = new Map(groups.map((group) => [group.id, group]));
+
+    onProgress?.(
+      `Warming ${groups.length} proxy group(s) for banned-account filter without refreshing yet...`,
+      true,
+    );
+
+    try {
+      for (let index = 0; index < groups.length; index++) {
+        const group = groups[index];
+        if (!this.keepWarm.running) {
+          return {
+            ok: false,
+            accounts: refreshable.length,
+            groups: groups.length,
+            temporary: true,
+            error: 'Stopped while warming proxy sessions.',
+          };
+        }
+
+        if (index > 0) {
+          const gapMs = this.nextRefreshDelayMs(timing.groupStartDelayMs.min, timing.groupStartDelayMs.max);
+          if (gapMs > 0) {
+            onProgress?.(`[${group.label}] opening in ${this.formatDuration(gapMs)}...`, true);
+            await this.sleepUnlessStopped(gapMs);
+          }
+        }
+        if (!this.keepWarm.running) {
+          return {
+            ok: false,
+            accounts: refreshable.length,
+            groups: groups.length,
+            temporary: true,
+            error: 'Stopped while warming proxy sessions.',
+          };
+        }
+
+        onProgress?.(`[${group.label}] opening browser for ${group.accounts.length} account(s)...`, true);
+        const session = opts.openProxySession
+          ? await opts.openProxySession(group)
+          : await openBrowserSession(buildProxyKeepWarmBrowserSessionOptions(
+              group.proxy,
+              group.label,
+              (message) => onProgress?.(message, true),
+            ));
+        this.keepWarmProxySessions.set(group.id, session);
+      }
+    } catch (err: any) {
+      this.keepWarm.running = false;
+      this.closeKeepWarmProxySessions();
+      return {
+        ok: false,
+        accounts: refreshable.length,
+        groups: groups.length,
+        temporary: true,
+        error: err?.message || String(err),
+      };
+    }
+
+    onProgress?.(`Proxy sessions ready for ${refreshable.length} account(s). Starting ban filter refreshes...`, true);
+    return {
+      ok: true,
+      accounts: refreshable.length,
+      groups: groups.length,
+      temporary: true,
+    };
   }
 
   async closeBrowserSession(): Promise<void> {
