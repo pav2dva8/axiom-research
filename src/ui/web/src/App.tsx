@@ -2,6 +2,7 @@ import { useEffect, useRef, useState, useCallback } from 'react';
 import { Tabs, TabsList, TabsTrigger, TabsContent } from '@/components/ui/tabs';
 import { RunTab } from '@/components/RunTab';
 import { AccountsTab } from '@/components/AccountsTab';
+import { RegisterTab } from '@/components/RegisterTab';
 import { LogPanel, type LogEntry } from '@/components/LogPanel';
 
 interface Status {
@@ -12,6 +13,7 @@ interface Status {
   activeViewers: number;
   keepWarm: boolean;
   deployWatch: boolean;
+  registerRunning?: boolean;
 }
 
 export type ViewerState = 'pending' | 'connecting' | 'connected' | 'failed' | 'disconnected';
@@ -41,6 +43,17 @@ export interface DeployWatchProgress {
   pairAddress?: string;
 }
 
+export interface RegisterProgress {
+  phase: 'started' | 'progress' | 'finished' | 'stopped';
+  message: string;
+  succeeded: number;
+  failed: number;
+  outputFile: string;
+  ipIndex?: number;
+  ipLabel?: string;
+  attempt?: number;
+}
+
 let logIdCounter = 0;
 
 function isActiveDeployWatchState(state: DeployWatchState): boolean {
@@ -64,6 +77,8 @@ export default function App() {
   const [accountsRefreshTick, setAccountsRefreshTick] = useState(0);
   const [viewerProgress, setViewerProgress] = useState<ViewerProgress>({ total: 0, states: {} });
   const [deployWatch, setDeployWatch] = useState<DeployWatchProgress | null>(null);
+  const [registerRunning, setRegisterRunning] = useState(false);
+  const [registerProgress, setRegisterProgress] = useState<RegisterProgress | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
 
   const addLog = useCallback((message: string, type: LogEntry['type'] = 'info') => {
@@ -122,7 +137,11 @@ export default function App() {
             activeViewers: msg.data.activeViewers ?? s.activeViewers,
             keepWarm: msg.data.keepWarm ?? s.keepWarm,
             deployWatch: deployWatchStatus ?? s.deployWatch,
+            registerRunning: msg.data.registerRunning ?? s.registerRunning,
           }));
+          if (typeof msg.data.registerRunning === 'boolean') {
+            setRegisterRunning(msg.data.registerRunning);
+          }
           if (deployWatchStatus === false) {
             setDeployWatch((prev) =>
               prev && isActiveDeployWatchState(prev.state) ? null : prev,
@@ -183,6 +202,23 @@ export default function App() {
               ? 'success'
               : 'info';
           addLog(`[probe] ${m}`, type);
+        } else if (
+          msg.type === 'register-started' ||
+          msg.type === 'register-progress' ||
+          msg.type === 'register-finished'
+        ) {
+          const data = msg.data as RegisterProgress;
+          setRegisterProgress(data);
+          if (msg.type === 'register-started') setRegisterRunning(true);
+          if (msg.type === 'register-finished') setRegisterRunning(false);
+          const m: string = data.message ?? '';
+          const type: LogEntry['type'] =
+            msg.type === 'register-finished' && /fail|error/i.test(m)
+              ? 'error'
+              : msg.type === 'register-finished'
+                ? 'success'
+                : 'info';
+          addLog(`[register] ${m}`, type);
         }
       };
     }
@@ -199,6 +235,9 @@ export default function App() {
           </TabsTrigger>
           <TabsTrigger value="accounts" className="h-7 rounded px-4 text-xs">
             Accounts
+          </TabsTrigger>
+          <TabsTrigger value="register" className="h-7 rounded px-4 text-xs">
+            Register
           </TabsTrigger>
         </TabsList>
         <div className="flex shrink-0 items-center gap-4 font-mono text-xs">
@@ -225,6 +264,9 @@ export default function App() {
           </TabsContent>
           <TabsContent value="accounts" className="m-0 flex-1 overflow-auto p-4">
             <AccountsTab onLog={addLog} refreshTick={accountsRefreshTick} onChanged={refreshAccounts} keepWarmRunning={status.keepWarm} />
+          </TabsContent>
+          <TabsContent value="register" className="m-0 flex-1 overflow-auto p-4">
+            <RegisterTab onLog={addLog} running={registerRunning} progress={registerProgress} />
           </TabsContent>
       </main>
 
