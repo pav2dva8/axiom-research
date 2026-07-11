@@ -11,6 +11,7 @@ wallet-*.json
 wallets/
 accounts/
 proxies.json
+proxies.txt
 keys.txt
 keys*.txt
 *_fresh_keys.txt
