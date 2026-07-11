@@ -130,18 +130,20 @@ export class RegisterService {
           const attemptInfo = { ipIndex, ipLabel: ip.label, attempt };
           onProgress(progress("progress", `Registering ${ip.label} attempt ${attempt}`, attemptInfo));
 
+          const generated = this.deps.generateWallet();
+          let tokens: AuthTokens;
           try {
-            const generated = this.deps.generateWallet();
-            const tokens = await this.deps.signup(generated.wallet, ip.agent);
-            this.writeAccount(generated.publicKey, generated.secretKeyBase58, tokens, outputFile);
-            succeeded++;
-            onProgress(progress("progress", "Signup succeeded", attemptInfo));
+            tokens = await this.deps.signup(generated.wallet, ip.agent);
           } catch (error) {
             failed++;
             const message = error instanceof Error ? error.message : String(error);
             onProgress(progress("progress", `Signup failed: ${message}`, attemptInfo));
             break;
           }
+
+          this.writeAccount(generated.publicKey, generated.secretKeyBase58, tokens, outputFile);
+          succeeded++;
+          onProgress(progress("progress", "Signup succeeded", attemptInfo));
 
           if (!this.stopRequested && attempt < opts.amountPerIp && opts.delaySec > 0) {
             await this.deps.sleep(opts.delaySec * 1000);

@@ -122,6 +122,38 @@ test("signup failure skips remaining slots on that IP", async () => {
   assert.equal(result.failed, 1);
 });
 
+test("write failure after signup stops before next proxy", async () => {
+  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "reg-"));
+  fs.mkdirSync(path.join(cwd, "accounts"), { recursive: true });
+  fs.writeFileSync(path.join(cwd, "accounts", "tokens"), "not a directory");
+  const proxies: ProxyConfig[] = [
+    { id: 1, label: "proxy 1", server: "http://1.1.1.1:1" },
+    { id: 2, label: "proxy 2", server: "http://2.2.2.2:2" },
+  ];
+  const signupAgents: string[] = [];
+  const svc = new RegisterService({
+    cwd,
+    now: () => new Date(2026, 6, 11),
+    sleep: async () => {},
+    loadProxies: () => proxies,
+    createAgent: (url) => ({ url }),
+    generateWallet: () => {
+      const w = walletFromKeypair(Keypair.generate());
+      return { publicKey: w.publicKey, secretKeyBase58: w.secretKeyBase58, wallet: w };
+    },
+    signup: async (wallet, agent) => {
+      signupAgents.push((agent as any).url);
+      return tokens(wallet.publicKey);
+    },
+  });
+
+  await assert.rejects(
+    () => svc.run({ amountPerIp: 1, delaySec: 0, useProxies: true }, () => {}),
+    /EEXIST|ENOTDIR|not a directory/i,
+  );
+  assert.deepEqual(signupAgents, ["http://1.1.1.1:1"]);
+});
+
 test("stop halts between attempts", async () => {
   const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "reg-"));
   fs.mkdirSync(path.join(cwd, "accounts", "tokens"), { recursive: true });
