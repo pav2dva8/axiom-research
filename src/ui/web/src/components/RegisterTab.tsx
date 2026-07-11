@@ -33,6 +33,10 @@ function toNumber(value: string, fallback: number): number {
   return Number.isFinite(next) ? next : fallback;
 }
 
+function clampAmountPerIp(value: number): number {
+  return Math.min(3, Math.max(1, Math.floor(value)));
+}
+
 export function RegisterTab({ onLog, running, progress }: Props) {
   const [amountPerIp, setAmountPerIp] = useState(DEFAULTS.amountPerIp);
   const [delaySec, setDelaySec] = useState(DEFAULTS.delaySec);
@@ -56,7 +60,11 @@ export function RegisterTab({ onLog, running, progress }: Props) {
           return;
         }
         if (canceled) return;
-        setAmountPerIp(Number.isFinite(data.amountPerIp) ? data.amountPerIp : DEFAULTS.amountPerIp);
+        setAmountPerIp(
+          clampAmountPerIp(
+            Number.isFinite(data.amountPerIp) ? data.amountPerIp : DEFAULTS.amountPerIp,
+          ),
+        );
         setDelaySec(Number.isFinite(data.delaySec) ? data.delaySec : DEFAULTS.delaySec);
         setUseProxies(data.useProxies === true);
         setProxyCount(Number.isFinite(data.proxyCount) ? data.proxyCount : 0);
@@ -89,7 +97,7 @@ export function RegisterTab({ onLog, running, progress }: Props) {
       const res = await fetch("/api/register/start", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ amountPerIp, delaySec, useProxies }),
+        body: JSON.stringify({ amountPerIp: clampAmountPerIp(amountPerIp), delaySec, useProxies }),
       });
       const data = await res.json().catch(() => ({}));
       if (!res.ok) {
@@ -173,7 +181,7 @@ export function RegisterTab({ onLog, running, progress }: Props) {
             max={3}
             step={1}
             value={Number.isFinite(amountPerIp) ? amountPerIp : ""}
-            onChange={(event) => setAmountPerIp(Math.max(1, Math.floor(toNumber(event.target.value, 1))))}
+            onChange={(event) => setAmountPerIp(clampAmountPerIp(toNumber(event.target.value, 1)))}
             disabled={controlsDisabled}
             className="font-mono"
           />
