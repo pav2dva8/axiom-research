@@ -373,13 +373,16 @@ async function handleApi(
             broadcastRegisterProgress(final);
           }
         } catch (err: any) {
-          broadcastRegisterProgress({
-            phase: "finished",
-            message: err?.message ?? String(err),
-            succeeded: 0,
-            failed: 0,
-            outputFile: freshKeysFilename(),
-          });
+          const progress = err?.progress as RegisterProgress | undefined;
+          broadcastRegisterProgress(
+            progress ?? {
+              phase: "finished",
+              message: err?.message ?? String(err),
+              succeeded: 0,
+              failed: 0,
+              outputFile: path.join(process.cwd(), freshKeysFilename()),
+            },
+          );
         }
       })();
 

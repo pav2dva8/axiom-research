@@ -25,6 +25,19 @@ export interface RegisterProgress {
   attempt?: number;
 }
 
+export class RegisterRunError extends Error {
+  progress: RegisterProgress;
+
+  constructor(message: string, progress: RegisterProgress, cause?: unknown) {
+    super(message);
+    this.name = "RegisterRunError";
+    this.progress = progress;
+    if (cause !== undefined) {
+      (this as Error & { cause?: unknown }).cause = cause;
+    }
+  }
+}
+
 export interface RegisterServiceDeps {
   signup: (wallet: WalletInfo, agent?: any) => Promise<AuthTokens>;
   loadProxies: () => ProxyConfig[];
@@ -141,7 +154,12 @@ export class RegisterService {
             break;
           }
 
-          this.writeAccount(generated.publicKey, generated.secretKeyBase58, tokens, outputFile);
+          try {
+            this.writeAccount(generated.publicKey, generated.secretKeyBase58, tokens, outputFile);
+          } catch (error) {
+            failed++;
+            throw error;
+          }
           succeeded++;
           onProgress(progress("progress", "Signup succeeded", attemptInfo));
 
@@ -155,6 +173,10 @@ export class RegisterService {
       const done = progress(donePhase, this.stopRequested ? "Register job stopped" : "Register job finished");
       onProgress(done);
       return done;
+    } catch (error) {
+      if (error instanceof RegisterRunError) throw error;
+      const message = error instanceof Error ? error.message : String(error);
+      throw new RegisterRunError(message, progress("finished", message), error);
     } finally {
       this.running = false;
     }
@@ -182,11 +204,11 @@ export class RegisterService {
     tokens: AuthTokens,
     outputFile: string,
   ): void {
-    fs.mkdirSync(path.dirname(outputFile), { recursive: true });
-    fs.appendFileSync(outputFile, `${secretKeyBase58}\n`);
-
     const tokensDir = path.join(this.deps.cwd, "accounts", "tokens");
     fs.mkdirSync(tokensDir, { recursive: true });
     fs.writeFileSync(path.join(tokensDir, `${publicKey}.json`), JSON.stringify(tokens, null, 2));
+
+    fs.mkdirSync(path.dirname(outputFile), { recursive: true });
+    fs.appendFileSync(outputFile, `${secretKeyBase58}\n`);
   }
 }

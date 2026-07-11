@@ -13,6 +13,7 @@ accounts/
 proxies.json
 keys.txt
 keys*.txt
+*_fresh_keys.txt
 probe-logs/
 .claude/
 docs/

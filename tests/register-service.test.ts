@@ -152,6 +152,45 @@ test("write failure after signup stops before next proxy", async () => {
     /EEXIST|ENOTDIR|not a directory/i,
   );
   assert.deepEqual(signupAgents, ["http://1.1.1.1:1"]);
+  assert.equal(fs.existsSync(path.join(cwd, "2026-07-11_fresh_keys.txt")), false);
+});
+
+test("write failure exposes accumulated counts and output file", async () => {
+  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "reg-"));
+  fs.mkdirSync(path.join(cwd, "accounts", "tokens"), { recursive: true });
+  const wallets = [Keypair.generate(), Keypair.generate()].map(walletFromKeypair);
+  let wi = 0;
+  const outputFile = path.join(cwd, "2026-07-11_fresh_keys.txt");
+  const svc = new RegisterService({
+    cwd,
+    now: () => new Date(2026, 6, 11),
+    sleep: async () => {},
+    loadProxies: () => [],
+    generateWallet: () => {
+      const w = wallets[wi++];
+      return { publicKey: w.publicKey, secretKeyBase58: w.secretKeyBase58, wallet: w };
+    },
+    signup: async (wallet) => {
+      if (wallet.publicKey === wallets[1].publicKey) {
+        fs.rmSync(path.join(cwd, "accounts", "tokens"), { recursive: true, force: true });
+        fs.writeFileSync(path.join(cwd, "accounts", "tokens"), "not a directory");
+      }
+      return tokens(wallet.publicKey);
+    },
+  });
+
+  let thrown: any;
+  try {
+    await svc.run({ amountPerIp: 2, delaySec: 0, useProxies: false }, () => {});
+  } catch (error) {
+    thrown = error;
+  }
+
+  assert.ok(thrown);
+  assert.equal(thrown.progress.succeeded, 1);
+  assert.equal(thrown.progress.failed, 1);
+  assert.equal(thrown.progress.outputFile, outputFile);
+  assert.equal(fs.readFileSync(outputFile, "utf-8"), `${wallets[0].secretKeyBase58}\n`);
 });
 
 test("stop halts between attempts", async () => {
