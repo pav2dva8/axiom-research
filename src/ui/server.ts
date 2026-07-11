@@ -35,6 +35,9 @@ import {
 } from "./token-resolver";
 import { installFileLogger, readCurrentLogTail } from "./logger";
 import { limitAccountsForRun, normalizeSafetyMaxAccounts } from "./run-safety";
+import { loadProxyFile } from "../proxy-groups";
+import { freshKeysFilename, normalizeRegisterOptions } from "./register-config";
+import { RegisterService, type RegisterProgress } from "./register-service";
 
 const PORT = process.env.PORT || 3847;
 const DEFAULT_RUN_SAFETY_MAX_ACCOUNTS = 2;
@@ -44,6 +47,7 @@ loadDeployWatchEnvFile();
 const accountManager = new AccountManager();
 const viewerService = new ViewerService();
 const deployWatcher = new DeployWatcher();
+const registerService = new RegisterService();
 
 const uiClients: Set<WebSocket> = new Set();
 let activeDeployWatchRequest: DeployWatchRequestState | null = null;
@@ -80,6 +84,7 @@ function statusPayload() {
     activeViewers: viewerService.getActiveCount(),
     keepWarm: accountManager.isKeepWarmRunning(),
     deployWatch: isDeployWatchStatusActive(),
+    registerRunning: registerService.isRunning(),
   };
 }
 
@@ -144,6 +149,17 @@ function broadcastViewerProgress(publicKey: string, state: string): void {
     connected: viewerService.getActiveCount(),
     total: currentRunTotal,
   });
+}
+
+function broadcastRegisterProgress(progress: RegisterProgress): void {
+  const type =
+    progress.phase === "started"
+      ? "register-started"
+      : progress.phase === "progress"
+        ? "register-progress"
+        : "register-finished";
+  broadcast(type, progress);
+  broadcastStatus();
 }
 
 viewerService.on("viewer-connecting", (pk: string) =>
@@ -320,6 +336,65 @@ async function handleApi(
       broadcastStatus();
       res.writeHead(200);
       res.end(JSON.stringify({ ok: true, selected: accountManager.getSelectedCount('run') }));
+      return;
+    }
+
+    // GET /api/register/defaults
+    if (pathname === "/api/register/defaults" && req.method === "GET") {
+      const proxies = loadProxyFile();
+      const opts = normalizeRegisterOptions({
+        useProxies: proxies.length > 0,
+      });
+      res.writeHead(200);
+      res.end(JSON.stringify({
+        ...opts,
+        proxyCount: proxies.length,
+        outputFile: freshKeysFilename(),
+      }));
+      return;
+    }
+
+    // POST /api/register/start  { amountPerIp?, delaySec?, useProxies? }
+    if (pathname === "/api/register/start" && req.method === "POST") {
+      if (registerService.isRunning()) {
+        res.writeHead(409);
+        res.end(JSON.stringify({ error: "Register job already running" }));
+        return;
+      }
+
+      const rawBody = await readBody(req).catch(() => "");
+      const body = rawBody ? JSON.parse(rawBody) : {};
+      const opts = normalizeRegisterOptions(body ?? {});
+
+      (async () => {
+        try {
+          const final = await registerService.run(opts, broadcastRegisterProgress);
+          if (final.phase !== "finished" && final.phase !== "stopped") {
+            broadcastRegisterProgress(final);
+          }
+        } catch (err: any) {
+          broadcastRegisterProgress({
+            phase: "finished",
+            message: err?.message ?? String(err),
+            succeeded: 0,
+            failed: 0,
+            outputFile: freshKeysFilename(),
+          });
+        }
+      })();
+
+      broadcastStatus();
+      res.writeHead(200);
+      res.end(JSON.stringify({ ok: true }));
+      return;
+    }
+
+    // POST /api/register/stop
+    if (pathname === "/api/register/stop" && req.method === "POST") {
+      registerService.requestStop();
+      broadcastStatus();
+      res.writeHead(200);
+      res.end(JSON.stringify({ ok: true }));
       return;
     }
 
