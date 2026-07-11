@@ -12,7 +12,9 @@ const FETCH_TIMEOUT = 15000; // 15 seconds timeout
 const BROWSER_USER_AGENT =
   'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36';
 
-const fetchWithTimeout = (url: string, options?: RequestInit) => {
+export type AuthFetchAgent = import('https-proxy-agent').HttpsProxyAgent<string>;
+
+const fetchWithTimeout = (url: string, options?: RequestInit & { agent?: AuthFetchAgent }) => {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), FETCH_TIMEOUT);
 
@@ -98,7 +100,7 @@ export function loadWalletFromPrivateKey(privateKeyBase58: string): WalletInfo {
 /**
  * Step 1: Get nonce from Axiom API
  */
-export async function getNonce(walletAddress: string, cfCookies?: string): Promise<string> {
+export async function getNonce(walletAddress: string, cfCookies?: string, agent?: AuthFetchAgent): Promise<string> {
   console.log('[Auth] Requesting nonce for wallet:', walletAddress);
 
   const headers: Record<string, string> = {
@@ -116,6 +118,7 @@ export async function getNonce(walletAddress: string, cfCookies?: string): Promi
     body: JSON.stringify({
       walletAddress,
     }),
+    ...(agent ? { agent } : {}),
   });
 
   if (!response.ok) {
@@ -158,6 +161,7 @@ export async function verifyWallet(
   allowRegistration: boolean = false,
   turnstileToken?: string,
   cfCookies?: string,
+  agent?: AuthFetchAgent,
 ): Promise<AuthTokens> {
   console.log(`[Auth] Verifying wallet (${allowRegistration ? 'signup' : 'login'})...`);
 
@@ -184,6 +188,7 @@ export async function verifyWallet(
       signature,
       turnstileToken: turnstileToken || null,
     }),
+    ...(agent ? { agent } : {}),
   });
 
   if (!response.ok) {
@@ -229,12 +234,13 @@ async function authenticate(
   allowRegistration: boolean,
   cfCookies?: string,
   turnstileToken?: string,
+  agent?: AuthFetchAgent,
 ): Promise<AuthTokens> {
-  const nonce = await getNonce(wallet.publicKey, cfCookies);
+  const nonce = await getNonce(wallet.publicKey, cfCookies, agent);
   const message = buildSignMessage(nonce);
   const signature = signMessage(message, wallet.secretKey);
   return verifyWallet(
-    wallet.publicKey, nonce, signature, allowRegistration, turnstileToken, cfCookies,
+    wallet.publicKey, nonce, signature, allowRegistration, turnstileToken, cfCookies, agent,
   );
 }
 
@@ -245,9 +251,10 @@ export async function login(
   wallet: WalletInfo,
   cfCookies?: string,
   turnstileToken?: string,
+  agent?: AuthFetchAgent,
 ): Promise<AuthTokens> {
   console.log('[Auth] Logging in with existing account...');
-  return authenticate(wallet, false, cfCookies, turnstileToken);
+  return authenticate(wallet, false, cfCookies, turnstileToken, agent);
 }
 
 /**
@@ -257,9 +264,10 @@ export async function signup(
   wallet: WalletInfo,
   cfCookies?: string,
   turnstileToken?: string,
+  agent?: AuthFetchAgent,
 ): Promise<AuthTokens> {
   console.log('[Auth] Signing up for new account...');
-  return authenticate(wallet, true, cfCookies, turnstileToken);
+  return authenticate(wallet, true, cfCookies, turnstileToken, agent);
 }
 
 /**
