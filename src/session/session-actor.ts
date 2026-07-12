@@ -17,7 +17,7 @@ import {
 export type SessionMode = "warmup" | "deploy";
 
 export interface SessionBridge {
-  openSession(...args: unknown[]): Promise<number>;
+  openSession(access: string, refresh: string, opts?: unknown): Promise<number>;
   navigateSession(id: number, actions: NavAction[]): Promise<void>;
   closeSession(id: number): Promise<void>;
 }
@@ -73,7 +73,7 @@ export class SessionActor {
 
   async startWarmup(access: unknown, refresh: unknown, openOpts: unknown): Promise<void> {
     if (this.sessionId === null) {
-      this.sessionId = await this.bridge.openSession(this.publicKey, access, refresh, openOpts);
+      this.sessionId = await this.bridge.openSession(access as string, refresh as string, openOpts);
     }
 
     this.closed = false;

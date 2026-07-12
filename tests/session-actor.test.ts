@@ -68,6 +68,10 @@ test("gotoDeploy cancels warmup and navigates to deploy token", async () => {
 
   await actor.startWarmup("access", "refresh", { proxy: "http://proxy" });
   await flushAsyncWork();
+  assert.deepEqual(bridge.calls[0], {
+    type: "open",
+    args: ["access", "refresh", { proxy: "http://proxy" }],
+  });
   assert.equal(actor.getMode(), "warmup");
   assert.equal(waits.waits[0]?.ms, 5);
 
@@ -95,6 +99,7 @@ test("returnToWarmup leaves deploy and resumes warmup mode", async () => {
 
   await actor.startWarmup("access", "refresh", {});
   await flushAsyncWork();
+  assert.deepEqual(bridge.calls[0], { type: "open", args: ["access", "refresh", {}] });
   await actor.gotoDeploy(token("DeployPair", "DeployToken"));
   await actor.returnToWarmup();
   await flushAsyncWork();
@@ -123,6 +128,7 @@ test("forceClose closes session", async () => {
 
   await actor.startWarmup("access", "refresh", {});
   await flushAsyncWork();
+  assert.deepEqual(bridge.calls[0], { type: "open", args: ["access", "refresh", {}] });
   await actor.forceClose();
 
   assert.equal(actor.getMode(), "warmup");
