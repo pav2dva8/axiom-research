@@ -17,18 +17,23 @@ import * as os from 'os';
 import * as net from 'net';
 import type { AuthTokens, WalletInfo } from './auth';
 import { buildSignMessage } from './auth';
+import type { NavAction } from './session/token-navigation-plan';
+import { planEnterFromFeed } from './session/token-navigation-plan';
+import { pageUpdateMeme } from './session/page-update';
 
 /**
  * Viewer-manager script installed on every page in the context via
  * `addInitScript`. Exposes:
- *   - __connectViewerStart(id, tokenInfo, opts) → number (sync)
+ *   - __openSession(id, opts) → number (sync)
  *       Synchronously constructs the discovered cluster + friends WebSocket pair so
  *       cookies are captured at the moment of construction. Stores a Promise
  *       in `__pendingPromises[id]` that resolves when both handshakes open.
- *   - __connectViewerAwait(id) → Promise<number>
+ *   - __openSessionAwait(id) → Promise<number>
  *       Returns the stored Promise so the caller can await handshake
  *       completion separately (without holding the cookie lock).
- *   - __disconnectViewer(id), __disconnectAll(), __activeCount()
+ *   - __navigateSession(id, actions), __closeSession(id), __disconnectAll(), __activeCount()
+ *   - __connectViewerStart / __connectViewerAwait compatibility shim for the
+ *       old burst-on-connect path while callers migrate to open+navigate.
  *
  * Why split start/await? Cookies live on the BrowserContext (global). If
  * worker A is mid-handshake while worker B sets account-B cookies, A's
@@ -48,10 +53,127 @@ const VIEWER_MANAGER_SCRIPT = `
 
   var FRIENDS_URL = 'wss://friends.axiom.trade/ws';
 
-  window.__connectViewerStart = function(id, tokenInfo, opts) {
+  function clearSessionTimers(v) {
+    if (!v) return;
+    clearTimeout(v.friendsPingStart);
+    clearInterval(v.friendsPingTimer);
+    clearInterval(v.clusterPingTimer);
+    for (var i = 0; i < v.timers.length; i++) clearTimeout(v.timers[i]);
+    v.timers = [];
+  }
+
+  function closeSockets(v) {
+    if (!v) return;
+    try { v.clusterWs.close(); } catch (_) {}
+    try { v.friendsWs.close(); } catch (_) {}
+  }
+
+  function cleanupSession(id, close) {
+    var v = window.__viewers[id];
+    if (!v) return;
+    v.closed = true;
+    clearSessionTimers(v);
+    if (v.navReject) {
+      try { v.navReject(new Error('session closed')); } catch (_) {}
+      v.navReject = null;
+    }
+    if (close) closeSockets(v);
+    delete window.__viewers[id];
+  }
+
+  function waitFor(v, ms) {
+    if (ms <= 0) return Promise.resolve();
+    return new Promise(function(resolve, reject) {
+      if (v.closed) return reject(new Error('session closed'));
+      var timer = setTimeout(function() {
+        var idx = v.timers.indexOf(timer);
+        if (idx >= 0) v.timers.splice(idx, 1);
+        v.navReject = null;
+        if (v.closed) reject(new Error('session closed'));
+        else resolve();
+      }, ms);
+      v.timers.push(timer);
+      v.navReject = function(err) {
+        clearTimeout(timer);
+        reject(err);
+      };
+    });
+  }
+
+  function normalizePageUpdate(payload) {
+    payload = payload || {};
+    if (payload.type === 'pageUpdate') return payload;
+    var out = {
+      type: 'pageUpdate',
+      page: payload.page || 'meme',
+      chain: payload.chain || 'sol'
+    };
+    if (payload.subpage !== undefined) out.subpage = payload.subpage;
+    return out;
+  }
+
+  function sendNavAction(id, action) {
+    var v = window.__viewers[id];
+    if (!v || v.closed) throw new Error('session ' + id + ' is not open');
+    if (!action || typeof action !== 'object') throw new Error('invalid nav action');
+
+    if (action.ws === 'cluster') {
+      if (v.clusterWs.readyState !== 1) throw new Error('cluster socket is not open');
+      if ((action.op !== 'join' && action.op !== 'leave') || !action.room) {
+        throw new Error('invalid cluster nav action');
+      }
+      v.clusterWs.send(JSON.stringify({ action: action.op, room: action.room }));
+      if (action.op === 'join') v.currentRooms.add(action.room);
+      else v.currentRooms.delete(action.room);
+      return;
+    }
+
+    if (action.ws === 'friends' && action.op === 'pageUpdate') {
+      if (v.friendsWs.readyState !== 1) throw new Error('friends socket is not open');
+      v.friendsWs.send(JSON.stringify(normalizePageUpdate(action.pageUpdate)));
+      return;
+    }
+
+    throw new Error('unsupported nav action');
+  }
+
+  function buildCompatEnterPlan(tokenInfo) {
+    tokenInfo = tokenInfo || {};
+    var pairAddress = tokenInfo.pairAddress || '';
+    var tokenAddress = tokenInfo.tokenAddress || '';
+    var lateAt = 450;
+    var roomsEarly = ['t:' + pairAddress, 'f:' + pairAddress, pairAddress + '_refresh'];
+    var roomsLate = [
+      'e-' + pairAddress,
+      'td:' + pairAddress,
+      's:' + pairAddress,
+      pairAddress + '-dex-paid',
+      pairAddress + '-wallet_funding',
+      'kol_tx:' + pairAddress,
+      'pump-cto:' + pairAddress,
+      'a:' + tokenAddress,
+      'soc_bub:' + tokenAddress,
+      'b-' + pairAddress
+    ];
+    var actions = [];
+    for (var i = 0; i < roomsEarly.length; i++) {
+      actions.push({ atMs: 0, ws: 'cluster', op: 'join', room: roomsEarly[i] });
+    }
+    for (var j = 0; j < roomsLate.length; j++) {
+      actions.push({ atMs: lateAt, ws: 'cluster', op: 'join', room: roomsLate[j] });
+    }
+    actions.push({ atMs: lateAt, ws: 'friends', op: 'pageUpdate', pageUpdate: {
+      type: 'pageUpdate',
+      page: 'meme',
+      subpage: tokenInfo,
+      chain: 'sol'
+    } });
+    return actions;
+  }
+
+  window.__openSession = function(id, opts) {
     opts = opts || {};
     var pingJitterMs = typeof opts.pingJitterMs === 'number' ? opts.pingJitterMs : Math.floor(Math.random() * 1000);
-    var pairAddress = tokenInfo.pairAddress;
     var clusterUrl = (typeof opts.clusterUrl === 'string' && opts.clusterUrl)
       ? opts.clusterUrl
       : (window.__axiomClusterUrl || 'wss://cluster8.axiom.trade/');
@@ -64,15 +186,6 @@ const VIEWER_MANAGER_SCRIPT = `
     var clusterWs = new WebSocket(clusterUrl);
     var friendsWs = new WebSocket(FRIENDS_URL);
     var timeout = setTimeout(function() { fail('WS timeout'); }, 12000);
-
-    var tokenRooms = [
-      't:'  + pairAddress,
-      'f:'  + pairAddress,
-      'td:' + pairAddress,
-      's:'  + pairAddress,
-      'b-'  + pairAddress,
-      'e-'  + pairAddress
-    ];
 
     var clusterOpen = false, friendsOpen = false;
     var settled = false;
@@ -110,23 +223,23 @@ const VIEWER_MANAGER_SCRIPT = `
       window.__viewers[id] = {
         clusterWs: clusterWs, friendsWs: friendsWs,
         friendsPingTimer: friendsPingTimer, clusterPingTimer: clusterPingTimer, friendsPingStart: friendsPingStart,
-        pairAddress: pairAddress
+        currentRooms: new Set(),
+        timers: [],
+        closed: false,
+        navReject: null
       };
       resolveFn(id);
     }
 
     clusterWs.onopen = function() {
-      for (var i = 0; i < tokenRooms.length; i++) {
-        clusterWs.send(JSON.stringify({ action: 'join', room: tokenRooms[i] }));
-      }
-      console.log('[viewer ' + id + '] ' + clusterLabel + ' joined ' + tokenRooms.length + ' rooms (e-' + pairAddress.slice(0, 6) + '...)');
+      console.log('[viewer ' + id + '] ' + clusterLabel + ' open');
       clusterOpen = true;
       tryResolve();
     };
     clusterWs.onmessage = function(e) {
       try {
         var msg = JSON.parse(e.data);
-        if (msg.room === 'e-' + pairAddress) {
+        if (typeof msg.room === 'string' && msg.room.indexOf('e-') === 0) {
           console.log('[viewer ' + id + '] eye-room count = ' + msg.content);
         }
       } catch (_) {}
@@ -137,23 +250,11 @@ const VIEWER_MANAGER_SCRIPT = `
     clusterWs.onclose = function(e) {
       var dt = Date.now() - tStart;
       console.log('[viewer ' + id + '] ' + clusterLabel + ' closed code=' + e.code + ' clean=' + e.wasClean + ' reason="' + (e.reason || '') + '" after ' + dt + 'ms');
-      var v = window.__viewers[id];
-      if (v) {
-        clearTimeout(v.friendsPingStart);
-        clearInterval(v.friendsPingTimer);
-        clearInterval(v.clusterPingTimer);
-        delete window.__viewers[id];
-      }
+      cleanupSession(id, false);
       if (!settled) fail(clusterLabel + ' closed code=' + e.code + (e.reason ? ' reason=' + e.reason : ''));
     };
 
     friendsWs.onopen = function() {
-      friendsWs.send(JSON.stringify({
-        type: 'pageUpdate',
-        page: 'meme',
-        subpage: tokenInfo,
-        chain: 'sol'
-      }));
       friendsOpen = true;
       tryResolve();
     };
@@ -170,45 +271,67 @@ const VIEWER_MANAGER_SCRIPT = `
     friendsWs.onclose = function(e) {
       var dt = Date.now() - tStart;
       console.log('[viewer ' + id + '] friends closed code=' + e.code + ' clean=' + e.wasClean + ' reason="' + (e.reason || '') + '" after ' + dt + 'ms');
+      cleanupSession(id, false);
       if (!settled) fail('friends closed code=' + e.code + (e.reason ? ' reason=' + e.reason : ''));
     };
 
     return id;
   };
 
-  window.__connectViewerAwait = function(id) {
+  window.__openSessionAwait = function(id) {
     var p = window.__pendingPromises[id];
     delete window.__pendingPromises[id];
     return p;
   };
 
-  window.__disconnectViewer = function(id) {
+  window.__navigateSession = function(id, actions) {
     var v = window.__viewers[id];
-    if (!v) return;
-    clearTimeout(v.friendsPingStart);
-    clearInterval(v.friendsPingTimer);
-    clearInterval(v.clusterPingTimer);
-    try { v.clusterWs.close(); } catch (_) {}
-    try { v.friendsWs.close(); } catch (_) {}
-    delete window.__viewers[id];
+    if (!v || v.closed) return Promise.reject(new Error('session ' + id + ' is not open'));
+    actions = (actions || []).slice().sort(function(a, b) { return (a.atMs || 0) - (b.atMs || 0); });
+    var start = Date.now();
+    return (async function() {
+      for (var i = 0; i < actions.length; i++) {
+        var action = actions[i];
+        var delayMs = Math.max(0, start + Math.max(0, action.atMs || 0) - Date.now());
+        await waitFor(v, delayMs);
+        sendNavAction(id, action);
+      }
+    })();
+  };
+
+  window.__closeSession = function(id) {
+    cleanupSession(id, true);
+  };
+
+  window.__disconnectViewer = function(id) {
+    window.__closeSession(id);
   };
 
   window.__disconnectAll = function() {
     var keys = Object.keys(window.__viewers);
     for (var i = 0; i < keys.length; i++) {
-      var v = window.__viewers[keys[i]];
-      clearTimeout(v.friendsPingStart);
-      clearInterval(v.friendsPingTimer);
-      clearInterval(v.clusterPingTimer);
-      try { v.clusterWs.close(); } catch (_) {}
-      try { v.friendsWs.close(); } catch (_) {}
+      window.__closeSession(keys[i]);
     }
-    window.__viewers = {};
   };
 
   window.__activeCount = function() {
     var vals = Object.keys(window.__viewers).map(function(k) { return window.__viewers[k]; });
     return vals.filter(function(v) { return v.clusterWs.readyState === 1; }).length;
+  };
+
+  window.__connectViewerStart = function(id, tokenInfo, opts) {
+    window.__openSession(id, opts || {});
+    var openPromise = window.__pendingPromises[id];
+    window.__pendingPromises[id] = openPromise.then(function(openId) {
+      return window.__navigateSession(openId, buildCompatEnterPlan(tokenInfo)).then(function() {
+        return openId;
+      });
+    });
+    return id;
+  };
+
+  window.__connectViewerAwait = function(id) {
+    return window.__openSessionAwait(id);
   };
 })();
 `;
@@ -262,11 +385,19 @@ export interface BrowserSession {
   refreshAccount(refreshToken: string): Promise<AuthTokens>;
   /** Grow the friendsPage pool to at least `n` pages so workers can run in parallel. */
   ensurePageSlots(n: number): Promise<void>;
+  openSession(accessToken: string, refreshToken: string, opts?: BrowserSessionOpenOptions): Promise<number>;
+  navigateSession(sessionId: number, actions: NavAction[]): Promise<void>;
+  closeSession(sessionId: number): Promise<void>;
   connectViewer(accessToken: string, refreshToken: string, tokenInfo: any, pingJitterMs?: number, slotIndex?: number): Promise<number>;
   disconnectViewer(viewerId: number): Promise<void>;
   disconnectAllViewers(): Promise<void>;
   getActiveViewerCount(): Promise<number>;
   close(): Promise<void>;
+}
+
+export interface BrowserSessionOpenOptions {
+  pingJitterMs?: number;
+  slotIndex?: number;
 }
 
 export interface BrowserProxyConfig {
@@ -1108,7 +1239,7 @@ export async function openBrowserSession(options: BrowserSessionOptions = {}): P
     await Promise.all(
       friendsPages.map((p) =>
         p.evaluate((url) => {
-          (window as any).__axiomClusterUrl = url;
+          (globalThis as any).__axiomClusterUrl = url;
         }, clusterWsUrl).catch(() => {}),
       ),
     );
@@ -1217,7 +1348,7 @@ export async function openBrowserSession(options: BrowserSessionOptions = {}): P
       const p = await setupFriendsPage();
       friendsPages.push(p);
       await p.evaluate((url) => {
-        (window as any).__axiomClusterUrl = url;
+        (globalThis as any).__axiomClusterUrl = url;
       }, sessionShards.clusterWsUrl).catch(() => {});
       console.log(`[BrowserAuth] friendsPage pool grew to ${friendsPages.length}`);
     }
@@ -1386,6 +1517,81 @@ export async function openBrowserSession(options: BrowserSessionOptions = {}): P
     }
 
     throw lastErr;
+  }
+
+  async function openManagedSession(
+    accessToken: string,
+    refreshToken: string,
+    openOpts: BrowserSessionOpenOptions = {},
+  ): Promise<number> {
+    const slotIndex = Math.max(0, Math.floor(openOpts.slotIndex ?? 0));
+    // Pick a page from the pool; default to slot 0 for callers that don't
+    // care. viewer-service passes its worker index so each worker owns a
+    // distinct page -> evaluates run truly in parallel.
+    const sessionPage = friendsPages[slotIndex % friendsPages.length];
+
+    // Discover clusterN only when actually opening viewer sessions (not on keep-warm open).
+    const shards = await ensureSessionShards();
+
+    // Set this account's auth cookies on every axiom subdomain we touch.
+    // The WS handshake reads cookies from the matching domain, so the
+    // auth-access-token must be present for the discovered cluster, friends,
+    // AND .axiom.trade (the wildcard, used as fallback).
+    const domains = buildAuthCookieDomains(shards.clusterWsUrl);
+    const cookiesToAdd: { name: string; value: string; domain: string; path: string }[] = [];
+    for (const domain of domains) {
+      cookiesToAdd.push(
+        { name: 'auth-access-token', value: accessToken, domain, path: '/' },
+        { name: 'auth-refresh-token', value: refreshToken, domain, path: '/' },
+      );
+    }
+
+    const scriptOpts = {
+      pingJitterMs: typeof openOpts.pingJitterMs === 'number' ? openOpts.pingJitterMs : Math.floor(Math.random() * 1000),
+      clusterUrl: shards.clusterWsUrl,
+    };
+    const sessionId = ++nextViewerId;
+
+    // Cookie-locked critical section: addCookies -> synchronously construct
+    // the WS pair (so cookies are captured) -> clear cookies. The handshake
+    // runs outside the lock, in parallel across pool slots.
+    const tStart = Date.now();
+    await withCookieLock(async () => {
+      try {
+        await context.addCookies(cookiesToAdd);
+        await sessionPage.evaluate(
+          ({ id, opts }) => (globalThis as any).__openSession(id, opts),
+          { id: sessionId, opts: scriptOpts },
+        );
+      } finally {
+        await context.clearCookies({ name: 'auth-access-token' });
+        await context.clearCookies({ name: 'auth-refresh-token' });
+      }
+    });
+    const tStartDone = Date.now();
+
+    // Wait for both WS handshakes to complete (no cookie lock held).
+    await sessionPage.evaluate((id) => (globalThis as any).__openSessionAwait(id), sessionId);
+    const tAwaitDone = Date.now();
+    console.log(`[Timing] slot=${slotIndex} cookieLocked=${tStartDone - tStart}ms handshake=${tAwaitDone - tStartDone}ms`);
+
+    viewerToPage.set(sessionId, sessionPage);
+    console.log(`[BrowserAuth] Session ${sessionId} opened on slot ${slotIndex} (acct token=${accessToken.slice(0, 12)}..., pingJitter=${scriptOpts.pingJitterMs}ms)`);
+    return sessionId;
+  }
+
+  async function navigateManagedSession(sessionId: number, actions: NavAction[]): Promise<void> {
+    const sessionPage = viewerToPage.get(sessionId) ?? friendsPage;
+    await sessionPage.evaluate(
+      ({ id, navActions }) => (globalThis as any).__navigateSession(id, navActions),
+      { id: sessionId, navActions: actions },
+    );
+  }
+
+  async function closeManagedSession(sessionId: number): Promise<void> {
+    const sessionPage = viewerToPage.get(sessionId) ?? friendsPage;
+    await sessionPage.evaluate((id) => (globalThis as any).__closeSession(id), sessionId);
+    viewerToPage.delete(sessionId);
   }
 
   return {
@@ -1592,6 +1798,18 @@ export async function openBrowserSession(options: BrowserSessionOptions = {}): P
       await ensurePageSlots(n);
     },
 
+    async openSession(accessToken: string, refreshToken: string, opts: BrowserSessionOpenOptions = {}): Promise<number> {
+      return openManagedSession(accessToken, refreshToken, opts);
+    },
+
+    async navigateSession(sessionId: number, actions: NavAction[]): Promise<void> {
+      return navigateManagedSession(sessionId, actions);
+    },
+
+    async closeSession(sessionId: number): Promise<void> {
+      return closeManagedSession(sessionId);
+    },
+
     async fetchPairInfo(pairAddress: string): Promise<any | null> {
       const hosts = apiHostsForSession();
       for (const host of hosts) {
@@ -1629,56 +1847,16 @@ export async function openBrowserSession(options: BrowserSessionOptions = {}): P
     },
 
     async connectViewer(accessToken: string, refreshToken: string, tokenInfo: any, pingJitterMs?: number, slotIndex: number = 0): Promise<number> {
-      // Pick a page from the pool; default to slot 0 for callers that don't
-      // care. viewer-service passes its worker index so each worker owns a
-      // distinct page → evaluates run truly in parallel.
-      const page = friendsPages[slotIndex % friendsPages.length];
-
-      // Discover clusterN only when actually connecting viewers (not on keep-warm open).
-      const shards = await ensureSessionShards();
-
-      // Set this account's auth cookies on every axiom subdomain we touch.
-      // The WS handshake reads cookies from the matching domain, so the
-      // auth-access-token must be present for the discovered cluster, friends,
-      // AND .axiom.trade (the wildcard, used as fallback).
-      const domains = buildAuthCookieDomains(shards.clusterWsUrl);
-      const cookiesToAdd: { name: string; value: string; domain: string; path: string }[] = [];
-      for (const domain of domains) {
-        cookiesToAdd.push(
-          { name: 'auth-access-token', value: accessToken, domain, path: '/' },
-          { name: 'auth-refresh-token', value: refreshToken, domain, path: '/' },
-        );
-      }
-
-      const opts = {
-        pingJitterMs: typeof pingJitterMs === 'number' ? pingJitterMs : Math.floor(Math.random() * 1000),
-        clusterUrl: shards.clusterWsUrl,
-      };
-      const viewerId = ++nextViewerId;
-
-      // Cookie-locked critical section: addCookies → synchronously construct
-      // the WS pair (so cookies are captured) → clear cookies. Lock is held
-      // ~10-30ms total. The handshake (~700ms) runs OUTSIDE the lock, in
-      // parallel across pool slots.
       const tStart = Date.now();
-      await withCookieLock(async () => {
-        await context.addCookies(cookiesToAdd);
-        await page.evaluate(
-          `window.__connectViewerStart(${viewerId}, ${JSON.stringify(tokenInfo)}, ${JSON.stringify(opts)})`
-        );
-        await context.clearCookies({ name: 'auth-access-token' });
-        await context.clearCookies({ name: 'auth-refresh-token' });
+      const sessionId = await openManagedSession(accessToken, refreshToken, { pingJitterMs, slotIndex });
+      const actions = planEnterFromFeed(tokenInfo).map((action) => {
+        if (action.op !== 'pageUpdate') return action;
+        return { ...action, pageUpdate: pageUpdateMeme(tokenInfo) };
       });
-      const tStartDone = Date.now();
-
-      // Wait for both WS handshakes to complete (no cookie lock held).
-      await page.evaluate(`window.__connectViewerAwait(${viewerId})`);
-      const tAwaitDone = Date.now();
-      console.log(`[Timing] slot=${slotIndex} cookieLocked=${tStartDone - tStart}ms handshake=${tAwaitDone - tStartDone}ms`);
-
-      viewerToPage.set(viewerId, page);
-      console.log(`[BrowserAuth] Viewer ${viewerId} connected on slot ${slotIndex} (acct token=${accessToken.slice(0, 12)}..., pingJitter=${opts.pingJitterMs}ms)`);
-      return viewerId;
+      await navigateManagedSession(sessionId, actions);
+      console.log(`[Timing] slot=${slotIndex} connectViewer compatibility path took ${Date.now() - tStart}ms`);
+      console.log(`[BrowserAuth] Viewer ${sessionId} connected on slot ${slotIndex} (acct token=${accessToken.slice(0, 12)}...)`);
+      return sessionId;
     },
 
     async resolvePairFromCa(ca: string, accessToken?: string, refreshToken?: string): Promise<any | null> {
@@ -1734,9 +1912,7 @@ export async function openBrowserSession(options: BrowserSessionOptions = {}): P
     },
 
     async disconnectViewer(viewerId: number): Promise<void> {
-      const page = viewerToPage.get(viewerId) ?? friendsPage;
-      await page.evaluate(`window.__disconnectViewer(${viewerId})`);
-      viewerToPage.delete(viewerId);
+      await closeManagedSession(viewerId);
     },
 
     async disconnectAllViewers(): Promise<void> {
