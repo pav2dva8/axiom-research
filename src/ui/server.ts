@@ -196,6 +196,11 @@ async function ensureBrowserSession(): Promise<
 > {
   let session = viewerService.getBrowserSession();
   if (session) return session;
+  const warm = accountManager.getBrowserSession();
+  if (warm) {
+    viewerService.setBrowserSession(warm);
+    return warm;
+  }
   broadcast("relogin-progress", {
     done: 0,
     total: 0,
