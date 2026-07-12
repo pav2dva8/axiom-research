@@ -25,15 +25,34 @@ test("planEnterFromFeed stages early then late joins and meme pageUpdate", () =>
   assert.equal(late.includes("b-Pair111"), true);
   const pu = plan.find((a) => a.op === "pageUpdate");
   assert.ok(pu && pu.atMs >= 450 && pu.ws === "friends");
+  assert.deepEqual(pu.pageUpdate, {
+    type: "pageUpdate",
+    page: "meme",
+    subpage: {
+      pairAddress: "Pair111",
+      tokenAddress: "Token111",
+    },
+    chain: "sol",
+  });
 });
 
-test("planTokenToToken leaves prev before joining next and delays e- leave", () => {
+test("planTokenToToken leaves prev before joining next, delays e- leave, and updates meme page", () => {
   const plan = planTokenToToken(T, U, fixed);
   const firstJoin = Math.min(...plan.filter((a) => a.op === "join").map((a) => a.atMs));
   const leaves = plan.filter((a) => a.op === "leave");
   assert.ok(leaves.every((a) => a.atMs < firstJoin || a.room === "e-Pair111"));
   const eLeave = leaves.find((a) => a.room === "e-Pair111");
   assert.ok(eLeave && eLeave.atMs >= firstJoin + 36);
+  const pu = plan.find((a) => a.op === "pageUpdate");
+  assert.deepEqual(pu?.pageUpdate, {
+    type: "pageUpdate",
+    page: "meme",
+    subpage: {
+      pairAddress: "Pair222",
+      tokenAddress: "Token222",
+    },
+    chain: "sol",
+  });
 });
 
 test("planLeaveAll leaves token rooms including e-", () => {

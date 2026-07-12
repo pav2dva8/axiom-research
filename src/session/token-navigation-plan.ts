@@ -1,3 +1,5 @@
+import { pageUpdateMeme } from "./page-update";
+
 export type NavAction = {
   atMs: number;
   ws: "cluster" | "friends";
@@ -21,8 +23,16 @@ function clusterLeave(atMs: number, room: string): NavAction {
   return { atMs, ws: "cluster", op: "leave", room };
 }
 
-function memePageUpdate(atMs: number): NavAction {
-  return { atMs, ws: "friends", op: "pageUpdate", pageUpdate: { page: "meme" } };
+function memePageUpdate(atMs: number, token: NavTokenRef): NavAction {
+  return {
+    atMs,
+    ws: "friends",
+    op: "pageUpdate",
+    pageUpdate: pageUpdateMeme({
+      pairAddress: token.pairAddress,
+      tokenAddress: token.tokenAddress,
+    }),
+  };
 }
 
 function allClusterRooms(ref: NavTokenRef): string[] {
@@ -98,7 +108,7 @@ export function planEnterFromFeed(
     plan.push(clusterJoin(lateAt, room));
   }
   plan.push(clusterJoin(bAt, `b-${token.pairAddress}`));
-  plan.push(memePageUpdate(lateAt));
+  plan.push(memePageUpdate(lateAt, token));
 
   return plan.sort((a, b) => a.atMs - b.atMs);
 }
@@ -129,7 +139,7 @@ export function planTokenToToken(
   for (const room of tokenToTokenLateJoinRooms(next)) {
     plan.push(clusterJoin(lateAt, room));
   }
-  plan.push(memePageUpdate(lateAt));
+  plan.push(memePageUpdate(lateAt, next));
 
   return plan.sort((a, b) => a.atMs - b.atMs);
 }

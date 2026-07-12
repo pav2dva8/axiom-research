@@ -176,3 +176,56 @@ test("warmup actors deploy, return to warmup, and force close through browser se
 
   assert.equal(calls.some((call) => call.type === "close"), true);
 });
+
+test("disconnectSlowly removes actor connection when return to warmup fails once", async () => {
+  const service = new ViewerService();
+  const calls: SessionCall[] = [];
+  const disconnectedEvents: string[] = [];
+  let failedReturnAttempts = 0;
+  const session = {
+    ...sessionWithActorApis(calls),
+    navigateSession: async (sessionId: number, actions: NavAction[]) => {
+      calls.push({ type: "navigate", sessionId, actions });
+      if (
+        actions.some(
+          (action) => action.op === "leave" && action.room === "t:deploy-pair",
+        ) &&
+        failedReturnAttempts === 0
+      ) {
+        failedReturnAttempts++;
+        throw new Error("return failed");
+      }
+    },
+  } as BrowserSession;
+  const acct = account("acct-fail-return");
+
+  service.on("viewer-disconnected", (publicKey) => disconnectedEvents.push(publicKey));
+
+  await service.startWarmupForGroups([
+    { id: 1, label: "proxy 1", session, accounts: [acct] },
+  ]);
+  await flushAsyncWork();
+
+  service.setTokenInfo(tokenInfo());
+  const connected = await service.connectGroups(
+    [{ id: 1, label: "proxy 1", session, accounts: [acct] }],
+    {
+      minGapMs: 0,
+      maxGapMs: 0,
+      groupStartDelayMinMs: 0,
+      groupStartDelayMaxMs: 0,
+      shuffle: false,
+    },
+  );
+  assert.equal(connected, 1);
+  assert.equal(service.getActiveCount(), 1);
+
+  const slowlyStopped = await service.disconnectSlowly(0, 0);
+
+  assert.equal(slowlyStopped, 1);
+  assert.equal(service.getActiveCount(), 0);
+  assert.deepEqual(disconnectedEvents, ["acct-fail-return"]);
+  assert.equal(failedReturnAttempts, 1);
+
+  await service.stopWarmup();
+});

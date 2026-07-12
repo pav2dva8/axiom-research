@@ -841,7 +841,15 @@ export class ViewerService extends EventEmitter {
       if (actor && connection.closeMode === "session") {
         try {
           await actor.returnToWarmup();
-        } catch {}
+        } catch (err: any) {
+          console.log(
+            `[Viewer] ${publicKey.slice(0, 8)} return to warmup failed: ${err?.message || err}`,
+          );
+          this.actorModes.delete(publicKey);
+        }
+        if (this.connectedViewers.delete(publicKey)) {
+          this.emit("viewer-disconnected", publicKey);
+        }
       } else {
         try {
           if (connection.closeMode === "session") {

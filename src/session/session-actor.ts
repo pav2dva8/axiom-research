@@ -157,6 +157,9 @@ export class SessionActor {
       await this.waitFor(this.timing.contextGapMs);
       if (!this.isWarmupActive(generation)) return;
 
+      await this.feed.refresh().catch(() => {});
+      if (!this.isWarmupActive(generation)) return;
+
       const next = this.feed.pickRandom(this.timing.rng);
       if (next) {
         const actions = this.currentToken

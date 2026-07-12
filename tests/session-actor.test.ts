@@ -115,6 +115,40 @@ test("returnToWarmup leaves deploy and resumes warmup mode", async () => {
   assert.equal(waits.waits.length, 2);
 });
 
+test("warmup refreshes feed before picking token", async () => {
+  const bridge = new FakeBridge();
+  const waits = deferredWaits();
+  let refreshes = 0;
+  const feed = new FeedPool({
+    fetchTrending: async () => {
+      refreshes++;
+      return [token("FreshPair", "FreshToken")];
+    },
+  });
+  const actor = new SessionActor({
+    publicKey: "Pub111",
+    bridge,
+    feed,
+    timing: { contextGapMs: [5, 5], dwellMs: [5, 5], wait: waits.wait, rng: () => 0 },
+  });
+
+  await actor.startWarmup("access", "refresh", {});
+  await flushAsyncWork();
+  waits.waits[0]?.resolve();
+  await flushAsyncWork();
+  await flushAsyncWork();
+
+  assert.equal(refreshes, 1);
+  assert.equal(
+    navigateCalls(bridge).some((call) =>
+      call.actions.some((action) => action.op === "join" && action.room === "t:FreshPair"),
+    ),
+    true,
+  );
+
+  await actor.forceClose();
+});
+
 test("forceClose closes session", async () => {
   const bridge = new FakeBridge();
   const waits = deferredWaits();
