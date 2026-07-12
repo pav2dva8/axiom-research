@@ -35,7 +35,7 @@ test("account auth status is used before a viewer state exists", () => {
 });
 
 test("every live viewer state has a visible status label and color", () => {
-  const states: RunViewerState[] = ["pending", "connecting", "connected", "failed", "disconnected"];
+  const states: RunViewerState[] = ["pending", "connecting", "warmup", "connected", "failed", "disconnected"];
   const auth: AccountAuthStatus = "loggedIn";
 
   for (const state of states) {

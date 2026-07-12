@@ -435,13 +435,21 @@ export function RunTab({
   }
 
   async function slowStop() {
+    const viewerDelay = normalizeDelayRange(minGapMs, maxGapMs);
     setStopping(true);
-    onLog("Slow stop — disconnecting 1 viewer/sec...", "info");
+    onLog(
+      `Slow stop — disconnecting with ${viewerDelay.min}–${viewerDelay.max} ms gaps...`,
+      "info",
+    );
     try {
       const res = await fetch("/api/viewers/stop", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ mode: "slow", delayMs: 2000 }),
+        body: JSON.stringify({
+          mode: "slow",
+          minGapMs: viewerDelay.min,
+          maxGapMs: viewerDelay.max,
+        }),
       });
       const data = await res.json();
       onLog(
@@ -485,7 +493,8 @@ export function RunTab({
     watchActive ||
     running ||
     connectedCount > 0 ||
-    (counts.connecting ?? 0) > 0;
+    (counts.connecting ?? 0) > 0 ||
+    (counts.warmup ?? 0) > 0;
   const canWatchDeploy =
     (BASE58.test(input.trim()) || isLinkInput(input)) && !isActive && !busy && !stopping;
   const watchPending = watching || watchActive;
@@ -562,10 +571,12 @@ export function RunTab({
     const connected = states.filter((state) => state === "connected").length;
     const failed = states.filter((state) => state === "failed").length;
     const connecting = states.filter((state) => state === "connecting").length;
+    const warmup = states.filter((state) => state === "warmup").length;
     if (states.length === 0) return null;
     return (
       <span className="font-mono text-muted-foreground">
         {connected}/{publicKeys.length}
+        {warmup > 0 ? ` · ${warmup} warmup` : ""}
         {connecting > 0 ? ` · ${connecting} connecting` : ""}
         {failed > 0 ? ` · ${failed} failed` : ""}
       </span>
@@ -621,7 +632,7 @@ export function RunTab({
               size="sm"
               onClick={slowStop}
               disabled={stopping || connectedCount === 0}
-              title="Disconnect one viewer at a time (~1s apart)"
+              title="Disconnect viewers one at a time using the delay range above"
             >
               {stopping ? (
                 <Loader2 className="mr-2 h-3.5 w-3.5 animate-spin" />
@@ -943,8 +954,13 @@ export function RunTab({
               connected
             </span>
             <span className="flex gap-2 font-mono text-muted-foreground">
+              {(counts.warmup ?? 0) > 0 && (
+                <span className="text-amber-200/85">
+                  {counts.warmup} warmup
+                </span>
+              )}
               {(counts.connecting ?? 0) > 0 && (
-                <span className="text-amber-400">
+                <span className="text-sky-400">
                   {counts.connecting} connecting
                 </span>
               )}
@@ -964,6 +980,7 @@ export function RunTab({
                   const groupConnected = groupStates.filter((state) => state === "connected").length;
                   const groupFailed = groupStates.filter((state) => state === "failed").length;
                   const groupConnecting = groupStates.filter((state) => state === "connecting").length;
+                  const groupWarmup = groupStates.filter((state) => state === "warmup").length;
 
                   return (
                     <section key={group.id} className="border-t border-border/70 pt-2 first:border-t-0 first:pt-0">
@@ -971,6 +988,7 @@ export function RunTab({
                         <span className="font-medium">{group.label}</span>
                         <span className="font-mono text-muted-foreground">
                           {groupConnected}/{group.accounts.length}
+                          {groupWarmup > 0 ? ` · ${groupWarmup} warmup` : ""}
                           {groupConnecting > 0 ? ` · ${groupConnecting} connecting` : ""}
                           {groupFailed > 0 ? ` · ${groupFailed} failed` : ""}
                         </span>

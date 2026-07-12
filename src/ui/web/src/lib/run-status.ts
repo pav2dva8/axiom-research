@@ -1,4 +1,4 @@
-export type RunViewerState = "pending" | "connecting" | "connected" | "failed" | "disconnected";
+export type RunViewerState = "pending" | "connecting" | "warmup" | "connected" | "failed" | "disconnected";
 export type AccountAuthStatus = "loggedIn" | "expired" | "needsLogin" | "banned";
 
 export const VIEWER_STATUS_META: Record<RunViewerState, { label: string; className: string }> = {
@@ -9,6 +9,10 @@ export const VIEWER_STATUS_META: Record<RunViewerState, { label: string; classNa
   connecting: {
     label: "connecting",
     className: "border-sky-500/40 bg-sky-500/15 text-sky-300",
+  },
+  warmup: {
+    label: "warmup",
+    className: "border-amber-500/25 bg-slate-500/12 text-amber-200/85",
   },
   connected: {
     label: "connected",

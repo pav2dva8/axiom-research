@@ -16,7 +16,7 @@ interface Status {
   registerRunning?: boolean;
 }
 
-export type ViewerState = 'pending' | 'connecting' | 'connected' | 'failed' | 'disconnected';
+export type ViewerState = 'pending' | 'connecting' | 'warmup' | 'connected' | 'failed' | 'disconnected';
 export interface ViewerProgressGroup {
   id: number;
   label: string;
