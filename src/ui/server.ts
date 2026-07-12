@@ -48,6 +48,7 @@ const accountManager = new AccountManager();
 const viewerService = new ViewerService();
 const deployWatcher = new DeployWatcher();
 const registerService = new RegisterService();
+accountManager.setViewerService(viewerService);
 
 const uiClients: Set<WebSocket> = new Set();
 let activeDeployWatchRequest: DeployWatchRequestState | null = null;
@@ -167,6 +168,10 @@ viewerService.on("viewer-connecting", (pk: string) =>
 );
 viewerService.on("viewer-connected", (pk: string) => {
   broadcastViewerProgress(pk, "connected");
+  broadcastStatus();
+});
+viewerService.on("viewer-warmup", (pk: string) => {
+  broadcastViewerProgress(pk, "warmup");
   broadcastStatus();
 });
 viewerService.on("viewer-failed", (pk: string) =>
@@ -1079,11 +1084,13 @@ async function handleApi(
       return;
     }
 
-    // POST /api/viewers/stop  { mode?: 'force' | 'slow', delayMs?: number }
+    // POST /api/viewers/stop  { mode?: 'force' | 'slow', delayMs?: number, minGapMs?, maxGapMs? }
     if (pathname === "/api/viewers/stop" && req.method === "POST") {
       const body = await readBody(req).catch(() => "");
       let mode: "force" | "slow" = "force";
       let delayMs = 2000;
+      let minGapMs: number | undefined;
+      let maxGapMs: number | undefined;
       try {
         if (body) {
           const parsed = JSON.parse(body);
@@ -1094,13 +1101,30 @@ async function handleApi(
           ) {
             delayMs = Math.max(0, Math.floor(parsed.delayMs));
           }
+          if (
+            typeof parsed.minGapMs === "number" &&
+            Number.isFinite(parsed.minGapMs)
+          ) {
+            minGapMs = Math.max(0, Math.floor(parsed.minGapMs));
+          }
+          if (
+            typeof parsed.maxGapMs === "number" &&
+            Number.isFinite(parsed.maxGapMs)
+          ) {
+            maxGapMs = Math.max(0, Math.floor(parsed.maxGapMs));
+          }
         }
       } catch {}
 
       cancelActiveDeployWatchRequest("Deploy watch canceled by Stop.");
 
       if (mode === "slow") {
-        const disconnected = await viewerService.disconnectSlowly(delayMs);
+        const resolvedMinGapMs = minGapMs ?? delayMs;
+        const resolvedMaxGapMs = Math.max(resolvedMinGapMs, maxGapMs ?? resolvedMinGapMs);
+        const disconnected = await viewerService.disconnectSlowly(
+          resolvedMinGapMs,
+          resolvedMaxGapMs,
+        );
         if (viewerService.getActiveCount() === 0) {
           currentRunTotal = 0;
           broadcast("viewer-run", { total: 0, accounts: [] });

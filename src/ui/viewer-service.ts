@@ -1,8 +1,12 @@
 import { EventEmitter } from "events";
 import type { LoadedAccount } from "./account-manager";
 import type { BrowserSession } from "../browser-auth";
+import { FeedPool } from "../session/feed-pool";
+import { SessionActor, type SessionBridge, type SessionMode } from "../session/session-actor";
+import { planEnterFromFeed } from "../session/token-navigation-plan";
 
 export interface TokenInfo {
+  [key: string]: unknown;
   pairAddress: string;
   tokenAddress: string;
   ticker: string;
@@ -185,6 +189,7 @@ export interface ConnectGroupsOptions extends ConnectAllOptions {
 interface ViewerConnection {
   viewerId: number;
   session: BrowserSession;
+  closeMode?: "viewer" | "session";
 }
 
 function shuffle<T>(arr: T[]): T[] {
@@ -199,6 +204,9 @@ function shuffle<T>(arr: T[]): T[] {
 export class ViewerService extends EventEmitter {
   private browserSession: BrowserSession | null = null;
   private connectedViewers: Map<string, ViewerConnection> = new Map();
+  private sessionActors: Map<string, SessionActor> = new Map();
+  private actorSessions: Map<string, BrowserSession> = new Map();
+  private actorModes: Map<string, SessionMode> = new Map();
   private warmedAccounts: Set<string> = new Set(); // publicKeys that have been bootstrapped this process
   private tokenInfo: TokenInfo | null = null;
   private bootstrapDisabled = false;
@@ -399,6 +407,184 @@ export class ViewerService extends EventEmitter {
     return new Promise((resolve) => setTimeout(resolve, ms));
   }
 
+  private createSessionBridge(session: BrowserSession): SessionBridge {
+    return {
+      openSession: (access, refresh, opts) =>
+        session.openSession(access, refresh, opts as any),
+      navigateSession: (id, actions) => session.navigateSession(id, actions),
+      closeSession: (id) => session.closeSession(id),
+    };
+  }
+
+  private rememberActorState(
+    publicKey: string,
+    session: BrowserSession,
+    state: { mode: SessionMode; sessionId?: number },
+  ): void {
+    const previousMode = this.actorModes.get(publicKey);
+
+    if (state.sessionId == null) {
+      if (previousMode === "deploy" || this.connectedViewers.has(publicKey)) {
+        this.connectedViewers.delete(publicKey);
+        this.emit("viewer-disconnected", publicKey);
+      }
+      this.actorModes.delete(publicKey);
+      return;
+    }
+
+    if (state.mode === "deploy") {
+      if (!this.connectedViewers.has(publicKey)) {
+        this.connectedViewers.set(publicKey, {
+          viewerId: state.sessionId,
+          session,
+          closeMode: "session",
+        });
+        this.emit("viewer-connected", publicKey);
+      }
+    } else {
+      if (previousMode === "deploy" || this.connectedViewers.has(publicKey)) {
+        this.connectedViewers.delete(publicKey);
+        this.emit("viewer-disconnected", publicKey);
+      }
+      if (previousMode !== "warmup") {
+        this.emit("viewer-warmup", publicKey);
+      }
+    }
+
+    this.actorModes.set(publicKey, state.mode);
+  }
+
+  private async closeActor(publicKey: string): Promise<void> {
+    const actor = this.sessionActors.get(publicKey);
+    if (!actor) return;
+    await actor.forceClose().catch(() => {});
+    this.sessionActors.delete(publicKey);
+    this.actorSessions.delete(publicKey);
+    this.actorModes.delete(publicKey);
+    this.connectedViewers.delete(publicKey);
+  }
+
+  async startWarmupForGroups(groups: ViewerAccountGroup[]): Promise<void> {
+    for (const group of groups) {
+      const feed = new FeedPool({
+        fetchTrending: () => group.session.fetchMemeTrending(),
+      });
+      try {
+        await feed.refresh();
+      } catch (err: any) {
+        console.log(
+          `[Viewer] ${group.label} warmup feed refresh failed: ${err?.message || err}`,
+        );
+      }
+
+      for (const account of group.accounts) {
+        const existing = this.sessionActors.get(account.publicKey);
+        if (existing && this.actorSessions.get(account.publicKey) === group.session) {
+          continue;
+        }
+        if (existing) {
+          await this.closeActor(account.publicKey);
+        }
+
+        const actor = new SessionActor({
+          publicKey: account.publicKey,
+          bridge: this.createSessionBridge(group.session),
+          feed,
+          onState: (state) =>
+            this.rememberActorState(account.publicKey, group.session, state),
+        });
+        this.sessionActors.set(account.publicKey, actor);
+        this.actorSessions.set(account.publicKey, group.session);
+        await actor.startWarmup(account.accessToken, account.refreshToken, {
+          pingJitterMs: Math.floor(Math.random() * 1000),
+        });
+      }
+    }
+  }
+
+  async stopWarmup(): Promise<void> {
+    const publicKeys = [...this.sessionActors.keys()];
+    await Promise.all(publicKeys.map((publicKey) => this.closeActor(publicKey)));
+    this.connectedViewers.clear();
+  }
+
+  private canUseManagedSession(session: BrowserSession): boolean {
+    return (
+      typeof (session as any).openSession === "function" &&
+      typeof (session as any).navigateSession === "function" &&
+      typeof (session as any).closeSession === "function"
+    );
+  }
+
+  private async connectManagedSession(
+    account: LoadedAccount,
+    session: BrowserSession,
+    slotIndex: number,
+  ): Promise<boolean> {
+    if (!this.tokenInfo) {
+      this.emit("viewer-failed", account.publicKey);
+      return false;
+    }
+    this.emit("viewer-connecting", account.publicKey);
+    try {
+      const sessionId = await session.openSession(
+        account.accessToken,
+        account.refreshToken,
+        {
+          pingJitterMs: Math.floor(Math.random() * 1000),
+          slotIndex,
+        },
+      );
+      await session.navigateSession(sessionId, planEnterFromFeed(this.tokenInfo));
+      this.connectedViewers.set(account.publicKey, {
+        viewerId: sessionId,
+        session,
+        closeMode: "session",
+      });
+      this.emit("viewer-connected", account.publicKey);
+      return true;
+    } catch (err: any) {
+      console.log(
+        `[Viewer] ${account.publicKey.slice(0, 8)} managed session failed: ${err.message}`,
+      );
+      this.emit("viewer-failed", account.publicKey);
+      return false;
+    }
+  }
+
+  private async deployAccount(
+    account: LoadedAccount,
+    session: BrowserSession,
+    slotIndex: number,
+    retry: { attempts?: number; minDelayMs?: number; maxDelayMs?: number } = {},
+  ): Promise<boolean> {
+    const actor = this.sessionActors.get(account.publicKey);
+    if (actor && this.actorSessions.get(account.publicKey) === session) {
+      if (!this.tokenInfo) {
+        this.emit("viewer-failed", account.publicKey);
+        return false;
+      }
+      this.emit("viewer-connecting", account.publicKey);
+      try {
+        await actor.gotoDeploy(this.tokenInfo);
+        return true;
+      } catch (err: any) {
+        console.log(
+          `[Viewer] ${account.publicKey.slice(0, 8)} deploy failed: ${err.message}`,
+        );
+        this.emit("viewer-failed", account.publicKey);
+        return false;
+      }
+    }
+
+    if (this.canUseManagedSession(session)) {
+      return this.connectManagedSession(account, session, slotIndex);
+    }
+
+    return this.connectAccount(account, slotIndex, true, session, retry);
+  }
+
+
   private async warmClusterPath(session: BrowserSession, account: LoadedAccount): Promise<void> {
     if (this.clusterWarmedSessions.has(session)) return;
     this.clusterWarmedSessions.add(session);
@@ -458,13 +644,19 @@ export class ViewerService extends EventEmitter {
             const gap = this.randomDelayMs(minGap, maxGap);
             if (gap > 0) await this.sleep(gap);
             if (this.connectCancelled) return;
-            const success = await this.connectAccount(account, 0, true, group.session, retry);
+            const success = await this.deployAccount(account, group.session, 0, retry);
             if (!success) continue;
             if (this.connectCancelled) {
               const connection = this.connectedViewers.get(account.publicKey);
               this.connectedViewers.delete(account.publicKey);
               if (connection) {
-                await connection.session.disconnectViewer(connection.viewerId).catch(() => {});
+                if (connection.closeMode === "session" && this.sessionActors.has(account.publicKey)) {
+                  await this.closeActor(account.publicKey).catch(() => {});
+                } else if (connection.closeMode === "session") {
+                  await connection.session.closeSession(connection.viewerId).catch(() => {});
+                } else {
+                  await connection.session.disconnectViewer(connection.viewerId).catch(() => {});
+                }
               }
               this.emit("viewer-disconnected", account.publicKey);
               return;
@@ -581,14 +773,24 @@ export class ViewerService extends EventEmitter {
   disconnectAll(): void {
     this.connectCancelled = true;
     this.slowStopCancelled = true;
-    const sessions = new Set<BrowserSession>();
-    for (const connection of this.connectedViewers.values()) {
-      sessions.add(connection.session);
+    const legacySessions = new Set<BrowserSession>();
+    const actorKeysToClose: string[] = [];
+    for (const [publicKey, connection] of this.connectedViewers.entries()) {
+      if (connection.closeMode === "session" && this.sessionActors.has(publicKey)) {
+        actorKeysToClose.push(publicKey);
+      } else if (connection.closeMode === "session") {
+        connection.session.closeSession(connection.viewerId).catch(() => {});
+      } else {
+        legacySessions.add(connection.session);
+      }
     }
-    if (sessions.size === 0 && this.browserSession) {
-      sessions.add(this.browserSession);
+    for (const publicKey of actorKeysToClose) {
+      this.closeActor(publicKey).catch(() => {});
     }
-    for (const session of sessions) {
+    if (legacySessions.size === 0 && actorKeysToClose.length === 0 && this.browserSession) {
+      legacySessions.add(this.browserSession);
+    }
+    for (const session of legacySessions) {
       session.disconnectAllViewers().catch(() => {});
     }
     this.connectedViewers.clear();
@@ -601,29 +803,41 @@ export class ViewerService extends EventEmitter {
    * connect loop first so no new viewers join mid-teardown. Preemptable by
    * disconnectAll() (force stop), which flips slowStopCancelled.
    */
-  async disconnectSlowly(delayMs = 2000): Promise<number> {
+  async disconnectSlowly(minGapMs = 2000, maxGapMs = minGapMs): Promise<number> {
     this.connectCancelled = true;
     this.slowStopCancelled = false;
-    const gap = Math.max(0, Math.floor(delayMs));
+    const minGap = Math.max(0, Math.floor(minGapMs));
+    const maxGap = Math.max(minGap, Math.floor(maxGapMs));
     let disconnected = 0;
 
     while (this.connectedViewers.size > 0 && !this.slowStopCancelled) {
       const entry = this.connectedViewers.entries().next().value;
       if (!entry) break;
       const [publicKey, connection] = entry;
-      try {
-        await connection.session.disconnectViewer(connection.viewerId);
-      } catch {}
-      this.connectedViewers.delete(publicKey);
-      this.emit("viewer-disconnected", publicKey);
+      const actor = this.sessionActors.get(publicKey);
+      if (actor && connection.closeMode === "session") {
+        try {
+          await actor.returnToWarmup();
+        } catch {}
+      } else {
+        try {
+          if (connection.closeMode === "session") {
+            await connection.session.closeSession(connection.viewerId);
+          } else {
+            await connection.session.disconnectViewer(connection.viewerId);
+          }
+        } catch {}
+        this.connectedViewers.delete(publicKey);
+        this.emit("viewer-disconnected", publicKey);
+      }
       disconnected++;
 
       if (
         this.connectedViewers.size > 0 &&
         !this.slowStopCancelled &&
-        gap > 0
+        maxGap > 0
       ) {
-        await new Promise((r) => setTimeout(r, gap));
+        await this.sleep(this.randomDelayMs(minGap, maxGap));
       }
     }
 

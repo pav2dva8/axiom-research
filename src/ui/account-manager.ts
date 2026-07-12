@@ -115,6 +115,11 @@ interface KeepWarmStartOptions extends KeepWarmTimingInput {
   onBanSignal?: (info: BanSignalInfo) => void;
 }
 
+interface KeepWarmViewerDirector {
+  startWarmupForGroups(groups: WarmProxyViewerGroup[]): Promise<void>;
+  stopWarmup(): Promise<void>;
+}
+
 interface WarmProxySessionsOptions extends KeepWarmTimingInput {
   openProxySession?: (group: ProxyAccountGroup) => Promise<BrowserSession>;
 }
@@ -212,6 +217,7 @@ export class AccountManager {
   private keyCache: Map<string, string> = new Map();
   private keysMtime = 0;
   private bannedRemovalBackupPath: string | null = null;
+  private viewerDirector: KeepWarmViewerDirector | null = null;
 
   constructor() {
     this.ensureDirs();
@@ -1202,6 +1208,7 @@ export class AccountManager {
   stopReloginAll(): void {
     this.stopRelogin = true;
     this.keepWarm.running = false;
+    this.viewerDirector?.stopWarmup().catch(() => {});
     this.closeKeepWarmProxySessions();
     if (this.reloginSession) {
       this.reloginSession.close().catch(() => {});
@@ -1215,6 +1222,10 @@ export class AccountManager {
 
   setBrowserSession(session: BrowserSession): void {
     this.reloginSession = session;
+  }
+
+  setViewerService(viewerDirector: KeepWarmViewerDirector | null): void {
+    this.viewerDirector = viewerDirector;
   }
 
   private buildProxyGroupsForPool(pool: string[], proxies: ProxyConfig[]): ProxyAccountGroup[] {
@@ -1366,6 +1377,28 @@ export class AccountManager {
       for (const publicKey of group.accounts) sessions.set(publicKey, group.session);
     }
     return { ok: true, sessions };
+  }
+
+  private loadedAccountsForPublicKeys(publicKeys: string[]): LoadedAccount[] {
+    return publicKeys
+      .map((publicKey) => this.loadAccount(publicKey))
+      .filter((account): account is LoadedAccount => !!account);
+  }
+
+  private async startViewerWarmupForGroup(
+    group: { id: number; label: string; accounts: string[] },
+    session: BrowserSession,
+  ): Promise<void> {
+    const accounts = this.loadedAccountsForPublicKeys(group.accounts);
+    if (accounts.length === 0) return;
+    await this.viewerDirector?.startWarmupForGroups([
+      {
+        id: group.id,
+        label: group.label,
+        session,
+        accounts,
+      },
+    ]);
   }
 
   async warmProxySessionsForAccounts(
@@ -1687,6 +1720,7 @@ export class AccountManager {
             (message) => onProgress?.(message, true),
           ));
       this.keepWarmProxySessions.set(group.id, next);
+      await this.startViewerWarmupForGroup(group, next);
       return next;
     };
 
@@ -1716,6 +1750,8 @@ export class AccountManager {
     }
     if (proxyMode) {
       this.keepWarmProxyGroups = new Map(groups.map((group) => [group.id, group]));
+    } else if (browser) {
+      await this.startViewerWarmupForGroup(groups[0], browser);
     }
 
     onProgress?.(
@@ -1867,6 +1903,7 @@ export class AccountManager {
 
   stopKeepLoggedIn(): void {
     this.keepWarm.running = false;
+    this.viewerDirector?.stopWarmup().catch(() => {});
     this.closeKeepWarmProxySessions();
   }
 
