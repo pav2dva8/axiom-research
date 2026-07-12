@@ -22,7 +22,7 @@ import { buildSignMessage } from './auth';
  * Viewer-manager script installed on every page in the context via
  * `addInitScript`. Exposes:
  *   - __connectViewerStart(id, tokenInfo, opts) → number (sync)
- *       Synchronously constructs the cluster9 + friends WebSocket pair so
+ *       Synchronously constructs the discovered cluster + friends WebSocket pair so
  *       cookies are captured at the moment of construction. Stores a Promise
  *       in `__pendingPromises[id]` that resolves when both handshakes open.
  *   - __connectViewerAwait(id) → Promise<number>
@@ -46,19 +46,22 @@ const VIEWER_MANAGER_SCRIPT = `
   window.__viewers = {};
   window.__pendingPromises = {};
 
-  var CLUSTER_URL = 'wss://cluster9.axiom.trade/';
   var FRIENDS_URL = 'wss://friends.axiom.trade/ws';
 
   window.__connectViewerStart = function(id, tokenInfo, opts) {
     opts = opts || {};
     var pingJitterMs = typeof opts.pingJitterMs === 'number' ? opts.pingJitterMs : Math.floor(Math.random() * 1000);
     var pairAddress = tokenInfo.pairAddress;
+    var clusterUrl = (typeof opts.clusterUrl === 'string' && opts.clusterUrl)
+      ? opts.clusterUrl
+      : (window.__axiomClusterUrl || 'wss://cluster8.axiom.trade/');
+    var clusterLabel = String(clusterUrl).split('/')[2] || 'cluster';
 
     var resolveFn, rejectFn;
     var promise = new Promise(function(res, rej) { resolveFn = res; rejectFn = rej; });
     window.__pendingPromises[id] = promise;
 
-    var clusterWs = new WebSocket(CLUSTER_URL);
+    var clusterWs = new WebSocket(clusterUrl);
     var friendsWs = new WebSocket(FRIENDS_URL);
     var timeout = setTimeout(function() { fail('WS timeout'); }, 12000);
 
@@ -116,7 +119,7 @@ const VIEWER_MANAGER_SCRIPT = `
       for (var i = 0; i < tokenRooms.length; i++) {
         clusterWs.send(JSON.stringify({ action: 'join', room: tokenRooms[i] }));
       }
-      console.log('[viewer ' + id + '] cluster9 joined ' + tokenRooms.length + ' rooms (e-' + pairAddress.slice(0, 6) + '...)');
+      console.log('[viewer ' + id + '] ' + clusterLabel + ' joined ' + tokenRooms.length + ' rooms (e-' + pairAddress.slice(0, 6) + '...)');
       clusterOpen = true;
       tryResolve();
     };
@@ -129,11 +132,11 @@ const VIEWER_MANAGER_SCRIPT = `
       } catch (_) {}
     };
     clusterWs.onerror = function() {
-      console.log('[viewer ' + id + '] cluster9 error event');
+      console.log('[viewer ' + id + '] ' + clusterLabel + ' error event');
     };
     clusterWs.onclose = function(e) {
       var dt = Date.now() - tStart;
-      console.log('[viewer ' + id + '] cluster9 closed code=' + e.code + ' clean=' + e.wasClean + ' reason="' + (e.reason || '') + '" after ' + dt + 'ms');
+      console.log('[viewer ' + id + '] ' + clusterLabel + ' closed code=' + e.code + ' clean=' + e.wasClean + ' reason="' + (e.reason || '') + '" after ' + dt + 'ms');
       var v = window.__viewers[id];
       if (v) {
         clearTimeout(v.friendsPingStart);
@@ -141,7 +144,7 @@ const VIEWER_MANAGER_SCRIPT = `
         clearInterval(v.clusterPingTimer);
         delete window.__viewers[id];
       }
-      if (!settled) fail('cluster9 closed code=' + e.code + (e.reason ? ' reason=' + e.reason : ''));
+      if (!settled) fail(clusterLabel + ' closed code=' + e.code + (e.reason ? ' reason=' + e.reason : ''));
     };
 
     friendsWs.onopen = function() {
@@ -211,23 +214,33 @@ const VIEWER_MANAGER_SCRIPT = `
 `;
 
 const TURNSTILE_SITEKEY = '0x4AAAAAACb1mthF4yHVUfUh';
-// Axiom shards its API across apiN.axiom.trade hosts and rotates which one the
-// frontend uses. As of 2026-06 the live site used api7 for /wallet-nonce +
-// /verify-wallet-v2 (api2 is stale and 500s on verify). Keep api7 first, but
-// try the same live shards as refresh if a shard returns an endpoint/server
-// style failure.
-export const LOGIN_API_HOSTS = [
-  'api7.axiom.trade',
+// Axiom shards its API across apiN.axiom.trade hosts. Do not prefer a fixed
+// shard: probe which ones are healthy for this browser/proxy session and use
+// that. These lists are only the probe/fallback namespace.
+export const API_SHARD_PROBE_HOSTS = [
+  'api2.axiom.trade',
   'api3.axiom.trade',
+  'api4.axiom.trade',
+  'api5.axiom.trade',
+  'api6.axiom.trade',
+  'api7.axiom.trade',
+  'api8.axiom.trade',
   'api9.axiom.trade',
+  'api10.axiom.trade',
 ] as const;
-export const AXIOM_BROWSER_PAGE_URL = 'https://axiom.trade/terms';
+
+/** Fallback namespace when session probe has not picked an apiN yet (no preferred shard). */
+export const LOGIN_API_HOSTS = API_SHARD_PROBE_HOSTS;
+export const AXIOM_BROWSER_PAGE_URL = 'https://axiom.trade/terms?chain=sol';
 const DEBUG_PORT = 9222;
 
 export interface BrowserSession {
   loginAccount(wallet: WalletInfo): Promise<AuthTokens>;
+  /** Same as loginAccount but with allowRegistration: true (fresh wallet signup). */
+  signupAccount(wallet: WalletInfo): Promise<AuthTokens>;
   getCfData(): Promise<{ cfCookies: string; userAgent: string }>;
   fetchPairInfo(pairAddress: string): Promise<any | null>;
+  fetchMemeTrending(): Promise<unknown>;
   resolvePairFromCa(ca: string, accessToken?: string, refreshToken?: string): Promise<any | null>;
   /**
    * Run the session bootstrap that the real client fires on every page load
@@ -236,6 +249,10 @@ export interface BrowserSession {
    * even though the account is otherwise logged in.
    */
   bootstrapSession(walletAddress: string, accessToken: string, refreshToken: string): Promise<void>;
+  /** Discovered apiN + clusterN for this browser/proxy session (after observe). */
+  getSessionShards(): SessionShards;
+  /** Run portfolio/discover observe once (lazy — skipped at session open). */
+  ensureSessionShards(): Promise<SessionShards>;
   probeEucalyptus(pairAddress: string, accessToken?: string, refreshToken?: string): Promise<void>;
   /**
    * Refresh the access token via Axiom's /refresh-access-token endpoint.
@@ -367,10 +384,6 @@ export function buildChromeWindowArgs(browserWindow?: BrowserWindowOptions): str
   return args;
 }
 
-export function buildAxiomWorkerReadinessUrls(now = Date.now()): string[] {
-  return REFRESH_ACCESS_TOKEN_HOSTS.map((host) => `https://${host}/server-time?v=${now}`);
-}
-
 async function resolveBrowserWindowBounds(
   page: Page,
   browserWindow: BrowserWindowOptions | undefined,
@@ -447,7 +460,15 @@ export function isRefreshResponseSuccessful(resultOk: boolean, realStatus: numbe
 }
 
 export function isLoginHostRetryableStatus(status: number): boolean {
-  return status === 0 || status === 404 || status === 408 || status === 418 || status === 429 || status >= 500;
+  return (
+    status === 0 ||
+    status === 404 ||
+    status === 408 ||
+    status === 417 ||
+    status === 418 ||
+    status === 429 ||
+    status >= 500
+  );
 }
 
 export function isCloudflareChallengePage(url: string, html: string): boolean {
@@ -463,7 +484,7 @@ function isLoginHostRetryableError(stage: string, status: number): boolean {
 interface LoginVerifyPayload {
   walletAddress: string;
   allowLinking: false;
-  allowRegistration: false;
+  allowRegistration: boolean;
   forAddCredential: false;
   isVerify: false;
   nonce: string;
@@ -476,6 +497,8 @@ interface LoginVerifyPayload {
 export interface RunLoginApiHostVerificationOptions {
   hosts: readonly string[];
   walletPublicKey: string;
+  /** Fresh-account signup when true; existing-account login when false/omitted. */
+  allowRegistration?: boolean;
   getNonce(host: string, walletPublicKey: string): Promise<string>;
   signNonce(nonce: string): string;
   getTurnstileToken(): Promise<string>;
@@ -506,7 +529,7 @@ export async function runLoginApiHostVerification(
       await opts.verify(host, {
         walletAddress: opts.walletPublicKey,
         allowLinking: false,
-        allowRegistration: false,
+        allowRegistration: opts.allowRegistration === true,
         forAddCredential: false,
         isVerify: false,
         nonce,
@@ -529,13 +552,100 @@ export async function runLoginApiHostVerification(
   throw lastHostErr || new Error('Login failed: no login API hosts tried');
 }
 
-// Observed from the live frontend: api10 can return 418 for refresh, while
-// api3 returns 200. Keep api3 first and avoid the teapot shard.
-export const REFRESH_ACCESS_TOKEN_HOSTS = [
-  'api3.axiom.trade',
-  'api9.axiom.trade',
-  'api7.axiom.trade',
-] as const;
+/** Fallback namespace only — session probe picks the live shard first. */
+export const REFRESH_ACCESS_TOKEN_HOSTS = API_SHARD_PROBE_HOSTS;
+
+/** Default cluster WS when CDP discovery has not observed one yet. */
+export const DEFAULT_CLUSTER_WS_URL = 'wss://cluster8.axiom.trade/';
+
+/**
+ * Fallback pages if /terms does not emit apiN + clusterN (rare).
+ * Primary discovery is CDP on AXIOM_BROWSER_PAGE_URL — terms opens both.
+ */
+export const AXIOM_SHARD_DISCOVERY_URL = 'https://axiom.trade/portfolio?chain=sol';
+export const AXIOM_SHARD_DISCOVERY_FALLBACK_URL = 'https://axiom.trade/discover?chain=sol';
+
+const AXIOM_API_HOST_RE = /^api\d+\.axiom\.trade$/i;
+const AXIOM_CLUSTER_HOST_RE = /^cluster\d+\.axiom\.trade$/i;
+
+export interface SessionShards {
+  apiHost: string | null;
+  clusterWsUrl: string;
+}
+
+export function parseAxiomApiHost(url: string): string | null {
+  try {
+    const host = new URL(url).hostname.toLowerCase();
+    return AXIOM_API_HOST_RE.test(host) ? host : null;
+  } catch {
+    return null;
+  }
+}
+
+export function normalizeClusterWsUrl(url: string): string {
+  const trimmed = url.trim();
+  if (!trimmed) return trimmed;
+  return trimmed.endsWith('/') ? trimmed : `${trimmed}/`;
+}
+
+export function parseAxiomClusterWsUrl(url: string): string | null {
+  try {
+    const u = new URL(url);
+    if (u.protocol !== 'wss:' && u.protocol !== 'ws:') return null;
+    const host = u.hostname.toLowerCase();
+    if (!AXIOM_CLUSTER_HOST_RE.test(host)) return null;
+    return normalizeClusterWsUrl(`wss://${host}/`);
+  } catch {
+    return null;
+  }
+}
+
+export function clusterHostFromWsUrl(url: string): string | null {
+  try {
+    return new URL(url).hostname.toLowerCase() || null;
+  } catch {
+    return null;
+  }
+}
+
+export function preferApiHosts(
+  discovered: string | null | undefined,
+  fallbacks: readonly string[],
+): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const host of [discovered, ...fallbacks]) {
+    if (!host || seen.has(host)) continue;
+    seen.add(host);
+    out.push(host);
+  }
+  return out;
+}
+
+/** Pick one healthy apiN for this session (randomized so proxy groups diversify). */
+export function chooseDiscoveredApiHost(
+  healthyHosts: readonly string[],
+  random: () => number = Math.random,
+): string | null {
+  if (healthyHosts.length === 0) return null;
+  const idx = Math.min(healthyHosts.length - 1, Math.max(0, Math.floor(random() * healthyHosts.length)));
+  return healthyHosts[idx] ?? null;
+}
+
+/** Login/refresh host order: discovered first, then remaining probe hosts (stable unique). */
+export function apiHostsForLoginOrRefresh(
+  discovered: string | null | undefined,
+  fallbacks: readonly string[] = API_SHARD_PROBE_HOSTS,
+): string[] {
+  return preferApiHosts(discovered ?? null, fallbacks);
+}
+
+export function buildAuthCookieDomains(clusterWsUrl?: string | null): string[] {
+  const clusterHost =
+    clusterHostFromWsUrl(clusterWsUrl || DEFAULT_CLUSTER_WS_URL) ||
+    clusterHostFromWsUrl(DEFAULT_CLUSTER_WS_URL)!;
+  return [clusterHost, 'friends.axiom.trade', '.axiom.trade'];
+}
 
 function findChrome(): string {
   const candidates = [
@@ -890,9 +1000,31 @@ export async function openBrowserSession(options: BrowserSessionOptions = {}): P
   // After WS objects are constructed (synchronous), cookies are captured
   // and the lock is released.
   const wsUrlByReq = new Map<string, string>();
+  let observedApiHost: string | null = null;
+  let observedClusterWsUrl: string | null = null;
+  let sessionShards: SessionShards = {
+    apiHost: null,
+    clusterWsUrl: DEFAULT_CLUSTER_WS_URL,
+  };
+
+  function noteNetworkUrl(url: string | undefined): void {
+    if (!url) return;
+    if (!observedApiHost) {
+      const apiHost = parseAxiomApiHost(url);
+      if (apiHost) observedApiHost = apiHost;
+    }
+    if (!observedClusterWsUrl) {
+      const clusterWs = parseAxiomClusterWsUrl(url);
+      if (clusterWs) observedClusterWsUrl = clusterWs;
+    }
+  }
+
   function tag(reqId: string): string {
     const u = wsUrlByReq.get(reqId) || reqId;
-    return u.includes('cluster9') ? 'cluster9' : u.includes('friends') ? 'friends' : u;
+    const cluster = parseAxiomClusterWsUrl(u);
+    if (cluster) return clusterHostFromWsUrl(cluster) || 'cluster';
+    if (u.includes('friends')) return 'friends';
+    return u;
   }
 
   // CDP-observed outcome of the most recent /refresh-access-token request. The
@@ -909,11 +1041,13 @@ export async function openBrowserSession(options: BrowserSessionOptions = {}): P
     await cdp.send('Network.enable');
     cdp.on('Network.requestWillBeSent', ({ requestId, request }: any) => {
       if (request?.url?.includes('refresh-access-token')) refreshReqIds.add(requestId);
+      noteNetworkUrl(request?.url);
     });
     cdp.on('Network.responseReceived', ({ requestId, response }: any) => {
       if (refreshReqIds.has(requestId)) {
         lastRefreshNetwork = { status: response?.status ?? null, statusText: response?.statusText ?? '', failed: false, error: null, ts: Date.now() };
       }
+      noteNetworkUrl(response?.url);
     });
     cdp.on('Network.loadingFailed', ({ requestId, errorText, blockedReason, corsErrorStatus }: any) => {
       if (refreshReqIds.has(requestId)) {
@@ -925,6 +1059,7 @@ export async function openBrowserSession(options: BrowserSessionOptions = {}): P
     cdp.on('Network.loadingFinished', ({ requestId }: any) => { refreshReqIds.delete(requestId); });
     cdp.on('Network.webSocketCreated', ({ requestId, url }: any) => {
       wsUrlByReq.set(requestId, url);
+      noteNetworkUrl(url);
     });
     cdp.on('Network.webSocketHandshakeResponseReceived', ({ requestId, response }: any) => {
       const status = response?.status;
@@ -940,72 +1075,150 @@ export async function openBrowserSession(options: BrowserSessionOptions = {}): P
       if (response.payloadData) console.log(`[CDP←${tag(requestId)}]`, response.payloadData.slice(0, 300));
     });
     cdp.on('Network.webSocketFrameError', ({ requestId, errorMessage }: any) => {
+      const msg = String(errorMessage || '');
+      // Portfolio/discover without auth cookies retries clusterN and floods this.
+      if (/HTTP Authentication failed/i.test(msg)) return;
       console.log(`[CDP] ${tag(requestId)} frame error: ${errorMessage}`);
     });
     cdp.on('Network.webSocketClosed', ({ requestId }) => {
-      console.log(`[CDP] ${tag(requestId)} closed`);
+      const label = tag(requestId);
+      // Ignore unauthenticated cluster reconnect churn after shard discovery.
+      if (!/^cluster\d+/i.test(label)) {
+        console.log(`[CDP] ${label} closed`);
+      }
       wsUrlByReq.delete(requestId);
     });
-  }
-
-  async function waitForAxiomWorkerPageReady(p: Page): Promise<void> {
-    let last = 'not checked';
-    for (let attempt = 1; attempt <= 8; attempt++) {
-      const urls = buildAxiomWorkerReadinessUrls();
-      const result = await p.evaluate(async (probeUrls) => {
-        let lastResult = 'no probe urls';
-        for (const url of probeUrls) {
-          try {
-            const r = await fetch(url, { credentials: 'include' });
-            lastResult = `${url} status=${r.status}`;
-            if (r.ok) return { ok: true, detail: lastResult };
-          } catch (e: any) {
-            lastResult = `${url} fetch=${e?.message || String(e)}`;
-          }
-        }
-        return { ok: false, detail: lastResult };
-      }, urls).catch((err: any) => ({ ok: false, detail: `evaluate=${err?.message || err}` }));
-
-      last = result.detail;
-      if (result.ok) {
-        if (attempt > 1) console.log(`${logPrefix} Axiom worker page network ready after ${attempt} probe(s)`);
-        await p.waitForTimeout(1000);
-        return;
-      }
-
-      if (attempt === 1) {
-        console.log(`${logPrefix} Waiting for Axiom worker page network before refresh...`);
-      }
-      await p.waitForTimeout(1000);
-    }
-
-    console.warn(`${logPrefix} Axiom worker page network did not confirm readiness (${last}); continuing`);
   }
 
   async function setupFriendsPage(): Promise<Page> {
     const p = await context.newPage();
     await attachProxyAuthToPage(p);
-    await p.goto(AXIOM_BROWSER_PAGE_URL, { waitUntil: 'load', timeout: 30000 }).catch(() => {});
-    await p.waitForTimeout(500);
     p.on('console', msg => {
       const t = msg.text();
       if (t.startsWith('[viewer ') || t.startsWith('[viewer]')) console.log('[Browser]', t);
     });
+    // CDP before goto so the first /terms load's apiN + clusterN are observed.
     await attachCdpListenersTo(p);
-    await waitForAxiomWorkerPageReady(p);
+    await p.goto(AXIOM_BROWSER_PAGE_URL, { waitUntil: 'load', timeout: 30000 }).catch(() => {});
+    await p.waitForTimeout(500);
     return p;
+  }
+
+  async function applyClusterUrlToPages(clusterWsUrl: string): Promise<void> {
+    await Promise.all(
+      friendsPages.map((p) =>
+        p.evaluate((url) => {
+          (window as any).__axiomClusterUrl = url;
+        }, clusterWsUrl).catch(() => {}),
+      ),
+    );
+  }
+
+  function apiHostsForSession(extraFallbacks: readonly string[] = []): string[] {
+    return apiHostsForLoginOrRefresh(sessionShards.apiHost, [
+      ...API_SHARD_PROBE_HOSTS,
+      ...extraFallbacks,
+    ]);
+  }
+
+  async function waitForObservedShards(timeoutMs: number): Promise<void> {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      if (observedApiHost && observedClusterWsUrl) return;
+      await friendsPage.waitForTimeout(250);
+    }
+  }
+
+  function commitSessionShards(source: string): void {
+    sessionShards = {
+      apiHost: observedApiHost || sessionShards.apiHost,
+      clusterWsUrl: observedClusterWsUrl || sessionShards.clusterWsUrl || DEFAULT_CLUSTER_WS_URL,
+    };
+    shardsDiscovered = !!(sessionShards.apiHost && observedClusterWsUrl);
+    console.log(
+      `${logPrefix} Session shards (${source}) api=${sessionShards.apiHost || 'unobserved'} cluster=${sessionShards.clusterWsUrl}`,
+    );
+  }
+
+  /** CDP on /terms — live SPA hits apiN + opens clusterN (confirmed on terms?chain=sol). */
+  async function discoverShardsFromTerms(): Promise<void> {
+    console.log(`${logPrefix} Observing shards via ${AXIOM_BROWSER_PAGE_URL}...`);
+    await waitForObservedShards(10000);
+    commitSessionShards('terms');
+    if (sessionShards.apiHost && observedClusterWsUrl) {
+      await applyClusterUrlToPages(sessionShards.clusterWsUrl);
+      return;
+    }
+    console.warn(
+      `${logPrefix} Terms did not emit full shards (api=${observedApiHost || '-'} cluster=${observedClusterWsUrl || '-'}); will fallback if viewers need them`,
+    );
+    if (observedClusterWsUrl) await applyClusterUrlToPages(sessionShards.clusterWsUrl);
+  }
+
+  /** Portfolio/discover only if terms missed apiN or clusterN. */
+  async function discoverSessionShardsFallback(): Promise<void> {
+    const pages = [AXIOM_SHARD_DISCOVERY_URL, AXIOM_SHARD_DISCOVERY_FALLBACK_URL];
+    for (let i = 0; i < pages.length; i++) {
+      const url = pages[i];
+      if (observedApiHost && observedClusterWsUrl) break;
+      console.log(`${logPrefix} Observing shards via ${url}...`);
+      await friendsPage.goto(url, { waitUntil: 'domcontentloaded', timeout: 45000 }).catch((err: any) => {
+        console.warn(`${logPrefix} shard discovery navigation failed: ${err?.message || err}`);
+      });
+      await waitForObservedShards(i === 0 ? 12000 : 8000);
+      if (observedClusterWsUrl && observedApiHost) break;
+    }
+
+    commitSessionShards('portfolio/discover fallback');
+    await applyClusterUrlToPages(sessionShards.clusterWsUrl);
+
+    // Leave portfolio/discover so unauthenticated cluster reconnect spam stops.
+    await friendsPage.goto(AXIOM_BROWSER_PAGE_URL, { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
+  }
+
+  let shardsDiscovered = false;
+  let shardDiscoveryPromise: Promise<void> | null = null;
+  async function ensureSessionShards(): Promise<SessionShards> {
+    if (shardsDiscovered && sessionShards.apiHost && observedClusterWsUrl) return sessionShards;
+    if (!shardDiscoveryPromise) {
+      shardDiscoveryPromise = (async () => {
+        if (!(observedApiHost && observedClusterWsUrl)) {
+          await discoverSessionShardsFallback();
+        } else {
+          commitSessionShards('cached');
+          await applyClusterUrlToPages(sessionShards.clusterWsUrl);
+        }
+      })().catch((err) => {
+        shardsDiscovered = true;
+        sessionShards = {
+          apiHost: observedApiHost || sessionShards.apiHost,
+          clusterWsUrl: observedClusterWsUrl || DEFAULT_CLUSTER_WS_URL,
+        };
+        console.warn(
+          `${logPrefix} Shard discovery failed (${err?.message || err}); using ${sessionShards.clusterWsUrl}`,
+        );
+      });
+    }
+    await shardDiscoveryPromise;
+    return sessionShards;
   }
 
   const friendsPages: Page[] = [];
   friendsPages.push(await setupFriendsPage());
   const friendsPage = friendsPages[0]; // primary for non-pool operations (resolvePairFromCa, bootstrapSession)
-  console.log(`${logPrefix} Axiom page ready for WS connections`);
+  // /terms?chain=sol already emits apiN + clusterN — observe via CDP (no portfolio).
+  await discoverShardsFromTerms();
+  console.log(`${logPrefix} Axiom page ready`);
   browserReadyForMinimize = true;
   await parkReadyBrowserWindow();
 
   async function ensurePageSlots(n: number): Promise<void> {
     while (friendsPages.length < n) {
-      friendsPages.push(await setupFriendsPage());
+      const p = await setupFriendsPage();
+      friendsPages.push(p);
+      await p.evaluate((url) => {
+        (window as any).__axiomClusterUrl = url;
+      }, sessionShards.clusterWsUrl).catch(() => {});
       console.log(`[BrowserAuth] friendsPage pool grew to ${friendsPages.length}`);
     }
   }
@@ -1055,123 +1268,145 @@ export async function openBrowserSession(options: BrowserSessionOptions = {}): P
     return token as string;
   }
 
+  async function authenticateWallet(
+    wallet: WalletInfo,
+    allowRegistration: boolean,
+  ): Promise<AuthTokens> {
+    const MAX_ATTEMPTS = 3;
+    let lastErr: any;
+    const action = allowRegistration ? 'Signing up' : 'Logging in';
+    const doneLabel = allowRegistration ? 'Signup' : 'Login';
+
+    // A Cloudflare re-challenge (or SPA redirect) can navigate the main page
+    // mid-login and destroy the JS execution context of the in-flight
+    // Turnstile evaluate ("Execution context was destroyed, most likely
+    // because of a navigation"). On that specific, navigation-caused error we
+    // re-clear the page and retry — bounded — instead of failing the account.
+    for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+      try {
+        console.log(`[BrowserAuth] ${action} wallet: ${wallet.publicKey} (attempt ${attempt}/${MAX_ATTEMPTS})`);
+
+        // 0. Recover from any CF re-challenge / navigation that wiped the main
+        //    page since the previous attempt, before the long Turnstile evaluate.
+        await ensureMainPageReady();
+
+        await runLoginApiHostVerification({
+          hosts: apiHostsForLoginOrRefresh(sessionShards.apiHost),
+          walletPublicKey: wallet.publicKey,
+          allowRegistration,
+          getNonce: async (host, walletPublicKey) => {
+            console.log(`[BrowserAuth] Trying login API host ${host}`);
+            const nonceRes = await apiPostFromPage(host, '/wallet-nonce', JSON.stringify({
+              walletAddress: walletPublicKey,
+              v: Date.now(),
+            }));
+            if (nonceRes.status < 200 || nonceRes.status >= 300) {
+              const err: any = new Error(`Nonce failed on ${host}: ${nonceRes.status} - ${nonceRes.body}`);
+              err.status = nonceRes.status;
+              err.host = host;
+              throw err;
+            }
+            console.log(`[BrowserAuth] Got nonce from ${host}:`, nonceRes.body);
+            return nonceRes.body;
+          },
+          signNonce: (nonce) => {
+            const message = buildSignMessage(nonce);
+            const signature = nacl.sign.detached(new TextEncoder().encode(message), wallet.secretKey);
+            return bs58.encode(signature);
+          },
+          getTurnstileToken,
+          verify: async (host, payload) => {
+            const verifyRes = await apiPostFromPage(host, '/verify-wallet-v2', JSON.stringify(payload));
+            if (verifyRes.status < 200 || verifyRes.status >= 300) {
+              const err: any = new Error(`Verify failed on ${host}: ${verifyRes.status} - ${verifyRes.body}`);
+              err.status = verifyRes.status;
+              err.host = host;
+              throw err;
+            }
+            console.log(`[BrowserAuth] Verify response received from ${host}`);
+          },
+          onHostFailure: async (host, status, message) => {
+            await context.clearCookies({ name: 'auth-access-token' }).catch(() => {});
+            await context.clearCookies({ name: 'auth-refresh-token' }).catch(() => {});
+            console.warn(`[BrowserAuth] Login API host ${host} failed (${status || 'network'}): ${message.split('\n')[0]}; trying next host...`);
+          },
+        });
+
+        // Extract auth + CF cookies from browser.
+        await page.waitForTimeout(500);
+        const browserCookies = await context.cookies();
+        let accessToken = '';
+        let refreshToken = '';
+        const parts: string[] = [];
+        const seen = new Set<string>();
+
+        for (const c of browserCookies) {
+          // Auth cookies
+          if (c.name === 'auth-access-token') { accessToken = c.value; }
+          if (c.name === 'auth-refresh-token') { refreshToken = c.value; }
+
+          // Include auth + CF cookies (needed for API and WS connections)
+          if (c.name.startsWith('auth-') || c.name === 'cf_clearance' || c.name === '__cf_bm') {
+            const key = `${c.name}=${c.value}`;
+            if (!seen.has(c.name)) {
+              seen.add(c.name);
+              parts.push(key);
+            }
+          }
+        }
+
+        if (!accessToken) {
+          throw new Error('No auth cookies received after verify');
+        }
+
+        console.log(`[BrowserAuth] ${doneLabel} successful! Access token:`, accessToken.slice(0, 20) + '...');
+        console.log('[BrowserAuth] Cookie types:', [...seen].join(', '));
+
+        // Clear auth cookies so next account starts fresh (keep CF cookies)
+        await context.clearCookies({ name: 'auth-access-token' });
+        await context.clearCookies({ name: 'auth-refresh-token' });
+
+        return {
+          accessToken,
+          refreshToken,
+          cookies: parts.join('; '),
+        };
+      } catch (err: any) {
+        lastErr = err;
+        const emsg = String(err?.message || err);
+        // Playwright's symptom of a navigation landing mid-evaluate.
+        const navRace = /Execution context was destroyed|frame (?:was |got )?detached|because of (?:a )?navigation/i.test(emsg);
+        if (navRace && attempt < MAX_ATTEMPTS) {
+          console.warn(`[BrowserAuth] ${doneLabel} attempt ${attempt}/${MAX_ATTEMPTS} hit a page navigation (${emsg.split('\n')[0]}); recovering & retrying...`);
+          await page.waitForTimeout(1000);
+          continue;
+        }
+        throw err;
+      }
+    }
+
+    throw lastErr;
+  }
+
   return {
     async probeEucalyptus(pairAddress: string, accessToken?: string, refreshToken?: string): Promise<void> {
       return probeEucalyptusMessages(pairAddress, accessToken, refreshToken);
     },
 
+    getSessionShards(): SessionShards {
+      return { ...sessionShards };
+    },
+
+    async ensureSessionShards(): Promise<SessionShards> {
+      return ensureSessionShards();
+    },
+
     async loginAccount(wallet: WalletInfo): Promise<AuthTokens> {
-      const MAX_ATTEMPTS = 3;
-      let lastErr: any;
+      return authenticateWallet(wallet, false);
+    },
 
-      // A Cloudflare re-challenge (or SPA redirect) can navigate the main page
-      // mid-login and destroy the JS execution context of the in-flight
-      // Turnstile evaluate ("Execution context was destroyed, most likely
-      // because of a navigation"). On that specific, navigation-caused error we
-      // re-clear the page and retry — bounded — instead of failing the account.
-      for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
-        try {
-          console.log(`[BrowserAuth] Logging in wallet: ${wallet.publicKey} (attempt ${attempt}/${MAX_ATTEMPTS})`);
-
-          // 0. Recover from any CF re-challenge / navigation that wiped the main
-          //    page since the previous attempt, before the long Turnstile evaluate.
-          await ensureMainPageReady();
-
-          await runLoginApiHostVerification({
-            hosts: LOGIN_API_HOSTS,
-            walletPublicKey: wallet.publicKey,
-            getNonce: async (host, walletPublicKey) => {
-              console.log(`[BrowserAuth] Trying login API host ${host}`);
-              const nonceRes = await apiPostFromPage(host, '/wallet-nonce', JSON.stringify({
-                walletAddress: walletPublicKey,
-                v: Date.now(),
-              }));
-              if (nonceRes.status < 200 || nonceRes.status >= 300) {
-                const err: any = new Error(`Nonce failed on ${host}: ${nonceRes.status} - ${nonceRes.body}`);
-                err.status = nonceRes.status;
-                err.host = host;
-                throw err;
-              }
-              console.log(`[BrowserAuth] Got nonce from ${host}:`, nonceRes.body);
-              return nonceRes.body;
-            },
-            signNonce: (nonce) => {
-              const message = buildSignMessage(nonce);
-              const signature = nacl.sign.detached(new TextEncoder().encode(message), wallet.secretKey);
-              return bs58.encode(signature);
-            },
-            getTurnstileToken,
-            verify: async (host, payload) => {
-              const verifyRes = await apiPostFromPage(host, '/verify-wallet-v2', JSON.stringify(payload));
-              if (verifyRes.status < 200 || verifyRes.status >= 300) {
-                const err: any = new Error(`Verify failed on ${host}: ${verifyRes.status} - ${verifyRes.body}`);
-                err.status = verifyRes.status;
-                err.host = host;
-                throw err;
-              }
-              console.log(`[BrowserAuth] Verify response received from ${host}`);
-            },
-            onHostFailure: async (host, status, message) => {
-              await context.clearCookies({ name: 'auth-access-token' }).catch(() => {});
-              await context.clearCookies({ name: 'auth-refresh-token' }).catch(() => {});
-              console.warn(`[BrowserAuth] Login API host ${host} failed (${status || 'network'}): ${message.split('\n')[0]}; trying next host...`);
-            },
-          });
-
-          // Extract auth + CF cookies from browser.
-          await page.waitForTimeout(500);
-          const browserCookies = await context.cookies();
-          let accessToken = '';
-          let refreshToken = '';
-          const parts: string[] = [];
-          const seen = new Set<string>();
-
-          for (const c of browserCookies) {
-            // Auth cookies
-            if (c.name === 'auth-access-token') { accessToken = c.value; }
-            if (c.name === 'auth-refresh-token') { refreshToken = c.value; }
-
-            // Include auth + CF cookies (needed for API and WS connections)
-            if (c.name.startsWith('auth-') || c.name === 'cf_clearance' || c.name === '__cf_bm') {
-              const key = `${c.name}=${c.value}`;
-              if (!seen.has(c.name)) {
-                seen.add(c.name);
-                parts.push(key);
-              }
-            }
-          }
-
-          if (!accessToken) {
-            throw new Error('No auth cookies received after verify');
-          }
-
-          console.log('[BrowserAuth] Login successful! Access token:', accessToken.slice(0, 20) + '...');
-          console.log('[BrowserAuth] Cookie types:', [...seen].join(', '));
-
-          // Clear auth cookies so next account starts fresh (keep CF cookies)
-          await context.clearCookies({ name: 'auth-access-token' });
-          await context.clearCookies({ name: 'auth-refresh-token' });
-
-          return {
-            accessToken,
-            refreshToken,
-            cookies: parts.join('; '),
-          };
-        } catch (err: any) {
-          lastErr = err;
-          const emsg = String(err?.message || err);
-          // Playwright's symptom of a navigation landing mid-evaluate.
-          const navRace = /Execution context was destroyed|frame (?:was |got )?detached|because of (?:a )?navigation/i.test(emsg);
-          if (navRace && attempt < MAX_ATTEMPTS) {
-            console.warn(`[BrowserAuth] Login attempt ${attempt}/${MAX_ATTEMPTS} hit a page navigation (${emsg.split('\n')[0]}); recovering & retrying...`);
-            await page.waitForTimeout(1000);
-            continue;
-          }
-          throw err;
-        }
-      }
-
-      throw lastErr;
+    async signupAccount(wallet: WalletInfo): Promise<AuthTokens> {
+      return authenticateWallet(wallet, true);
     },
 
     async refreshAccount(oldRefreshToken: string): Promise<AuthTokens> {
@@ -1180,7 +1415,7 @@ export async function openBrowserSession(options: BrowserSessionOptions = {}): P
       // context first) and responds with Set-Cookie for the new access token
       // (and usually a rotated refresh token). CORS allow-origin is
       // https://axiom.trade, so the fetch MUST run on friendsPage.
-      const domains = ['cluster9.axiom.trade', 'friends.axiom.trade', '.axiom.trade'];
+      const domains = buildAuthCookieDomains(sessionShards.clusterWsUrl);
       const cookiesToAdd: { name: string; value: string; domain: string; path: string }[] = [];
       for (const domain of domains) {
         cookiesToAdd.push({ name: 'auth-refresh-token', value: oldRefreshToken, domain, path: '/' });
@@ -1236,7 +1471,7 @@ export async function openBrowserSession(options: BrowserSessionOptions = {}): P
             }
           }
           return lastResult;
-        }, [...REFRESH_ACCESS_TOKEN_HOSTS]);
+        }, apiHostsForSession());
 
         // What CDP saw for this exact request (real status / failure reason),
         // which beats the opaque status 0 the in-page fetch reports when the
@@ -1302,9 +1537,9 @@ export async function openBrowserSession(options: BrowserSessionOptions = {}): P
       // Mirror the HTTP burst the real React client fires on first page load.
       // Empirically: viewer counts drop accounts that haven't called these
       // endpoints — even when otherwise logged in. Calling them appears to
-      // "register" the session server-side so cluster9 includes the user in
+      // "register" the session server-side so the cluster includes the user in
       // the e-{pair} broadcast.
-      const domains = ['cluster9.axiom.trade', 'friends.axiom.trade', '.axiom.trade'];
+      const domains = buildAuthCookieDomains(sessionShards.clusterWsUrl);
       const cookiesToAdd: { name: string; value: string; domain: string; path: string }[] = [];
       for (const domain of domains) {
         cookiesToAdd.push(
@@ -1315,8 +1550,10 @@ export async function openBrowserSession(options: BrowserSessionOptions = {}): P
       await context.addCookies(cookiesToAdd);
 
       try {
-        const results = await friendsPage.evaluate(async (wallet: string) => {
+        const apiHost = sessionShards.apiHost || API_SHARD_PROBE_HOSTS[0];
+        const results = await friendsPage.evaluate(async ({ wallet, host }: { wallet: string; host: string }) => {
           const v = Date.now();
+          const base = 'https://' + host;
           const j = (url: string, init?: RequestInit) => fetch(url, { credentials: 'include', ...(init || {}) })
             .then(r => ({ url, status: r.status }))
             .catch((e: any) => ({ url, error: String(e?.message || e) }));
@@ -1328,18 +1565,18 @@ export async function openBrowserSession(options: BrowserSessionOptions = {}): P
 
           // Order/grouping mirrors the bootstrap probe captured for a real client.
           return Promise.all([
-            POST('https://api9.axiom.trade/bundle-key-and-wallets', { v }),
-            POST('https://api9.axiom.trade/meme-open-positions-v3', { walletAddresses: [wallet], v }),
-            POST('https://api9.axiom.trade/user-nonce-accounts', { userWallets: [wallet], v }),
-            j('https://api9.axiom.trade/tracked-wallets-v3?v=' + v),
-            j('https://api9.axiom.trade/watchlist-v2?v=' + v),
-            j('https://api9.axiom.trade/get-settings?v=' + v),
-            j('https://api9.axiom.trade/get-notifications?v=' + v),
-            j('https://api9.axiom.trade/user-data?v=' + v),
-            j('https://api9.axiom.trade/lighthouse?v=' + v),
-            j('https://api9.axiom.trade/online-users-count?v=' + v),
+            POST(base + '/bundle-key-and-wallets', { v }),
+            POST(base + '/meme-open-positions-v3', { walletAddresses: [wallet], v }),
+            POST(base + '/user-nonce-accounts', { userWallets: [wallet], v }),
+            j(base + '/tracked-wallets-v4?v=' + v),
+            j(base + '/watchlist-v2?v=' + v),
+            j(base + '/get-settings?v=' + v),
+            j(base + '/get-notifications?v=' + v),
+            j(base + '/user-data?v=' + v),
+            j(base + '/lighthouse?v=' + v),
+            j(base + '/online-users-count?v=' + v),
           ]);
-        }, walletAddress);
+        }, { wallet: walletAddress, host: apiHost });
 
         const summary = (results as any[])
           .map(r => r.error ? `ERR(${r.url.split('/').pop()})` : `${r.url.split('/').pop()}=${r.status}`)
@@ -1356,7 +1593,7 @@ export async function openBrowserSession(options: BrowserSessionOptions = {}): P
     },
 
     async fetchPairInfo(pairAddress: string): Promise<any | null> {
-      const hosts = ['api9.axiom.trade', 'api7.axiom.trade', 'api3.axiom.trade', 'api2.axiom.trade'];
+      const hosts = apiHostsForSession();
       for (const host of hosts) {
         try {
           const url = `https://${host}/pair-info?pairAddress=${pairAddress}&v=${Date.now()}`;
@@ -1381,21 +1618,30 @@ export async function openBrowserSession(options: BrowserSessionOptions = {}): P
       return null;
     },
 
+    async fetchMemeTrending(): Promise<unknown> {
+      const host = sessionShards.apiHost || API_SHARD_PROBE_HOSTS[0];
+      const url = `https://${host}/meme-trending-v2?v=${Date.now()}`;
+      return friendsPage.evaluate(async (u) => {
+        const r = await fetch(u, { credentials: 'include' });
+        if (!r.ok) throw new Error('status ' + r.status);
+        return r.json();
+      }, url);
+    },
+
     async connectViewer(accessToken: string, refreshToken: string, tokenInfo: any, pingJitterMs?: number, slotIndex: number = 0): Promise<number> {
       // Pick a page from the pool; default to slot 0 for callers that don't
       // care. viewer-service passes its worker index so each worker owns a
       // distinct page → evaluates run truly in parallel.
       const page = friendsPages[slotIndex % friendsPages.length];
 
+      // Discover clusterN only when actually connecting viewers (not on keep-warm open).
+      const shards = await ensureSessionShards();
+
       // Set this account's auth cookies on every axiom subdomain we touch.
       // The WS handshake reads cookies from the matching domain, so the
-      // auth-access-token must be present for cluster9, friends, AND
-      // .axiom.trade (the wildcard, used as fallback).
-      const domains = [
-        'cluster9.axiom.trade',
-        'friends.axiom.trade',
-        '.axiom.trade',
-      ];
+      // auth-access-token must be present for the discovered cluster, friends,
+      // AND .axiom.trade (the wildcard, used as fallback).
+      const domains = buildAuthCookieDomains(shards.clusterWsUrl);
       const cookiesToAdd: { name: string; value: string; domain: string; path: string }[] = [];
       for (const domain of domains) {
         cookiesToAdd.push(
@@ -1404,7 +1650,10 @@ export async function openBrowserSession(options: BrowserSessionOptions = {}): P
         );
       }
 
-      const opts = { pingJitterMs: typeof pingJitterMs === 'number' ? pingJitterMs : Math.floor(Math.random() * 1000) };
+      const opts = {
+        pingJitterMs: typeof pingJitterMs === 'number' ? pingJitterMs : Math.floor(Math.random() * 1000),
+        clusterUrl: shards.clusterWsUrl,
+      };
       const viewerId = ++nextViewerId;
 
       // Cookie-locked critical section: addCookies → synchronously construct
@@ -1440,7 +1689,7 @@ export async function openBrowserSession(options: BrowserSessionOptions = {}): P
       // cookie-locked critical section, like every other authed op — then
       // clear them. CORS allow-origin is axiom.trade only, so the fetch MUST
       // run on friendsPage.
-      const domains = ['cluster9.axiom.trade', 'friends.axiom.trade', '.axiom.trade'];
+      const domains = buildAuthCookieDomains(sessionShards.clusterWsUrl);
       if (accessToken) {
         const cookiesToAdd: { name: string; value: string; domain: string; path: string }[] = [];
         for (const domain of domains) {
@@ -1450,8 +1699,8 @@ export async function openBrowserSession(options: BrowserSessionOptions = {}): P
         await context.addCookies(cookiesToAdd);
       }
 
-      // A single apiN host can still 502 transiently; try a couple.
-      const hosts = ['api9.axiom.trade', 'api7.axiom.trade', 'api2.axiom.trade'];
+      // A single apiN host can still 502 transiently; try discovered + fallbacks.
+      const hosts = apiHostsForSession();
       try {
         for (const host of hosts) {
           try {

@@ -3,13 +3,15 @@ import assert from "node:assert/strict";
 
 import {
   AXIOM_BROWSER_PAGE_URL,
+  API_SHARD_PROBE_HOSTS,
   LOGIN_API_HOSTS,
   PROXY_BACKGROUND_BROWSER_WINDOW,
   REFRESH_ACCESS_TOKEN_HOSTS,
-  buildAxiomWorkerReadinessUrls,
   buildChromeWindowArgs,
   buildChromeProxyArgs,
   buildProxyKeepWarmBrowserSessionOptions,
+  chooseDiscoveredApiHost,
+  apiHostsForLoginOrRefresh,
   isCloudflareChallengePage,
   isLoginHostRetryableStatus,
   isRefreshResponseSuccessful,
@@ -17,7 +19,7 @@ import {
 } from "../src/browser-auth";
 
 test("browser auth uses the lightweight Axiom page for Cloudflare readiness", () => {
-  assert.equal(AXIOM_BROWSER_PAGE_URL, "https://axiom.trade/terms");
+  assert.equal(AXIOM_BROWSER_PAGE_URL, "https://axiom.trade/terms?chain=sol");
 });
 
 test("Chrome proxy args keep credentials out of proxy-server", () => {
@@ -39,14 +41,6 @@ test("Chrome window args park proxy sessions visibly near the bottom-right", () 
   assert.deepEqual(buildChromeWindowArgs(PROXY_BACKGROUND_BROWSER_WINDOW), [
     "--window-size=480,360",
     "--window-position=1200,700",
-  ]);
-});
-
-test("worker readiness probes use the same healthy refresh API hosts", () => {
-  assert.deepEqual(buildAxiomWorkerReadinessUrls(123), [
-    "https://api3.axiom.trade/server-time?v=123",
-    "https://api9.axiom.trade/server-time?v=123",
-    "https://api7.axiom.trade/server-time?v=123",
   ]);
 });
 
@@ -94,19 +88,54 @@ test("Cloudflare challenge detection ignores background JS detection scripts", (
   ), false);
 });
 
-test("login endpoint candidates can move across API shards", () => {
-  assert.equal(LOGIN_API_HOSTS[0], "api7.axiom.trade");
-  assert.equal(LOGIN_API_HOSTS.includes("api3.axiom.trade"), true);
-  assert.equal(LOGIN_API_HOSTS.includes("api2.axiom.trade"), false);
+test("login/refresh host lists are the probe namespace with no preferred shard", () => {
+  assert.equal(LOGIN_API_HOSTS, API_SHARD_PROBE_HOSTS);
+  assert.equal(REFRESH_ACCESS_TOKEN_HOSTS, API_SHARD_PROBE_HOSTS);
+  assert.equal(API_SHARD_PROBE_HOSTS.includes("api2.axiom.trade"), true);
+  assert.equal(API_SHARD_PROBE_HOSTS.includes("api10.axiom.trade"), true);
+});
+
+test("apiHostsForLoginOrRefresh prefers discovered host then probe list", () => {
+  assert.deepEqual(
+    apiHostsForLoginOrRefresh("api8.axiom.trade"),
+    ["api8.axiom.trade", ...API_SHARD_PROBE_HOSTS.filter((h) => h !== "api8.axiom.trade")],
+  );
+  assert.deepEqual(apiHostsForLoginOrRefresh(null), [...API_SHARD_PROBE_HOSTS]);
+});
+
+test("chooseDiscoveredApiHost picks among healthy hosts", () => {
+  assert.equal(chooseDiscoveredApiHost([]), null);
+  assert.equal(chooseDiscoveredApiHost(["api5.axiom.trade"], () => 0), "api5.axiom.trade");
+  assert.equal(
+    chooseDiscoveredApiHost(["api3.axiom.trade", "api9.axiom.trade"], () => 0.99),
+    "api9.axiom.trade",
+  );
 });
 
 test("login host retry classification only retries shard/network style failures", () => {
   assert.equal(isLoginHostRetryableStatus(0), true);
   assert.equal(isLoginHostRetryableStatus(404), true);
+  assert.equal(isLoginHostRetryableStatus(417), true);
   assert.equal(isLoginHostRetryableStatus(418), true);
   assert.equal(isLoginHostRetryableStatus(429), true);
   assert.equal(isLoginHostRetryableStatus(500), true);
   assert.equal(isLoginHostRetryableStatus(401), false);
+});
+
+test("runLoginApiHostVerification can request allowRegistration for signup", async () => {
+  let seenAllowRegistration: boolean | undefined;
+  await runLoginApiHostVerification({
+    hosts: ["ok.axiom.trade"],
+    walletPublicKey: "wallet-1",
+    allowRegistration: true,
+    getNonce: async () => "nonce-1",
+    signNonce: () => "sig-1",
+    getTurnstileToken: async () => "turnstile-token",
+    verify: async (_host, payload) => {
+      seenAllowRegistration = payload.allowRegistration;
+    },
+  });
+  assert.equal(seenAllowRegistration, true);
 });
 
 test("login fallback checks nonce before spending a Turnstile token", async () => {
@@ -222,9 +251,9 @@ test("login fallback does not retry API hosts after verify returns Weird Error",
   ]);
 });
 
-test("refresh endpoint candidates follow the live frontend shard", () => {
-  assert.equal(REFRESH_ACCESS_TOKEN_HOSTS[0], "api3.axiom.trade");
-  assert.equal(REFRESH_ACCESS_TOKEN_HOSTS.includes("api10.axiom.trade"), false);
+test("refresh endpoint candidates are the full probe namespace", () => {
+  assert.equal(REFRESH_ACCESS_TOKEN_HOSTS, API_SHARD_PROBE_HOSTS);
+  assert.equal(REFRESH_ACCESS_TOKEN_HOSTS.includes("api10.axiom.trade"), true);
 });
 
 test("refresh response is successful when fetch rejects but CDP saw a 2xx wire status", () => {
