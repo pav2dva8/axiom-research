@@ -9,7 +9,8 @@ import type { NavAction } from "../src/session/token-navigation-plan";
 type SessionCall =
   | { type: "open"; accessToken: string; refreshToken: string; opts: unknown }
   | { type: "navigate"; sessionId: number; actions: NavAction[] }
-  | { type: "close"; sessionId: number };
+  | { type: "close"; sessionId: number }
+  | { type: "legacy-connect" };
 
 function account(publicKey: string): LoadedAccount {
   return {
@@ -49,6 +50,7 @@ function sessionWithActorApis(calls: SessionCall[]): BrowserSession {
       },
     ],
     getSessionShards: () => ({ apiHost: "api9.axiom.trade", clusterHost: "cluster9.axiom.trade" }),
+    ensurePageSlots: async () => {},
     openSession: async (accessToken: string, refreshToken: string, opts: unknown) => {
       calls.push({ type: "open", accessToken, refreshToken, opts });
       return nextSessionId++;
@@ -60,6 +62,7 @@ function sessionWithActorApis(calls: SessionCall[]): BrowserSession {
       calls.push({ type: "close", sessionId });
     },
     connectViewer: async () => {
+      calls.push({ type: "legacy-connect" });
       throw new Error("legacy connectViewer should not be used once warmup actors exist");
     },
     disconnectViewer: async () => {},
@@ -68,6 +71,45 @@ function sessionWithActorApis(calls: SessionCall[]): BrowserSession {
     },
   } as any;
 }
+
+test("connectAll deploys warmed direct sessions through SessionActor", async (t) => {
+  const service = new ViewerService();
+  const calls: SessionCall[] = [];
+  const session = sessionWithActorApis(calls);
+  const acct = account("acct-direct");
+  t.after(async () => {
+    await service.stopWarmup();
+  });
+
+  service.setBrowserSession(session);
+  await service.startWarmupForGroups([
+    { id: 0, label: "direct", session, accounts: [acct] },
+  ]);
+  await flushAsyncWork();
+
+  service.setTokenInfo(tokenInfo("direct-pair"));
+  const connected = await service.connectAll([acct], {
+    minGapMs: 0,
+    maxGapMs: 0,
+    shuffle: false,
+    bootstrapDisabled: true,
+  });
+
+  assert.equal(connected, 1);
+  assert.equal(service.getActiveCount(), 1);
+  assert.equal(
+    calls.some(
+      (call) =>
+        call.type === "navigate" &&
+        call.actions.some((action) => action.op === "join" && action.room === "t:direct-pair"),
+    ),
+    true,
+  );
+  assert.equal(
+    calls.some((call) => call.type === "legacy-connect"),
+    false,
+  );
+});
 
 test("warmup actors deploy, return to warmup, and force close through browser session APIs", async () => {
   const service = new ViewerService();

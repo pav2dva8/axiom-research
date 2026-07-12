@@ -705,10 +705,20 @@ export class ViewerService extends EventEmitter {
     // with the first account so the cluster9 WS path is primed. Otherwise
     // the very first real viewer joins silently — server never broadcasts
     // the eye-room count back. Mirrors the user's manual stop+start workaround.
-    if (this.needsClusterWarmup && this.browserSession && order.length > 0) {
+    if (
+      this.needsClusterWarmup &&
+      this.browserSession &&
+      !this.canUseManagedSession(this.browserSession) &&
+      order.length > 0
+    ) {
       this.needsClusterWarmup = false;
       const warmAccount = order.find(
-        (a) => !this.connectedViewers.has(a.publicKey),
+        (a) =>
+          !this.connectedViewers.has(a.publicKey) &&
+          !(
+            this.sessionActors.has(a.publicKey) &&
+            this.actorSessions.get(a.publicKey) === this.browserSession
+          ),
       );
       if (warmAccount) {
         console.log(
@@ -732,6 +742,11 @@ export class ViewerService extends EventEmitter {
 
     let connected = 0;
     let nextIndex = 0;
+    const retry = {
+      attempts: opts.connectAttempts ?? 1,
+      minDelayMs: opts.connectRetryMinMs ?? 0,
+      maxDelayMs: opts.connectRetryMaxMs ?? 0,
+    };
     const claim = (): LoadedAccount | null => {
       while (nextIndex < order.length) {
         const a = order[nextIndex++];
@@ -748,7 +763,9 @@ export class ViewerService extends EventEmitter {
           minGap + Math.floor(Math.random() * Math.max(1, maxGap - minGap));
         if (gap > 0) await new Promise((r) => setTimeout(r, gap));
         if (this.connectCancelled) return;
-        const success = await this.connectAccount(account, slotIndex);
+        const success = this.browserSession
+          ? await this.deployAccount(account, this.browserSession, slotIndex, retry)
+          : await this.connectAccount(account, slotIndex);
         if (!success) continue;
         // A stop landed while this handshake was still in flight. The browser
         // disconnectAll already ran (or will), so this freshly-joined viewer
@@ -757,7 +774,13 @@ export class ViewerService extends EventEmitter {
           const connection = this.connectedViewers.get(account.publicKey);
           this.connectedViewers.delete(account.publicKey);
           if (connection) {
-            await connection.session.disconnectViewer(connection.viewerId).catch(() => {});
+            if (connection.closeMode === "session" && this.sessionActors.has(account.publicKey)) {
+              await this.closeActor(account.publicKey).catch(() => {});
+            } else if (connection.closeMode === "session") {
+              await connection.session.closeSession(connection.viewerId).catch(() => {});
+            } else {
+              await connection.session.disconnectViewer(connection.viewerId).catch(() => {});
+            }
           }
           this.emit("viewer-disconnected", account.publicKey);
           return;
