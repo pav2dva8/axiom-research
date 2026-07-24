@@ -50,12 +50,17 @@ interface Props {
   deployWatch: DeployWatchProgress | null;
   deployWatchActive: boolean;
   keepWarmRunning: boolean;
+  sessionWarmupRunning: boolean;
+  sessionWarmupCount: number;
 }
 
 type BootstrapMode = "skip" | "run";
 
 const BASE58 = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
 const BASE58_ADDRESS = /[1-9A-HJ-NP-Za-km-z]{32,44}/;
+// Ethereum-style hex pair address (robinhood/bnb/eth chains).
+const HEX_ADDRESS = /0x[a-fA-F0-9]{40}/;
+const HEX_ADDRESS_EXACT = /^0x[a-fA-F0-9]{40}$/;
 const DEFAULT_MIN_GAP_MS = 5000;
 const DEFAULT_MAX_GAP_MS = 10000;
 const DEFAULT_GROUP_START_MIN_MS = 5000;
@@ -65,18 +70,32 @@ const DEFAULT_SAFETY_MAX_ACCOUNTS = 2;
 /**
  * The input is always either a bare token CA or a full axiom.trade link
  * (e.g. https://axiom.trade/meme/<pair>?chain=sol) whose embedded address is
- * the pair. Pull the base58 address out of whatever was pasted; a bare CA is
- * returned unchanged so the server's CA-vs-pair logic can take over.
+ * the pair. Pull the address (base58 for sol, or 0x hex for cross-chain) out
+ * of whatever was pasted; a bare CA is returned unchanged so the server's
+ * CA-vs-pair logic can take over.
  */
 function extractAddress(input: string): string {
   const trimmed = input.trim();
-  const match = trimmed.match(BASE58_ADDRESS);
-  return match ? match[0] : trimmed;
+  const b58 = trimmed.match(BASE58_ADDRESS);
+  if (b58) return b58[0];
+  const hex = trimmed.match(HEX_ADDRESS);
+  if (hex) return hex[0];
+  return trimmed;
 }
 
+/** True when the input is an axiom link containing a token/pair address. */
 function isLinkInput(input: string): boolean {
   const trimmed = input.trim();
-  return trimmed.length > 0 && extractAddress(trimmed) !== trimmed && BASE58.test(extractAddress(trimmed));
+  if (!trimmed) return false;
+  const addr = extractAddress(trimmed);
+  if (addr === trimmed) return false;
+  return BASE58.test(addr) || HEX_ADDRESS_EXACT.test(addr);
+}
+
+/** True for a bare (non-link) token CA — base58 (sol) or 0x (cross-chain). */
+function isBareCa(input: string): boolean {
+  const trimmed = input.trim();
+  return BASE58.test(trimmed) || HEX_ADDRESS_EXACT.test(trimmed);
 }
 
 function parsePaste(text: string, knownAccounts: Set<string>) {
@@ -89,7 +108,7 @@ function parsePaste(text: string, knownAccounts: Set<string>) {
 
   for (const token of tokens) {
     const addr = extractAddress(token);
-    if (!BASE58.test(addr)) continue;
+    if (!(BASE58.test(addr) || HEX_ADDRESS_EXACT.test(addr))) continue;
     if (knownAccounts.has(addr)) {
       publicKeys.push(addr);
     } else if (!ca) {
@@ -115,6 +134,8 @@ export function RunTab({
   deployWatch,
   deployWatchActive,
   keepWarmRunning,
+  sessionWarmupRunning,
+  sessionWarmupCount,
 }: Props) {
   const [input, setInput] = useState("");
   const [token, setToken] = useState<ResolvedToken | null>(null);
@@ -135,6 +156,7 @@ export function RunTab({
   const [groupStartMaxMs, setGroupStartMaxMs] = useState<number>(DEFAULT_GROUP_START_MAX_MS);
   const [safetyMaxAccounts, setSafetyMaxAccounts] = useState<number>(DEFAULT_SAFETY_MAX_ACCOUNTS);
   const [bootstrapMode, setBootstrapMode] = useState<BootstrapMode>("skip");
+  const [sessionWarmupBusy, setSessionWarmupBusy] = useState(false);
 
   const fetchAccounts = useCallback(async () => {
     try {
@@ -362,7 +384,7 @@ export function RunTab({
       return;
     }
 
-    if (!BASE58.test(trimmed)) {
+    if (!isBareCa(trimmed)) {
       onLog("Watch deploy requires a bare token CA", "error");
       return;
     }
@@ -434,6 +456,58 @@ export function RunTab({
     }
   }
 
+  async function startSessionWarmup() {
+    if (!keepWarmRunning) {
+      onLog("Start Keep logged in on Accounts first — session warmup needs those browsers", "error");
+      return;
+    }
+    setSessionWarmupBusy(true);
+    const viewerDelay = normalizeDelayRange(minGapMs, maxGapMs);
+    const groupDelay = normalizeDelayRange(groupStartMinMs, groupStartMaxMs);
+    try {
+      const res = await fetch("/api/session-warmup/start", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          minGapMs: viewerDelay.min,
+          maxGapMs: viewerDelay.max,
+          groupStartDelayMinMs: groupDelay.min,
+          groupStartDelayMaxMs: groupDelay.max,
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        onLog(`Session warmup failed: ${data.error ?? res.statusText}`, "error");
+        return;
+      }
+      onLog(
+        `Session warmup started for ${data.count ?? 0} account(s) (acct ${viewerDelay.min}–${viewerDelay.max}ms, group ${groupDelay.min}–${groupDelay.max}ms)`,
+        "success",
+      );
+    } catch (err: any) {
+      onLog(`Session warmup error: ${err.message}`, "error");
+    } finally {
+      setSessionWarmupBusy(false);
+    }
+  }
+
+  async function stopSessionWarmup() {
+    setSessionWarmupBusy(true);
+    try {
+      const res = await fetch("/api/session-warmup/stop", { method: "POST" });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        onLog(`Stop session warmup failed: ${(data as any).error ?? res.statusText}`, "error");
+        return;
+      }
+      onLog("Session warmup stopped", "info");
+    } catch (err: any) {
+      onLog(`Stop session warmup error: ${err.message}`, "error");
+    } finally {
+      setSessionWarmupBusy(false);
+    }
+  }
+
   async function slowStop() {
     const viewerDelay = normalizeDelayRange(minGapMs, maxGapMs);
     setStopping(true);
@@ -496,7 +570,7 @@ export function RunTab({
     (counts.connecting ?? 0) > 0 ||
     (counts.warmup ?? 0) > 0;
   const canWatchDeploy =
-    (BASE58.test(input.trim()) || isLinkInput(input)) && !isActive && !busy && !stopping;
+    (isBareCa(input.trim()) || isLinkInput(input)) && !isActive && !busy && !stopping;
   const watchPending = watching || watchActive;
   const primaryPending = resolving || watchPending || (busy && running);
   const selectedCount = accounts.filter((account) => account.selected).length;
@@ -513,7 +587,7 @@ export function RunTab({
     const trimmed = input.trim();
     const address = extractAddress(trimmed);
 
-    if (!trimmed || !BASE58.test(address)) {
+    if (!trimmed || !(BASE58.test(address) || HEX_ADDRESS_EXACT.test(address))) {
       setToken(null);
       setPreviewError(null);
       setPreviewingToken(false);
@@ -585,6 +659,74 @@ export function RunTab({
 
   return (
     <div className="mx-auto flex w-full max-w-6xl flex-col gap-4">
+      <div className="flex flex-col gap-2 rounded-md border border-border bg-card p-3">
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <div className="flex flex-col gap-0.5">
+            <span className="text-sm font-medium">Session warmup</span>
+            <span className="text-xs text-muted-foreground">
+              Chill Discover/Pulse wander for run-selected accounts. Keep logged in stays login/refresh only.
+            </span>
+          </div>
+          <div className="flex flex-wrap items-center gap-2">
+            {sessionWarmupRunning && (
+              <span className="inline-flex items-center gap-1.5 text-xs text-amber-300">
+                <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-amber-400" />
+                warming {sessionWarmupCount}
+              </span>
+            )}
+            {sessionWarmupRunning ? (
+              <Button
+                type="button"
+                size="sm"
+                variant="outline"
+                onClick={stopSessionWarmup}
+                disabled={sessionWarmupBusy}
+              >
+                {sessionWarmupBusy ? (
+                  <Loader2 className="mr-2 h-3.5 w-3.5 animate-spin" />
+                ) : (
+                  <Square className="mr-2 h-3.5 w-3.5" />
+                )}
+                Stop warmup
+              </Button>
+            ) : (
+              <Button
+                type="button"
+                size="sm"
+                onClick={startSessionWarmup}
+                disabled={
+                  sessionWarmupBusy ||
+                  !keepWarmRunning ||
+                  selectedCount === 0 ||
+                  isActive ||
+                  busy ||
+                  stopping
+                }
+                title={
+                  !keepWarmRunning
+                    ? "Start Keep logged in on Accounts first"
+                    : selectedCount === 0
+                      ? "Select accounts on this Run tab"
+                      : "Start Discover/Pulse wander for selected accounts"
+                }
+              >
+                {sessionWarmupBusy ? (
+                  <Loader2 className="mr-2 h-3.5 w-3.5 animate-spin" />
+                ) : (
+                  <Radar className="mr-2 h-3.5 w-3.5" />
+                )}
+                Start warmup
+              </Button>
+            )}
+          </div>
+        </div>
+        {!keepWarmRunning && (
+          <p className="text-xs text-muted-foreground">
+            Prerequisite: Accounts → Keep logged in (opens browsers / refreshes tokens).
+          </p>
+        )}
+      </div>
+
       <div className="flex flex-col gap-2">
         <label className="text-xs font-medium uppercase tracking-wider text-muted-foreground">
           Token CA or axiom link

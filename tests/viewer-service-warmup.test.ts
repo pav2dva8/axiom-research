@@ -111,6 +111,70 @@ test("connectAll deploys warmed direct sessions through SessionActor", async (t)
   );
 });
 
+test("startWarmupForGroups staggers accounts and groups using connect delay options", async () => {
+  const service = new ViewerService();
+  const calls: SessionCall[] = [];
+  const sessionA = sessionWithActorApis(calls);
+  const sessionB = sessionWithActorApis(calls);
+  const sleeps: number[] = [];
+  (service as any).sleep = async (ms: number) => {
+    sleeps.push(ms);
+  };
+
+  await service.startWarmupForGroups(
+    [
+      {
+        id: 1,
+        label: "proxy 1",
+        session: sessionA,
+        accounts: [account("acct-a1"), account("acct-a2")],
+      },
+      {
+        id: 2,
+        label: "proxy 2",
+        session: sessionB,
+        accounts: [account("acct-b1")],
+      },
+    ],
+    {
+      minGapMs: 1000,
+      maxGapMs: 1000,
+      groupStartDelayMinMs: 5000,
+      groupStartDelayMaxMs: 5000,
+    },
+  );
+
+  // Between a1→a2 (1s), then between group1→group2 (5s). No trailing sleeps.
+  assert.deepEqual(sleeps, [1000, 5000]);
+  await service.stopWarmup();
+});
+
+test("stopWarmup emits viewer-cleared for warmup-only accounts", async () => {
+  const service = new ViewerService();
+  const calls: SessionCall[] = [];
+  const clearedEvents: string[] = [];
+  const disconnectedEvents: string[] = [];
+  const session = sessionWithActorApis(calls);
+  const acct = account("acct-warmup-only");
+
+  service.on("viewer-cleared", (publicKey) => clearedEvents.push(publicKey));
+  service.on("viewer-disconnected", (publicKey) => disconnectedEvents.push(publicKey));
+
+  await service.startWarmupForGroups([
+    { id: 1, label: "proxy 1", session, accounts: [acct] },
+  ]);
+  await flushAsyncWork();
+
+  assert.equal(service.isSessionWarmupRunning(), true);
+
+  await service.stopWarmup();
+
+  assert.equal(service.isSessionWarmupRunning(), false);
+  assert.deepEqual(clearedEvents, ["acct-warmup-only"]);
+  assert.deepEqual(disconnectedEvents, []);
+  assert.equal(calls.some((call) => call.type === "close"), true);
+});
+
 test("warmup actors deploy, return to warmup, and force close through browser session APIs", async () => {
   const service = new ViewerService();
   const calls: SessionCall[] = [];

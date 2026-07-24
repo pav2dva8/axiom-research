@@ -211,6 +211,10 @@ export function RegisterTab({ onLog, running, progress }: Props) {
             <span className="ml-1">available</span>
           </span>
         </label>
+        <p className="text-[11px] leading-relaxed text-muted-foreground md:col-span-2">
+          Uses a real Chrome session with Cloudflare Turnstile (same as Accounts re-login).
+          On the first signup error the job pauses — it will not continue to the next proxy.
+        </p>
       </div>
 
       <dl className="grid grid-cols-[auto_1fr] gap-x-4 gap-y-2 rounded-md border border-border bg-card p-3 font-mono text-xs">

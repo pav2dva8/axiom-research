@@ -4,20 +4,8 @@
   "description": "WebSocket bot for connecting to Axiom.trade",
   "main": "dist/index.js",
   "scripts": {
-    "build": "tsc",
-    "start": "node dist/index.js",
-    "dev": "tsx src/index.ts",
-    "login": "tsx src/login.ts",
-    "signup": "tsx src/login.ts --signup",
-    "viewers": "tsx src/viewers.ts",
-    "viewer-bot": "tsx src/ui/cli.ts",
     "viewer-ui": "tsx src/ui/server.ts",
-    "filter-banned": "tsx src/ui/filter-banned.ts",
-    "dev:server": "tsx src/ui/server.ts",
-    "build:web": "vite build --config src/ui/web/vite.config.ts",
-    "dev:web": "vite --config src/ui/web/vite.config.ts",
-    "probe": "tsx src/probe-token-page.ts",
-    "probe-diff": "tsx src/diff-user-state.ts"
+    "build:web": "vite build --config src/ui/web/vite.config.ts"
   },
   "keywords": [
     "axiom",

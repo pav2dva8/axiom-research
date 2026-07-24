@@ -13,7 +13,17 @@ test("deploy watch target uses only local pair derivation", () => {
   assert.equal(derivePumpPair(ca), derivedPair);
   assert.equal(target.parsed.ca, ca);
   assert.equal(target.parsed.pairAddress, derivedPair);
+  assert.equal(target.parsed.chain, "sol");
   assert.equal(target.tokenInfo.pairAddress, derivedPair);
   assert.equal(target.tokenInfo.tokenAddress, ca);
   assert.equal(target.resolvedByAxiom, false);
+});
+
+test("deploy watch target accepts Robinhood bare 0x CA", () => {
+  const ca = "0xa7254b5806775bba1efed7ec7b8f50a2d21f786c";
+  const target = resolveDeployWatchTarget(ca);
+  assert.equal(target.parsed.chain, "robinhood");
+  assert.equal(target.parsed.ca, ca);
+  assert.equal(target.tokenInfo.chain, "robinhood");
+  assert.equal(target.tokenInfo.tokenAddress, ca);
 });

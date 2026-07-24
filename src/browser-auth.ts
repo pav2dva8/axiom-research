@@ -18,8 +18,12 @@ import * as net from 'net';
 import type { AuthTokens, WalletInfo } from './auth';
 import { buildSignMessage } from './auth';
 import type { NavAction } from './session/token-navigation-plan';
-import { planEnterFromFeed } from './session/token-navigation-plan';
+import { planEnterFromFeed, GLOBAL_LIVENESS_ROOMS } from './session/token-navigation-plan';
 import { pageUpdateMeme } from './session/page-update';
+import {
+  startSessionKeepalive,
+  type SessionKeepaliveHandle,
+} from './session/session-keepalive';
 
 /**
  * Viewer-manager script installed on every page in the context via
@@ -53,19 +57,236 @@ const VIEWER_MANAGER_SCRIPT = `
 
   var FRIENDS_URL = 'wss://friends.axiom.trade/ws';
 
+  // Global, token-independent rooms the real browser joins at connect time
+  // (HAR: all at 0ms on cluster9 open). These broadcast frequently and keep
+  // the socket fed with inbound traffic, so it never goes idle and gets reaped
+  // by a network/proxy idle timer (the observed ~60s 1006 drops).
+  var LIVENESS_ROOMS = ${JSON.stringify([...GLOBAL_LIVENESS_ROOMS])};
+
   function clearSessionTimers(v) {
     if (!v) return;
     clearTimeout(v.friendsPingStart);
     clearInterval(v.friendsPingTimer);
     clearInterval(v.clusterPingTimer);
+    if (v.friendsReconnectTimer) { clearTimeout(v.friendsReconnectTimer); v.friendsReconnectTimer = 0; }
+    if (v.clusterReconnectTimer) { clearTimeout(v.clusterReconnectTimer); v.clusterReconnectTimer = 0; }
     for (var i = 0; i < v.timers.length; i++) clearTimeout(v.timers[i]);
     v.timers = [];
+  }
+
+  function isFixedReconnectMode(v) {
+    return v && typeof v.friendsReconnectDelayMs === 'number';
+  }
+
+  function resolveReconnectDelayMs(v, attempt) {
+    if (isFixedReconnectMode(v)) return Math.max(0, Math.floor(v.friendsReconnectDelayMs));
+    var n = Math.max(1, Math.floor(attempt || 1));
+    return Math.min(15000, 150 * Math.pow(2, n - 1)) + Math.floor(Math.random() * 150);
+  }
+
+  function reopenFriends(id) {
+    var v = window.__viewers[id];
+    if (!v || v.closed) return;
+    try {
+      v.friendsReconnectOpening = true;
+      v.friendsOpenedAt = 0;
+      var ws2 = new WebSocket(FRIENDS_URL);
+      v.friendsWs = ws2;
+      attachFriendsHandlers(id, ws2, Math.floor(Math.random() * 1000));
+    } catch (err) {
+      v.friendsReconnectOpening = false;
+      console.log('[viewer ' + id + '] friends reopen failed: ' + (err && err.message || err));
+    }
+  }
+
+  function attachClusterHandlers(id, ws, onInitialOpen, onInitialClose) {
+    ws.onopen = function() {
+      var v = window.__viewers[id];
+      var label = (v && v.clusterLabel) || 'cluster';
+      console.log('[viewer ' + id + '] ' + label + ' open');
+      if (onInitialOpen) { onInitialOpen(); onInitialOpen = null; onInitialClose = null; }
+      if (!v) return;
+      v.clusterReconnects = 0;
+      v.clusterOpenedAt = Date.now();
+      v.clusterReconnectOpening = false;
+      // Re-join liveness rooms (if enabled) and any token rooms after reconnect.
+      if (v.wantLivenessRooms) {
+        try {
+          for (var i = 0; i < LIVENESS_ROOMS.length; i++) {
+            ws.send(JSON.stringify({ action: 'join', room: LIVENESS_ROOMS[i] }));
+          }
+        } catch (_) {}
+      }
+      try {
+        v.currentRooms.forEach(function(room) {
+          try { ws.send(JSON.stringify({ action: 'join', room: room })); } catch (_) {}
+        });
+      } catch (_) {}
+    };
+    ws.onmessage = function(e) {
+      try {
+        var msg = JSON.parse(e.data);
+        if (typeof msg.room === 'string' && msg.room.indexOf('e-') === 0) {
+          console.log('[viewer ' + id + '] eye-room count = ' + msg.content);
+        }
+      } catch (_) {}
+    };
+    ws.onerror = function() {
+      var v = window.__viewers[id];
+      var label = (v && v.clusterLabel) || 'cluster';
+      console.log('[viewer ' + id + '] ' + label + ' error event');
+    };
+    ws.onclose = function(e) {
+      var v = window.__viewers[id];
+      var label = (v && v.clusterLabel) || 'cluster';
+      var openedAt = v && v.clusterOpenedAt;
+      var dt = openedAt ? (Date.now() - openedAt) : 0;
+      var pending = !!(v && v.clusterReconnectOpening && !openedAt);
+      console.log('[viewer ' + id + '] ' + label + ' closed code=' + e.code + ' clean=' + e.wasClean + ' reason="' + (e.reason || '') + '"' + (pending ? ' (reconnect never opened)' : ' after ' + dt + 'ms'));
+      if (onInitialClose) { onInitialClose(e); onInitialOpen = null; onInitialClose = null; return; }
+      if (!v) return;
+      v.clusterReconnectOpening = false;
+      v.clusterOpenedAt = 0;
+      // Fixed-delay Test mode: reconnect cluster instead of tearing the session
+      // down (page-update has no liveness rooms so idle reaper kills it ~60s).
+      if (isFixedReconnectMode(v) && !v.closed) {
+        scheduleClusterReconnect(id);
+        return;
+      }
+      cleanupSession(id, false);
+    };
+  }
+
+  function scheduleClusterReconnect(id) {
+    var v = window.__viewers[id];
+    if (!v || v.closed) return;
+    if (v.clusterReconnectTimer) return;
+    v.clusterReconnects = (v.clusterReconnects || 0) + 1;
+    if (v.clusterReconnects > 20) {
+      console.log('[viewer ' + id + '] cluster reconnects exhausted (' + v.clusterReconnects + '); giving up');
+      cleanupSession(id, false);
+      return;
+    }
+    var delay = resolveReconnectDelayMs(v, v.clusterReconnects);
+    var scheduledAt = Date.now();
+    console.log('[viewer ' + id + '] cluster reconnect: waiting ' + delay + 'ms (attempt ' + v.clusterReconnects + ')');
+    v.clusterReconnectTimer = setTimeout(function() {
+      v.clusterReconnectTimer = 0;
+      if (v.closed) return;
+      var waited = Date.now() - scheduledAt;
+      try {
+        console.log('[viewer ' + id + '] cluster reconnect: opening now (waited ' + waited + 'ms)');
+        v.clusterReconnectOpening = true;
+        v.clusterOpenedAt = 0;
+        var ws2 = new WebSocket(v.clusterUrl);
+        v.clusterWs = ws2;
+        attachClusterHandlers(id, ws2);
+      } catch (err) {
+        v.clusterReconnectOpening = false;
+        console.log('[viewer ' + id + '] cluster reopen failed: ' + (err && err.message || err));
+      }
+    }, delay);
+  }
+
+  function scheduleFriendsReconnect(id) {
+    var v = window.__viewers[id];
+    if (!v || v.closed) return;
+    if (v.friendsReconnectTimer) return;
+    // Classic fast-reconnect mode: reset attempt counter after a healthy lifetime.
+    if (!isFixedReconnectMode(v) && v.friendsOpenedAt && (Date.now() - v.friendsOpenedAt) > 10000) {
+      v.friendsReconnects = 0;
+    }
+    v.friendsReconnects = (v.friendsReconnects || 0) + 1;
+    if (v.friendsReconnects > 20) {
+      console.log('[viewer ' + id + '] friends reconnects exhausted (' + v.friendsReconnects + '); giving up');
+      return;
+    }
+    var delay = resolveReconnectDelayMs(v, v.friendsReconnects);
+    var scheduledAt = Date.now();
+    console.log('[viewer ' + id + '] friends reconnect: waiting ' + delay + 'ms (attempt ' + v.friendsReconnects + ')');
+    v.friendsReconnectTimer = setTimeout(function() {
+      v.friendsReconnectTimer = 0;
+      if (v.closed) return;
+      // Classic mode still needs cluster alive; fixed-delay Test mode does not.
+      if (!isFixedReconnectMode(v) && v.clusterWs.readyState !== 1) return;
+      var waited = Date.now() - scheduledAt;
+      console.log('[viewer ' + id + '] friends reconnect: opening now (waited ' + waited + 'ms)');
+      reopenFriends(id);
+    }, delay);
+  }
+
+  // Friends (friends.axiom.trade) sends ZERO inbound traffic in steady state
+  // — the client drives a 1 Hz "." heartbeat and a pageUpdate on navigation.
+  // With no inbound frames, a network/proxy idle reaper kills the socket at
+  // ~60s (code 1006). Unlike cluster, there is no room to join that would feed
+  // it traffic, so the only way to keep a friends presence alive is to reopen
+  // the (unauthenticated) socket when it drops and re-declare the pageUpdate.
+  function attachFriendsHandlers(id, ws, pingJitterMs, onInitialOpen, onInitialClose) {
+    ws.onopen = function() {
+      // First-ever open: let the session resolve (both sockets up).
+      if (onInitialOpen) { onInitialOpen(); onInitialOpen = null; onInitialClose = null; }
+      var v = window.__viewers[id];
+      if (!v) return;
+      v.friendsReconnects = 0;
+      v.friendsOpenedAt = Date.now();
+      v.friendsReconnectOpening = false;
+      console.log('[viewer ' + id + '] friends open');
+      // Re-declare the last page presence so the server re-counts this viewer.
+      if (v.lastPageUpdate) {
+        try { ws.send(JSON.stringify(v.lastPageUpdate)); } catch (_) {}
+      }
+      // Restart the 1 Hz "." heartbeat (matches real Chrome).
+      v.friendsPingStart = setTimeout(function() {
+        if (v.closed || !v.friendsWs || v.friendsWs.readyState !== 1) return;
+        try { v.friendsWs.send('.'); } catch (_) {}
+        v.friendsPingTimer = setInterval(function() {
+          if (v.closed || !v.friendsWs || v.friendsWs.readyState !== 1) return;
+          try { v.friendsWs.send('.'); } catch (_) {}
+        }, 1000);
+      }, pingJitterMs);
+    };
+    ws.onmessage = function(e) {
+      if (e.data === '.') return;
+      try {
+        var msg = JSON.parse(e.data);
+        if (msg.type === 'ping') { try { ws.send(JSON.stringify({ type: 'pong' })); } catch (_) {} }
+      } catch (_) {}
+    };
+    ws.onerror = function() {};
+    ws.onclose = function(e) {
+      var v = window.__viewers[id];
+      var openedAt = v && v.friendsOpenedAt;
+      var dt = openedAt ? (Date.now() - openedAt) : 0;
+      var pending = !!(v && v.friendsReconnectOpening && !openedAt);
+      console.log('[viewer ' + id + '] friends closed code=' + e.code + ' clean=' + e.wasClean + ' reason="' + (e.reason || '') + '"' + (pending ? ' (reconnect never opened)' : ' after ' + dt + 'ms'));
+      // Initial handshake never completed: fail the open promise.
+      if (onInitialClose) { onInitialClose(e); onInitialOpen = null; onInitialClose = null; return; }
+      if (!v) return;
+      // Stop heartbeats on the dead socket.
+      clearTimeout(v.friendsPingStart);
+      clearInterval(v.friendsPingTimer);
+      v.friendsPingStart = 0;
+      v.friendsPingTimer = 0;
+      v.friendsReconnectOpening = false;
+      v.friendsOpenedAt = 0;
+      // Fixed-delay Test mode: reconnect friends even if cluster is already dead.
+      // Classic mode: only reconnect while cluster is still open.
+      if (v.closed) {
+        cleanupSession(id, false);
+        return;
+      }
+      if (!isFixedReconnectMode(v) && v.clusterWs.readyState !== 1) {
+        cleanupSession(id, false);
+        return;
+      }
+      scheduleFriendsReconnect(id);
+    };
   }
 
   function closeSockets(v) {
     if (!v) return;
     try { v.clusterWs.close(); } catch (_) {}
-    try { v.friendsWs.close(); } catch (_) {}
+    try { if (v.friendsWs) v.friendsWs.close(); } catch (_) {}
   }
 
   function cleanupSession(id, close) {
@@ -129,8 +350,10 @@ const VIEWER_MANAGER_SCRIPT = `
     }
 
     if (action.ws === 'friends' && action.op === 'pageUpdate') {
-      if (v.friendsWs.readyState !== 1) throw new Error('friends socket is not open');
-      v.friendsWs.send(JSON.stringify(normalizePageUpdate(action.pageUpdate)));
+      if (!v.friendsWs || v.friendsWs.readyState !== 1) throw new Error('friends socket is not open');
+      var pu = normalizePageUpdate(action.pageUpdate);
+      v.lastPageUpdate = pu;
+      v.friendsWs.send(JSON.stringify(pu));
       return;
     }
 
@@ -166,7 +389,7 @@ const VIEWER_MANAGER_SCRIPT = `
       type: 'pageUpdate',
       page: 'meme',
       subpage: tokenInfo,
-      chain: 'sol'
+      chain: tokenInfo.chain || 'sol'
     } });
     return actions;
   }
@@ -178,104 +401,111 @@ const VIEWER_MANAGER_SCRIPT = `
       ? opts.clusterUrl
       : (window.__axiomClusterUrl || 'wss://cluster8.axiom.trade/');
     var clusterLabel = String(clusterUrl).split('/')[2] || 'cluster';
+    var wantFriends = opts.friends !== false;
+    // Liveness rooms (high-frequency global broadcasts) keep the socket
+    // non-idle so a proxy reaper does not kill it at ~60s. page-update test
+    // mode sets this false to isolate friends-only behavior with zero cluster
+    // activity. Default true (matches the real browser).
+    var wantLivenessRooms = opts.livenessRooms !== false;
+    var friendsReconnectDelayMs = typeof opts.friendsReconnectDelayMs === 'number' && isFinite(opts.friendsReconnectDelayMs)
+      ? Math.max(0, Math.floor(opts.friendsReconnectDelayMs))
+      : null;
 
     var resolveFn, rejectFn;
     var promise = new Promise(function(res, rej) { resolveFn = res; rejectFn = rej; });
     window.__pendingPromises[id] = promise;
 
     var clusterWs = new WebSocket(clusterUrl);
-    var friendsWs = new WebSocket(FRIENDS_URL);
+    var friendsWs = wantFriends ? new WebSocket(FRIENDS_URL) : null;
     var timeout = setTimeout(function() { fail('WS timeout'); }, 12000);
 
-    var clusterOpen = false, friendsOpen = false;
+    var clusterOpen = false, friendsOpen = !wantFriends;
     var settled = false;
-    var friendsPingTimer = 0, clusterPingTimer = 0, friendsPingStart = 0;
     var tStart = Date.now();
+
+    // Register the viewer immediately so socket handlers can reconnect after
+    // idle drops (especially fixed-delay Test mode) without losing state.
+    var viewer = {
+      clusterWs: clusterWs, friendsWs: friendsWs,
+      friendsPingTimer: 0, clusterPingTimer: 0, friendsPingStart: 0,
+      currentRooms: new Set(),
+      timers: [],
+      closed: false,
+      navReject: null,
+      lastPageUpdate: null,
+      friendsReconnectTimer: 0,
+      friendsReconnects: 0,
+      friendsOpenedAt: 0,
+      friendsReconnectOpening: false,
+      friendsReconnectDelayMs: friendsReconnectDelayMs,
+      clusterReconnectTimer: 0,
+      clusterReconnects: 0,
+      clusterOpenedAt: 0,
+      clusterReconnectOpening: false,
+      clusterUrl: clusterUrl,
+      clusterLabel: clusterLabel,
+      wantLivenessRooms: wantLivenessRooms,
+      tStart: tStart
+    };
+    window.__viewers[id] = viewer;
 
     function killBoth() {
       try { clusterWs.close(); } catch (_) {}
-      try { friendsWs.close(); } catch (_) {}
+      try { if (friendsWs) friendsWs.close(); } catch (_) {}
     }
     function fail(why) {
       if (settled) return;
       settled = true;
       clearTimeout(timeout);
+      // Mark closed first so socket onclose handlers do not schedule reconnects.
+      if (viewer) viewer.closed = true;
       killBoth();
+      cleanupSession(id, false);
       rejectFn(new Error(why));
     }
     function tryResolve() {
       if (!clusterOpen || !friendsOpen || settled) return;
       settled = true;
       clearTimeout(timeout);
-
-      friendsPingStart = setTimeout(function() {
-        friendsPingTimer = setInterval(function() {
-          if (friendsWs.readyState === 1) friendsWs.send('.');
-          else clearInterval(friendsPingTimer);
-        }, 1000);
-      }, pingJitterMs);
-
-      clusterPingTimer = setInterval(function() {
-        if (clusterWs.readyState === 1) clusterWs.send(JSON.stringify({ method: 'ping' }));
-        else clearInterval(clusterPingTimer);
-      }, 30000 + Math.floor(Math.random() * 5000));
-
-      window.__viewers[id] = {
-        clusterWs: clusterWs, friendsWs: friendsWs,
-        friendsPingTimer: friendsPingTimer, clusterPingTimer: clusterPingTimer, friendsPingStart: friendsPingStart,
-        currentRooms: new Set(),
-        timers: [],
-        closed: false,
-        navReject: null
-      };
       resolveFn(id);
     }
 
-    clusterWs.onopen = function() {
-      console.log('[viewer ' + id + '] ' + clusterLabel + ' open');
-      clusterOpen = true;
-      tryResolve();
-    };
-    clusterWs.onmessage = function(e) {
-      try {
-        var msg = JSON.parse(e.data);
-        if (typeof msg.room === 'string' && msg.room.indexOf('e-') === 0) {
-          console.log('[viewer ' + id + '] eye-room count = ' + msg.content);
-        }
-      } catch (_) {}
-    };
-    clusterWs.onerror = function() {
-      console.log('[viewer ' + id + '] ' + clusterLabel + ' error event');
-    };
-    clusterWs.onclose = function(e) {
-      var dt = Date.now() - tStart;
-      console.log('[viewer ' + id + '] ' + clusterLabel + ' closed code=' + e.code + ' clean=' + e.wasClean + ' reason="' + (e.reason || '') + '" after ' + dt + 'ms');
-      cleanupSession(id, false);
-      if (!settled) fail(clusterLabel + ' closed code=' + e.code + (e.reason ? ' reason=' + e.reason : ''));
-    };
+    attachClusterHandlers(id, clusterWs,
+      function onInitialOpen() {
+        clusterOpen = true;
+        tryResolve();
+      },
+      function onInitialClose(e) {
+        if (!settled) fail(clusterLabel + ' closed code=' + e.code + (e.reason ? ' reason=' + e.reason : ''));
+      }
+    );
 
-    friendsWs.onopen = function() {
-      friendsOpen = true;
-      tryResolve();
-    };
-    friendsWs.onmessage = function(e) {
-      if (e.data === '.') return;
-      try {
-        var msg = JSON.parse(e.data);
-        if (msg.type === 'ping') friendsWs.send(JSON.stringify({ type: 'pong' }));
-      } catch (_) {}
-    };
-    friendsWs.onerror = function() {
-      console.log('[viewer ' + id + '] friends error event');
-    };
-    friendsWs.onclose = function(e) {
-      var dt = Date.now() - tStart;
-      console.log('[viewer ' + id + '] friends closed code=' + e.code + ' clean=' + e.wasClean + ' reason="' + (e.reason || '') + '" after ' + dt + 'ms');
-      cleanupSession(id, false);
-      if (!settled) fail('friends closed code=' + e.code + (e.reason ? ' reason=' + e.reason : ''));
-    };
+    if (friendsWs) {
+      attachFriendsHandlers(id, friendsWs, pingJitterMs,
+        function onInitialOpen() { friendsOpen = true; tryResolve(); },
+        function onInitialClose(e) {
+          if (!settled) fail('friends closed code=' + e.code + (e.reason ? ' reason=' + e.reason : ''));
+        }
+      );
+    }
 
     return id;
+  };
+
+  window.__keepaliveFriends = function(id) {
+    var v = window.__viewers[id];
+    if (!v || v.closed || !v.friendsWs) return false;
+    if (v.friendsWs.readyState !== 1) return false;
+    v.friendsWs.send('.');
+    return true;
+  };
+
+  window.__keepaliveCluster = function(id) {
+    var v = window.__viewers[id];
+    if (!v || v.closed) return false;
+    if (v.clusterWs.readyState !== 1) return false;
+    v.clusterWs.send(JSON.stringify({ method: 'ping' }));
+    return true;
   };
 
   window.__openSessionAwait = function(id) {
@@ -297,6 +527,13 @@ const VIEWER_MANAGER_SCRIPT = `
         sendNavAction(id, action);
       }
     })();
+  };
+
+  // Single-action send for Node-timed navigation (avoids holding page.evaluate
+  // across delays that Chrome may throttle to ~60s in background tabs).
+  window.__sendNavAction = function(id, action) {
+    sendNavAction(id, action);
+    return true;
   };
 
   window.__closeSession = function(id) {
@@ -363,7 +600,7 @@ export interface BrowserSession {
   signupAccount(wallet: WalletInfo): Promise<AuthTokens>;
   getCfData(): Promise<{ cfCookies: string; userAgent: string }>;
   fetchPairInfo(pairAddress: string): Promise<any | null>;
-  fetchMemeTrending(): Promise<unknown>;
+  fetchMemeTrending(accessToken?: string, refreshToken?: string): Promise<unknown>;
   resolvePairFromCa(ca: string, accessToken?: string, refreshToken?: string): Promise<any | null>;
   /**
    * Run the session bootstrap that the real client fires on every page load
@@ -374,6 +611,8 @@ export interface BrowserSession {
   bootstrapSession(walletAddress: string, accessToken: string, refreshToken: string): Promise<void>;
   /** Discovered apiN + clusterN for this browser/proxy session (after observe). */
   getSessionShards(): SessionShards;
+  /** Proxy used for this Chrome session (if any). */
+  getProxyConfig(): BrowserProxyConfig | undefined;
   /** Run portfolio/discover observe once (lazy — skipped at session open). */
   ensureSessionShards(): Promise<SessionShards>;
   probeEucalyptus(pairAddress: string, accessToken?: string, refreshToken?: string): Promise<void>;
@@ -398,6 +637,27 @@ export interface BrowserSession {
 export interface BrowserSessionOpenOptions {
   pingJitterMs?: number;
   slotIndex?: number;
+  /** When false, open cluster only (no friends.axiom.trade socket). Default true. */
+  friends?: boolean;
+  /**
+   * When set, navigate the worker page to `/meme/{pairAddress}` (with auth
+   * cookies) before constructing the managed WebSocket pair.
+   */
+  pairAddress?: string;
+  /**
+   * When true, leave auth cookies on the BrowserContext after opening the
+   * session (Test longevity A/B). Default false = classic cookie-swap clear.
+   */
+  keepAuthCookies?: boolean;
+  /**
+   * When false, skip joining the global liveness rooms on cluster open. Used
+   * by page-update test mode to isolate friends-only behavior. Default true.
+   */
+  livenessRooms?: boolean;
+  /**
+   * Fixed delay (ms) before reopening friends WS after close. Default 20000.
+   */
+  friendsReconnectDelayMs?: number;
 }
 
 export interface BrowserProxyConfig {
@@ -831,6 +1091,11 @@ export async function openBrowserSession(options: BrowserSessionOptions = {}): P
     ...buildChromeProxyArgs(options.proxy),
     '--no-first-run',
     '--no-default-browser-check',
+    // Keep in-page setInterval (friends ".") from being throttled when the
+    // Chrome window is minimized / backgrounded.
+    '--disable-background-timer-throttling',
+    '--disable-backgrounding-occluded-windows',
+    '--disable-renderer-backgrounding',
     ...buildChromeWindowArgs(options.window),
     'about:blank',
   ], {
@@ -918,7 +1183,22 @@ export async function openBrowserSession(options: BrowserSessionOptions = {}): P
   }).catch(() => {});
 
   // Navigate to a lightweight axiom.trade page for Cloudflare/Turnstile.
-  await page.goto(AXIOM_BROWSER_PAGE_URL, { waitUntil: 'load', timeout: 30000 });
+  // Retry on transient proxy/CF handshake failures (ERR_EMPTY_RESPONSE, etc.) —
+  // fresh residential exits often need 2-3 attempts before CF serves the
+  // challenge page (which waitForMainPageClear then waits out). Without the
+  // retry, a single empty response aborts the whole browser session.
+  let pageLoaded = false;
+  for (let attempt = 1; attempt <= 4 && !pageLoaded; attempt++) {
+    try {
+      await page.goto(AXIOM_BROWSER_PAGE_URL, { waitUntil: 'domcontentloaded', timeout: 30000 });
+      pageLoaded = true;
+    } catch (err: any) {
+      const msg = String(err?.message || err);
+      console.warn(`${logPrefix} page.goto attempt ${attempt}/4 failed: ${msg}`);
+      if (attempt >= 4) throw err;
+      await new Promise((r) => setTimeout(r, 2000 * attempt));
+    }
+  }
   console.log(`${logPrefix} Page loaded, URL:`, page.url());
 
   // ── Cloudflare / Turnstile readiness helpers ───────────────────────────
@@ -1131,6 +1411,8 @@ export async function openBrowserSession(options: BrowserSessionOptions = {}): P
   // After WS objects are constructed (synchronous), cookies are captured
   // and the lock is released.
   const wsUrlByReq = new Map<string, string>();
+  const pageCdps = new Map<Page, Awaited<ReturnType<BrowserContext['newCDPSession']>>>();
+  let friendsHeartbeatCount = 0;
   let observedApiHost: string | null = null;
   let observedClusterWsUrl: string | null = null;
   let sessionShards: SessionShards = {
@@ -1169,7 +1451,12 @@ export async function openBrowserSession(options: BrowserSessionOptions = {}): P
 
   async function attachCdpListenersTo(p: Page): Promise<void> {
     const cdp = await context.newCDPSession(p);
+    pageCdps.set(p, cdp);
     await cdp.send('Network.enable');
+    // Keep the worker page "active" so in-page timers / WS keepalive are not
+    // clamped to ~60s when the Chrome window is minimized or backgrounded.
+    await cdp.send('Page.enable').catch(() => {});
+    await cdp.send('Page.setWebLifecycleState', { state: 'active' }).catch(() => {});
     cdp.on('Network.requestWillBeSent', ({ requestId, request }: any) => {
       if (request?.url?.includes('refresh-access-token')) refreshReqIds.add(requestId);
       noteNetworkUrl(request?.url);
@@ -1200,10 +1487,25 @@ export async function openBrowserSession(options: BrowserSessionOptions = {}): P
       }
     });
     cdp.on('Network.webSocketFrameSent', ({ requestId, response }) => {
-      if (response.payloadData) console.log(`[CDP→${tag(requestId)}]`, response.payloadData.slice(0, 300));
+      const data = response.payloadData || '';
+      const label = tag(requestId);
+      // Friends keepalive is a single "." every ~1s — mute it (unless this is
+      // a friends socket and verbose WS logging is on).
+      if (data === '.') {
+        // Friends keepalive "." is high-frequency noise — only log when verbose.
+        if (label === 'friends' && process.env.WS_VERBOSE) {
+          friendsHeartbeatCount++;
+          console.log(`[CDP→friends] . heartbeat #${friendsHeartbeatCount} @${Date.now()}`);
+        }
+        return;
+      }
+      if (data.includes('"method":"ping"') || data.includes('"method": "ping"')) return;
+      if (data) console.log(`[CDP→${label}]`, data.slice(0, 300));
     });
     cdp.on('Network.webSocketFrameReceived', ({ requestId, response }) => {
-      if (response.payloadData) console.log(`[CDP←${tag(requestId)}]`, response.payloadData.slice(0, 300));
+      const data = response.payloadData || '';
+      if (data === '.') return;
+      if (data) console.log(`[CDP←${tag(requestId)}]`, data.slice(0, 300));
     });
     cdp.on('Network.webSocketFrameError', ({ requestId, errorMessage }: any) => {
       const msg = String(errorMessage || '');
@@ -1219,20 +1521,6 @@ export async function openBrowserSession(options: BrowserSessionOptions = {}): P
       }
       wsUrlByReq.delete(requestId);
     });
-  }
-
-  async function setupFriendsPage(): Promise<Page> {
-    const p = await context.newPage();
-    await attachProxyAuthToPage(p);
-    p.on('console', msg => {
-      const t = msg.text();
-      if (t.startsWith('[viewer ') || t.startsWith('[viewer]')) console.log('[Browser]', t);
-    });
-    // CDP before goto so the first /terms load's apiN + clusterN are observed.
-    await attachCdpListenersTo(p);
-    await p.goto(AXIOM_BROWSER_PAGE_URL, { waitUntil: 'load', timeout: 30000 }).catch(() => {});
-    await p.waitForTimeout(500);
-    return p;
   }
 
   async function applyClusterUrlToPages(clusterWsUrl: string): Promise<void> {
@@ -1334,23 +1622,27 @@ export async function openBrowserSession(options: BrowserSessionOptions = {}): P
     return sessionShards;
   }
 
-  const friendsPages: Page[] = [];
-  friendsPages.push(await setupFriendsPage());
-  const friendsPage = friendsPages[0]; // primary for non-pool operations (resolvePairFromCa, bootstrapSession)
-  // /terms?chain=sol already emits apiN + clusterN — observe via CDP (no portfolio).
+  // One Chrome tab only: reuse the main CF/terms page for viewers + refresh.
+  page.on('console', (msg) => {
+    const t = msg.text();
+    if (t.startsWith('[viewer ') || t.startsWith('[viewer]')) console.log('[Browser]', t);
+  });
+  await attachCdpListenersTo(page);
+  const friendsPages: Page[] = [page];
+  const friendsPage = friendsPages[0];
+  // Reload terms under CDP so apiN/clusterN from this tab are observed.
+  await page.goto(AXIOM_BROWSER_PAGE_URL, { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
   await discoverShardsFromTerms();
-  console.log(`${logPrefix} Axiom page ready`);
+  console.log(`${logPrefix} Axiom page ready (single tab)`);
   browserReadyForMinimize = true;
   await parkReadyBrowserWindow();
 
   async function ensurePageSlots(n: number): Promise<void> {
-    while (friendsPages.length < n) {
-      const p = await setupFriendsPage();
-      friendsPages.push(p);
-      await p.evaluate((url) => {
-        (globalThis as any).__axiomClusterUrl = url;
-      }, sessionShards.clusterWsUrl).catch(() => {});
-      console.log(`[BrowserAuth] friendsPage pool grew to ${friendsPages.length}`);
+    // Stay on one tab — cookie-swap serializes accounts on friendsPages[0].
+    if (n > 1) {
+      console.log(
+        `[BrowserAuth] ensurePageSlots(${n}) ignored — single-tab mode (cookie-swap on one page)`,
+      );
     }
   }
 
@@ -1370,6 +1662,7 @@ export async function openBrowserSession(options: BrowserSessionOptions = {}): P
 
   // Track which page each viewer was created on, so disconnect routes correctly.
   const viewerToPage = new Map<number, Page>();
+  const sessionKeepalives = new Map<number, SessionKeepaliveHandle>();
   let nextViewerId = 0;
 
   // Viewer manager is auto-installed on every page via context.addInitScript
@@ -1549,23 +1842,56 @@ export async function openBrowserSession(options: BrowserSessionOptions = {}): P
     const scriptOpts = {
       pingJitterMs: typeof openOpts.pingJitterMs === 'number' ? openOpts.pingJitterMs : Math.floor(Math.random() * 1000),
       clusterUrl: shards.clusterWsUrl,
+      ...(openOpts.friends === false ? { friends: false } : {}),
+      ...(openOpts.livenessRooms === false ? { livenessRooms: false } : {}),
+      ...(typeof openOpts.friendsReconnectDelayMs === 'number' &&
+      Number.isFinite(openOpts.friendsReconnectDelayMs)
+        ? {
+            friendsReconnectDelayMs: Math.max(
+              0,
+              Math.floor(openOpts.friendsReconnectDelayMs),
+            ),
+          }
+        : {}),
     };
     const sessionId = ++nextViewerId;
 
-    // Cookie-locked critical section: addCookies -> synchronously construct
-    // the WS pair (so cookies are captured) -> clear cookies. The handshake
-    // runs outside the lock, in parallel across pool slots.
+    // Cookie-locked critical section: addCookies -> (optional meme goto) ->
+    // synchronously construct the WS pair (so cookies are captured) -> clear
+    // cookies. The handshake runs outside the lock, in parallel across pool slots.
     const tStart = Date.now();
+    const pairAddress =
+      typeof openOpts.pairAddress === "string" ? openOpts.pairAddress.trim() : "";
     await withCookieLock(async () => {
       try {
         await context.addCookies(cookiesToAdd);
+        if (pairAddress) {
+          const memeUrl = `https://axiom.trade/meme/${pairAddress}?chain=sol`;
+          console.log(
+            `[BrowserAuth] Session ${sessionId} navigating slot ${slotIndex} to meme page...`,
+          );
+          await sessionPage
+            .goto(memeUrl, { waitUntil: "domcontentloaded", timeout: 45000 })
+            .catch((err: any) => {
+              console.warn(
+                `[BrowserAuth] Session ${sessionId} meme navigation failed: ${err?.message || err}`,
+              );
+            });
+          await sessionPage.waitForTimeout(400).catch(() => {});
+        }
         await sessionPage.evaluate(
           ({ id, opts }) => (globalThis as any).__openSession(id, opts),
           { id: sessionId, opts: scriptOpts },
         );
       } finally {
-        await context.clearCookies({ name: 'auth-access-token' });
-        await context.clearCookies({ name: 'auth-refresh-token' });
+        if (openOpts.keepAuthCookies) {
+          console.log(
+            `[BrowserAuth] Session ${sessionId} keeping auth cookies (Test longevity)`,
+          );
+        } else {
+          await context.clearCookies({ name: 'auth-access-token' });
+          await context.clearCookies({ name: 'auth-refresh-token' });
+        }
       }
     });
     const tStartDone = Date.now();
@@ -1576,19 +1902,109 @@ export async function openBrowserSession(options: BrowserSessionOptions = {}): P
     console.log(`[Timing] slot=${slotIndex} cookieLocked=${tStartDone - tStart}ms handshake=${tAwaitDone - tStartDone}ms`);
 
     viewerToPage.set(sessionId, sessionPage);
-    console.log(`[BrowserAuth] Session ${sessionId} opened on slot ${slotIndex} (acct token=${accessToken.slice(0, 12)}..., pingJitter=${scriptOpts.pingJitterMs}ms)`);
+    const existingKeepalive = sessionKeepalives.get(sessionId);
+    if (existingKeepalive) existingKeepalive.stop();
+    const friendsEnabled = openOpts.friends !== false;
+    let friendsKeepaliveFails = 0;
+    let friendsOkLogged = false;
+    const keepaliveHandle = startSessionKeepalive({
+      // Primary path is CDP Runtime.evaluate every 1s (bypasses Playwright
+      // evaluate queue + background timer throttling).
+      friendsEnabled,
+      friendsJitterMs: scriptOpts.pingJitterMs,
+      friendsIntervalMs: 1000,
+      clusterIntervalMs: 30_000 + Math.floor(Math.random() * 5000),
+      tickFriends: () =>
+        evalKeepalive(sessionPage, sessionId, '__keepaliveFriends')
+          .then((ok) => {
+            if (ok) {
+              if (!friendsOkLogged) {
+                friendsOkLogged = true;
+                console.log(`[BrowserAuth] Session ${sessionId} friends keepalive active`);
+              }
+              friendsKeepaliveFails = 0;
+              return;
+            }
+            friendsKeepaliveFails += 1;
+            if (friendsKeepaliveFails === 3 || friendsKeepaliveFails % 30 === 0) {
+              console.warn(
+                `[BrowserAuth] Session ${sessionId} friends keepalive miss x${friendsKeepaliveFails}`,
+              );
+            }
+            // Friends is gone — stop hammering a dead socket.
+            if (friendsKeepaliveFails >= 5) {
+              const handle = sessionKeepalives.get(sessionId);
+              if (handle === keepaliveHandle) {
+                handle.stop();
+                sessionKeepalives.delete(sessionId);
+                console.warn(
+                  `[BrowserAuth] Session ${sessionId} friends keepalive stopped after repeated misses`,
+                );
+              }
+            }
+          })
+          .catch((err: any) => {
+            friendsKeepaliveFails += 1;
+            if (friendsKeepaliveFails <= 3 || friendsKeepaliveFails % 30 === 0) {
+              console.warn(
+                `[BrowserAuth] Session ${sessionId} friends keepalive error: ${err?.message || err}`,
+              );
+            }
+          }),
+      tickCluster: () => {
+        void evalKeepalive(sessionPage, sessionId, '__keepaliveCluster').catch(() => false);
+      },
+    });
+    sessionKeepalives.set(sessionId, keepaliveHandle);
+    console.log(`[BrowserAuth] Session ${sessionId} opened on slot ${slotIndex} (acct token=${accessToken.slice(0, 12)}..., pingJitter=${scriptOpts.pingJitterMs}ms${friendsEnabled ? '' : ', friends=off'})`);
     return sessionId;
   }
 
   async function navigateManagedSession(sessionId: number, actions: NavAction[]): Promise<void> {
     const sessionPage = viewerToPage.get(sessionId) ?? friendsPage;
-    await sessionPage.evaluate(
-      ({ id, navActions }) => (globalThis as any).__navigateSession(id, navActions),
-      { id: sessionId, navActions: actions },
+    const sorted = [...(actions || [])].sort((a, b) => (a.atMs || 0) - (b.atMs || 0));
+    const start = Date.now();
+    for (const action of sorted) {
+      const delayMs = Math.max(0, start + Math.max(0, action.atMs || 0) - Date.now());
+      if (delayMs > 0) await new Promise((r) => setTimeout(r, delayMs));
+      await sessionPage.evaluate(
+        ({ id, navAction }) => (globalThis as any).__sendNavAction(id, navAction),
+        { id: sessionId, navAction: action },
+      );
+    }
+  }
+
+  async function evalKeepalive(
+    sessionPage: Page,
+    sessionId: number,
+    fnName: '__keepaliveFriends' | '__keepaliveCluster',
+  ): Promise<boolean> {
+    const cdp = pageCdps.get(sessionPage);
+    if (cdp) {
+      try {
+        const result = await cdp.send('Runtime.evaluate', {
+          expression: `window.${fnName}(${sessionId})`,
+          returnByValue: true,
+          awaitPromise: false,
+        });
+        if (result?.exceptionDetails) return false;
+        return result?.result?.value === true;
+      } catch {
+        // Fall through to Playwright evaluate.
+      }
+    }
+    return sessionPage.evaluate(
+      ({ id, name }) => (globalThis as any)[name](id),
+      { id: sessionId, name: fnName },
     );
   }
 
   async function closeManagedSession(sessionId: number): Promise<void> {
+    const keepalive = sessionKeepalives.get(sessionId);
+    if (keepalive) {
+      keepalive.stop();
+      sessionKeepalives.delete(sessionId);
+    }
     const sessionPage = viewerToPage.get(sessionId) ?? friendsPage;
     await sessionPage.evaluate((id) => (globalThis as any).__closeSession(id), sessionId);
     viewerToPage.delete(sessionId);
@@ -1601,6 +2017,10 @@ export async function openBrowserSession(options: BrowserSessionOptions = {}): P
 
     getSessionShards(): SessionShards {
       return { ...sessionShards };
+    },
+
+    getProxyConfig(): BrowserProxyConfig | undefined {
+      return options.proxy ? { ...options.proxy } : undefined;
     },
 
     async ensureSessionShards(): Promise<SessionShards> {
@@ -1836,14 +2256,38 @@ export async function openBrowserSession(options: BrowserSessionOptions = {}): P
       return null;
     },
 
-    async fetchMemeTrending(): Promise<unknown> {
+    async fetchMemeTrending(accessToken?: string, refreshToken?: string): Promise<unknown> {
       const host = sessionShards.apiHost || API_SHARD_PROBE_HOSTS[0];
-      const url = `https://${host}/meme-trending-v2?v=${Date.now()}`;
-      return friendsPage.evaluate(async (u) => {
-        const r = await fetch(u, { credentials: 'include' });
-        if (!r.ok) throw new Error('status ' + r.status);
-        return r.json();
-      }, url);
+      // HAR: GET /meme-trending-v2?timePeriod=24h&v=... (auth cookies when logged in).
+      const url = `https://${host}/meme-trending-v2?timePeriod=24h&v=${Date.now()}`;
+
+      const runFetch = () =>
+        friendsPage.evaluate(async (u) => {
+          const r = await fetch(u, { credentials: 'include' });
+          if (!r.ok) {
+            const body = await r.text().catch(() => '');
+            throw new Error(`status ${r.status}${body ? `: ${body.slice(0, 120)}` : ''}`);
+          }
+          return r.json();
+        }, url);
+
+      if (!accessToken) return runFetch();
+
+      const domains = buildAuthCookieDomains(sessionShards.clusterWsUrl);
+      const cookiesToAdd: { name: string; value: string; domain: string; path: string }[] = [];
+      for (const domain of domains) {
+        cookiesToAdd.push({ name: 'auth-access-token', value: accessToken, domain, path: '/' });
+        if (refreshToken) {
+          cookiesToAdd.push({ name: 'auth-refresh-token', value: refreshToken, domain, path: '/' });
+        }
+      }
+      await context.addCookies(cookiesToAdd);
+      try {
+        return await runFetch();
+      } finally {
+        await context.clearCookies({ name: 'auth-access-token' });
+        await context.clearCookies({ name: 'auth-refresh-token' });
+      }
     },
 
     async connectViewer(accessToken: string, refreshToken: string, tokenInfo: any, pingJitterMs?: number, slotIndex: number = 0): Promise<number> {
@@ -1916,6 +2360,8 @@ export async function openBrowserSession(options: BrowserSessionOptions = {}): P
     },
 
     async disconnectAllViewers(): Promise<void> {
+      for (const handle of sessionKeepalives.values()) handle.stop();
+      sessionKeepalives.clear();
       await Promise.all(friendsPages.map(p => p.evaluate('window.__disconnectAll()')));
       viewerToPage.clear();
       console.log('[BrowserAuth] All viewers disconnected');

@@ -1,9 +1,9 @@
 import { EventEmitter } from "events";
 import type { LoadedAccount } from "./account-manager";
-import type { BrowserSession } from "../browser-auth";
+import { API_SHARD_PROBE_HOSTS, type BrowserSession } from "../browser-auth";
 import { FeedPool } from "../session/feed-pool";
 import { SessionActor, type SessionBridge, type SessionMode } from "../session/session-actor";
-import { planEnterFromFeed } from "../session/token-navigation-plan";
+import { planEnterFromFeed, planMinimalViewer, planPageUpdateOnlyViewer } from "../session/token-navigation-plan";
 
 export interface TokenInfo {
   [key: string]: unknown;
@@ -15,6 +15,7 @@ export interface TokenInfo {
   isMigrated: boolean;
   supply: number;
   price: number;
+  chain: string;
 }
 
 function firstString(...values: unknown[]): string | undefined {
@@ -158,6 +159,11 @@ export function normalizeTokenInfo(
         token?.price,
         fallback.price,
       ) ?? 0,
+    chain:
+      firstString(
+        data?.chain,
+        fallback.chain,
+      ) ?? "sol",
   };
 }
 
@@ -172,6 +178,10 @@ export interface ConnectAllOptions {
   connectRetryMaxMs?: number;
   /** Max number of viewer handshakes in flight at the same time. Default 1 (serial). */
   concurrency?: number;
+  /** full = OG room burst; minimal = early rooms+e-+pageUpdate; page-update = friends pageUpdate only (no token rooms). */
+  navMode?: "full" | "minimal" | "page-update";
+  /** Fixed delay before friends WS reconnect after close. Default 20000. */
+  friendsReconnectDelayMs?: number;
 }
 
 export interface ViewerAccountGroup {
@@ -210,6 +220,8 @@ export class ViewerService extends EventEmitter {
   private warmedAccounts: Set<string> = new Set(); // publicKeys that have been bootstrapped this process
   private tokenInfo: TokenInfo | null = null;
   private bootstrapDisabled = false;
+  private navMode: "full" | "minimal" | "page-update" = "full";
+  private friendsReconnectDelayMs: number | undefined;
   // Halts an in-progress connectAll loop. Set by either stop mode so no new
   // viewers join once a stop has been requested.
   private connectCancelled = false;
@@ -259,12 +271,7 @@ export class ViewerService extends EventEmitter {
       if (!looksLikeTokenInfoData(data)) return null;
       return normalizeTokenInfo(pairAddress, data);
     };
-    for (const host of [
-      "api9.axiom.trade",
-      "api7.axiom.trade",
-      "api3.axiom.trade",
-      "api2.axiom.trade",
-    ]) {
+    for (const host of API_SHARD_PROBE_HOSTS) {
       try {
         const tokenInfo = await tryHost(host);
         if (tokenInfo) return tokenInfo;
@@ -295,7 +302,7 @@ export class ViewerService extends EventEmitter {
     const message = String(err?.message || err || "");
     return (
       /friends closed code=1006/i.test(message) ||
-      /cluster9 closed code=1006/i.test(message) ||
+      /cluster\d+(?:\.axiom\.trade)? closed code=1006/i.test(message) ||
       /WS timeout/i.test(message) ||
       /Unexpected response code:\s*425/i.test(message)
     );
@@ -424,11 +431,23 @@ export class ViewerService extends EventEmitter {
     const previousMode = this.actorModes.get(publicKey);
 
     if (state.sessionId == null) {
-      if (previousMode === "deploy" || this.connectedViewers.has(publicKey)) {
-        this.connectedViewers.delete(publicKey);
-        this.emit("viewer-disconnected", publicKey);
-      }
+      const hadDeployPresence =
+        previousMode === "deploy" || this.connectedViewers.has(publicKey);
+      const hadWarmupPresence = previousMode === "warmup";
+      this.connectedViewers.delete(publicKey);
       this.actorModes.delete(publicKey);
+      // Actor ended (stop or fatal socket death) — drop from warmup roster so
+      // "warming N" does not stay stuck after the session is gone.
+      this.sessionActors.delete(publicKey);
+      this.actorSessions.delete(publicKey);
+      if (hadDeployPresence) {
+        // Was on a deploy token — keep the strikethrough "disconnected" chip.
+        this.emit("viewer-disconnected", publicKey);
+      } else if (hadWarmupPresence) {
+        // Warmup stop should return the row to auth status (ok/due), not
+        // look like a failed viewer disconnect.
+        this.emit("viewer-cleared", publicKey);
+      }
       return;
     }
 
@@ -464,20 +483,65 @@ export class ViewerService extends EventEmitter {
     this.connectedViewers.delete(publicKey);
   }
 
-  async startWarmupForGroups(groups: ViewerAccountGroup[]): Promise<void> {
-    for (const group of groups) {
+  async startWarmupForGroups(
+    groups: ViewerAccountGroup[],
+    opts: Pick<
+      ConnectGroupsOptions,
+      "minGapMs" | "maxGapMs" | "groupStartDelayMinMs" | "groupStartDelayMaxMs"
+    > = {},
+  ): Promise<void> {
+    const accountMinGap = Math.max(0, Math.floor(opts.minGapMs ?? 5000));
+    const accountMaxGap = Math.max(accountMinGap, Math.floor(opts.maxGapMs ?? 15_000));
+    const groupMinGap = Math.max(0, Math.floor(opts.groupStartDelayMinMs ?? 5000));
+    const groupMaxGap = Math.max(groupMinGap, Math.floor(opts.groupStartDelayMaxMs ?? 15_000));
+
+    for (let groupIndex = 0; groupIndex < groups.length; groupIndex++) {
+      const group = groups[groupIndex]!;
+      if (groupIndex > 0) {
+        const gap = this.randomDelayMs(groupMinGap, groupMaxGap);
+        if (gap > 0) {
+          console.log(
+            `[Viewer] warmup stagger ${group.label}: waiting ${gap}ms before group start`,
+          );
+          await this.sleep(gap);
+        }
+      }
+
+      const feedAccount = group.accounts[0];
       const feed = new FeedPool({
-        fetchTrending: () => group.session.fetchMemeTrending(),
+        fetchTrending: () =>
+          group.session.fetchMemeTrending(
+            feedAccount?.accessToken,
+            feedAccount?.refreshToken,
+          ),
       });
       try {
         await feed.refresh();
+        console.log(
+          `[Viewer] ${group.label} warmup feed ready (${feed.list().length} token(s))`,
+        );
       } catch (err: any) {
         console.log(
           `[Viewer] ${group.label} warmup feed refresh failed: ${err?.message || err}`,
         );
       }
 
-      for (const account of group.accounts) {
+      if (typeof (group.session as any).ensurePageSlots === "function") {
+        await (group.session as any).ensurePageSlots(group.accounts.length);
+      }
+
+      for (let accountIndex = 0; accountIndex < group.accounts.length; accountIndex++) {
+        const account = group.accounts[accountIndex]!;
+        if (accountIndex > 0) {
+          const gap = this.randomDelayMs(accountMinGap, accountMaxGap);
+          if (gap > 0) {
+            console.log(
+              `[Viewer] warmup stagger ${account.publicKey.slice(0, 8)}: waiting ${gap}ms`,
+            );
+            await this.sleep(gap);
+          }
+        }
+
         const existing = this.sessionActors.get(account.publicKey);
         if (existing && this.actorSessions.get(account.publicKey) === group.session) {
           continue;
@@ -497,6 +561,7 @@ export class ViewerService extends EventEmitter {
         this.actorSessions.set(account.publicKey, group.session);
         await actor.startWarmup(account.accessToken, account.refreshToken, {
           pingJitterMs: Math.floor(Math.random() * 1000),
+          slotIndex: accountIndex,
         });
       }
     }
@@ -506,6 +571,14 @@ export class ViewerService extends EventEmitter {
     const publicKeys = [...this.sessionActors.keys()];
     await Promise.all(publicKeys.map((publicKey) => this.closeActor(publicKey)));
     this.connectedViewers.clear();
+  }
+
+  isSessionWarmupRunning(): boolean {
+    return this.sessionActors.size > 0;
+  }
+
+  getSessionWarmupCount(): number {
+    return this.sessionActors.size;
   }
 
   private canUseManagedSession(session: BrowserSession): boolean {
@@ -525,6 +598,7 @@ export class ViewerService extends EventEmitter {
       this.emit("viewer-failed", account.publicKey);
       return false;
     }
+
     this.emit("viewer-connecting", account.publicKey);
     try {
       const sessionId = await session.openSession(
@@ -533,9 +607,24 @@ export class ViewerService extends EventEmitter {
         {
           pingJitterMs: Math.floor(Math.random() * 1000),
           slotIndex,
+          // page-update mode isolates friends-only behavior: skip the global
+          // liveness rooms so no cluster activity happens at all.
+          livenessRooms: this.navMode !== "page-update",
+          ...(typeof this.friendsReconnectDelayMs === "number"
+            ? { friendsReconnectDelayMs: this.friendsReconnectDelayMs }
+            : {}),
         },
       );
-      await session.navigateSession(sessionId, planEnterFromFeed(this.tokenInfo));
+      // Select the nav plan by mode. All modes run through the same Chrome
+      // (Playwright) socket pair — the plan only changes which rooms are
+      // joined and whether a friends pageUpdate is sent.
+      const plan =
+        this.navMode === "page-update"
+          ? planPageUpdateOnlyViewer(this.tokenInfo)
+          : this.navMode === "minimal"
+            ? planMinimalViewer(this.tokenInfo)
+            : planEnterFromFeed(this.tokenInfo);
+      await session.navigateSession(sessionId, plan);
       this.connectedViewers.set(account.publicKey, {
         viewerId: sessionId,
         session,
@@ -552,28 +641,53 @@ export class ViewerService extends EventEmitter {
     }
   }
 
+  private closeViewerConnection(connection: ViewerConnection): Promise<void> | void {
+    if (connection.closeMode === "session") {
+      return connection.session.closeSession(connection.viewerId);
+    }
+    return connection.session.disconnectViewer(connection.viewerId);
+  }
+
+  private async teardownViewer(
+    publicKey: string,
+    connection: ViewerConnection,
+  ): Promise<void> {
+    if (
+      connection.closeMode === "session" &&
+      this.sessionActors.has(publicKey)
+    ) {
+      await this.closeActor(publicKey).catch(() => {});
+      return;
+    }
+    await Promise.resolve(this.closeViewerConnection(connection)).catch(() => {});
+  }
+
   private async deployAccount(
     account: LoadedAccount,
     session: BrowserSession,
     slotIndex: number,
     retry: { attempts?: number; minDelayMs?: number; maxDelayMs?: number } = {},
   ): Promise<boolean> {
-    const actor = this.sessionActors.get(account.publicKey);
-    if (actor && this.actorSessions.get(account.publicKey) === session) {
-      if (!this.tokenInfo) {
-        this.emit("viewer-failed", account.publicKey);
-        return false;
-      }
-      this.emit("viewer-connecting", account.publicKey);
-      try {
-        await actor.gotoDeploy(this.tokenInfo);
-        return true;
-      } catch (err: any) {
-        console.log(
-          `[Viewer] ${account.publicKey.slice(0, 8)} deploy failed: ${err.message}`,
-        );
-        this.emit("viewer-failed", account.publicKey);
-        return false;
+    // Minimal / page-update modes always open a fresh Chrome session —
+    // do not reuse Discover/Pulse SessionActors (they use the full room plan).
+    if (this.navMode === "full") {
+      const actor = this.sessionActors.get(account.publicKey);
+      if (actor && this.actorSessions.get(account.publicKey) === session) {
+        if (!this.tokenInfo) {
+          this.emit("viewer-failed", account.publicKey);
+          return false;
+        }
+        this.emit("viewer-connecting", account.publicKey);
+        try {
+          await actor.gotoDeploy(this.tokenInfo);
+          return true;
+        } catch (err: any) {
+          console.log(
+            `[Viewer] ${account.publicKey.slice(0, 8)} deploy failed: ${err.message}`,
+          );
+          this.emit("viewer-failed", account.publicKey);
+          return false;
+        }
       }
     }
 
@@ -583,7 +697,6 @@ export class ViewerService extends EventEmitter {
 
     return this.connectAccount(account, slotIndex, true, session, retry);
   }
-
 
   private async warmClusterPath(session: BrowserSession, account: LoadedAccount): Promise<void> {
     if (this.clusterWarmedSessions.has(session)) return;
@@ -618,6 +731,17 @@ export class ViewerService extends EventEmitter {
       this.warmedAccounts.clear();
     }
     this.bootstrapDisabled = nextBootstrapDisabled;
+    this.navMode =
+      opts.navMode === "page-update"
+        ? "page-update"
+        : opts.navMode === "minimal"
+          ? "minimal"
+          : "full";
+    this.friendsReconnectDelayMs =
+      typeof opts.friendsReconnectDelayMs === "number" &&
+      Number.isFinite(opts.friendsReconnectDelayMs)
+        ? Math.max(0, Math.floor(opts.friendsReconnectDelayMs))
+        : undefined;
     this.connectCancelled = false;
 
     let connected = 0;
@@ -632,14 +756,16 @@ export class ViewerService extends EventEmitter {
           if (startDelayMs > 0) await this.sleep(startDelayMs);
           if (this.connectCancelled) return;
 
-          const order = shouldShuffle ? shuffle(group.accounts) : [...group.accounts];
+          const accountsToConnect = shouldShuffle
+            ? shuffle(group.accounts)
+            : [...group.accounts];
           const retry = {
             attempts: opts.connectAttempts ?? 3,
             minDelayMs: opts.connectRetryMinMs ?? 15_000,
             maxDelayMs: opts.connectRetryMaxMs ?? 30_000,
           };
 
-          for (const account of order) {
+          for (const account of accountsToConnect) {
             if (this.connectCancelled) return;
             const gap = this.randomDelayMs(minGap, maxGap);
             if (gap > 0) await this.sleep(gap);
@@ -650,13 +776,7 @@ export class ViewerService extends EventEmitter {
               const connection = this.connectedViewers.get(account.publicKey);
               this.connectedViewers.delete(account.publicKey);
               if (connection) {
-                if (connection.closeMode === "session" && this.sessionActors.has(account.publicKey)) {
-                  await this.closeActor(account.publicKey).catch(() => {});
-                } else if (connection.closeMode === "session") {
-                  await connection.session.closeSession(connection.viewerId).catch(() => {});
-                } else {
-                  await connection.session.disconnectViewer(connection.viewerId).catch(() => {});
-                }
+                await this.teardownViewer(account.publicKey, connection);
               }
               this.emit("viewer-disconnected", account.publicKey);
               return;
@@ -683,7 +803,6 @@ export class ViewerService extends EventEmitter {
     const minGap = Math.max(0, Math.floor(rawMin));
     const maxGap = Math.max(minGap, Math.floor(rawMax));
     const shouldShuffle = opts.shuffle ?? true;
-    const order = shouldShuffle ? shuffle(accounts) : [...accounts];
     // Toggling the bootstrap flag invalidates prior warm-up, so re-bootstrap
     // (or skip) every account on this run.
     const nextBootstrapDisabled = opts.bootstrapDisabled ?? false;
@@ -691,7 +810,20 @@ export class ViewerService extends EventEmitter {
       this.warmedAccounts.clear();
     }
     this.bootstrapDisabled = nextBootstrapDisabled;
+    this.navMode =
+      opts.navMode === "page-update"
+        ? "page-update"
+        : opts.navMode === "minimal"
+          ? "minimal"
+          : "full";
+    this.friendsReconnectDelayMs =
+      typeof opts.friendsReconnectDelayMs === "number" &&
+      Number.isFinite(opts.friendsReconnectDelayMs)
+        ? Math.max(0, Math.floor(opts.friendsReconnectDelayMs))
+        : undefined;
     this.connectCancelled = false;
+
+    let order = shouldShuffle ? shuffle(accounts) : [...accounts];
 
     const concurrency = Math.max(1, Math.floor(opts.concurrency ?? 1));
     // Pre-grow the friendsPage pool so each worker gets its own page.
@@ -774,13 +906,7 @@ export class ViewerService extends EventEmitter {
           const connection = this.connectedViewers.get(account.publicKey);
           this.connectedViewers.delete(account.publicKey);
           if (connection) {
-            if (connection.closeMode === "session" && this.sessionActors.has(account.publicKey)) {
-              await this.closeActor(account.publicKey).catch(() => {});
-            } else if (connection.closeMode === "session") {
-              await connection.session.closeSession(connection.viewerId).catch(() => {});
-            } else {
-              await connection.session.disconnectViewer(connection.viewerId).catch(() => {});
-            }
+            await this.teardownViewer(account.publicKey, connection);
           }
           this.emit("viewer-disconnected", account.publicKey);
           return;
@@ -811,7 +937,11 @@ export class ViewerService extends EventEmitter {
       this.closeActor(publicKey).catch(() => {});
     }
     if (legacySessions.size === 0 && actorKeysToClose.length === 0 && this.browserSession) {
-      legacySessions.add(this.browserSession);
+      // Only force legacy disconnectAll when we actually used legacy viewers.
+      const hadLegacy = [...this.connectedViewers.values()].some(
+        (c) => c.closeMode !== "session",
+      );
+      if (hadLegacy) legacySessions.add(this.browserSession);
     }
     for (const session of legacySessions) {
       session.disconnectAllViewers().catch(() => {});
@@ -852,11 +982,7 @@ export class ViewerService extends EventEmitter {
         }
       } else {
         try {
-          if (connection.closeMode === "session") {
-            await connection.session.closeSession(connection.viewerId);
-          } else {
-            await connection.session.disconnectViewer(connection.viewerId);
-          }
+          await this.teardownViewer(publicKey, connection);
         } catch {}
         this.connectedViewers.delete(publicKey);
         this.emit("viewer-disconnected", publicKey);

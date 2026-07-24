@@ -36,6 +36,17 @@ export type SessionStateEvent = "state";
 
 type StateListener = (state: SessionState) => void;
 
+const SOCKET_DEAD_RE =
+  /cluster socket is not open|friends socket is not open|session .+ is not open|session closed|friends closed|cluster\d*\.?axiom\.trade closed|WS timeout/i;
+
+const MAX_CONSECUTIVE_REOPENS = 3;
+const MAX_OPEN_ATTEMPTS = 3;
+
+function isSocketDeadError(err: unknown): boolean {
+  const message = err instanceof Error ? err.message : String(err ?? "");
+  return SOCKET_DEAD_RE.test(message);
+}
+
 export class SessionActor {
   private readonly publicKey: string;
   private readonly bridge: SessionBridge;
@@ -50,6 +61,10 @@ export class SessionActor {
   private warmupGeneration = 0;
   private loopPromise: Promise<void> | null = null;
   private navInFlight: Promise<void> = Promise.resolve();
+  private accessToken: string | null = null;
+  private refreshToken: string | null = null;
+  private openOpts: unknown = undefined;
+  private consecutiveReopens = 0;
 
   constructor(opts: {
     publicKey: string;
@@ -72,12 +87,21 @@ export class SessionActor {
   }
 
   async startWarmup(access: unknown, refresh: unknown, openOpts: unknown): Promise<void> {
+    this.accessToken = access as string;
+    this.refreshToken = refresh as string;
+    this.openOpts = openOpts;
+
     if (this.sessionId === null) {
-      this.sessionId = await this.bridge.openSession(access as string, refresh as string, openOpts);
+      this.sessionId = await this.bridge.openSession(
+        this.accessToken,
+        this.refreshToken,
+        openOpts,
+      );
     }
 
     this.closed = false;
     this.mode = "warmup";
+    this.consecutiveReopens = 0;
     this.emitState();
     this.startWarmupLoop();
   }
@@ -137,9 +161,8 @@ export class SessionActor {
   }
 
   private startWarmupLoop(): void {
-    const sessionId = this.requireSession();
     const generation = ++this.warmupGeneration;
-    this.loopPromise = this.runWarmupLoop(sessionId, generation);
+    this.loopPromise = this.runWarmupLoop(generation);
     this.loopPromise.catch(() => {
       // Keep background warmup failures from becoming unhandled rejections.
     });
@@ -149,30 +172,112 @@ export class SessionActor {
     this.warmupGeneration++;
   }
 
-  private async runWarmupLoop(sessionId: number, generation: number): Promise<void> {
+  private async runWarmupLoop(generation: number): Promise<void> {
     while (this.isWarmupActive(generation)) {
-      await this.navigate(sessionId, [this.contextPageUpdateAction()]);
-      if (!this.isWarmupActive(generation)) return;
-
-      await this.waitFor(this.timing.contextGapMs);
-      if (!this.isWarmupActive(generation)) return;
-
-      await this.feed.refresh().catch(() => {});
-      if (!this.isWarmupActive(generation)) return;
-
-      const next = this.feed.pickRandom(this.timing.rng);
-      if (next) {
-        const actions = this.currentToken
-          ? planTokenToToken(this.currentToken, next, this.timing.rng)
-          : planEnterFromFeed(next, this.timing.rng);
-        await this.navigate(sessionId, actions);
+      try {
+        const contextNav = await this.navigateWarmup(generation, [
+          this.contextPageUpdateAction(),
+        ]);
         if (!this.isWarmupActive(generation)) return;
-        this.currentToken = next;
-        this.emitState();
-      }
+        if (contextNav === "reopened") continue;
 
-      await this.waitFor(this.timing.dwellMs);
+        await this.waitFor(this.timing.contextGapMs);
+        if (!this.isWarmupActive(generation)) return;
+
+        await this.feed.refresh().catch(() => {});
+        if (!this.isWarmupActive(generation)) return;
+
+        const next = this.feed.pickRandom(this.timing.rng);
+        if (next) {
+          const actions = this.currentToken
+            ? planTokenToToken(this.currentToken, next, this.timing.rng)
+            : planEnterFromFeed(next, this.timing.rng);
+          const tokenNav = await this.navigateWarmup(generation, actions);
+          if (!this.isWarmupActive(generation)) return;
+          if (tokenNav === "reopened") continue;
+          this.currentToken = next;
+          this.emitState();
+        }
+
+        await this.waitFor(this.timing.dwellMs);
+      } catch (err) {
+        if (!this.isWarmupActive(generation)) return;
+        console.warn(
+          `[SessionActor] ${this.publicKey.slice(0, 8)} warmup stopped: ${
+            err instanceof Error ? err.message : String(err)
+          }`,
+        );
+        await this.forceClose().catch(() => {});
+        return;
+      }
     }
+  }
+
+  private async navigateWarmup(
+    generation: number,
+    actions: NavAction[],
+  ): Promise<"ok" | "reopened"> {
+    const sessionId = this.requireSession();
+    try {
+      await this.navigate(sessionId, actions);
+      this.consecutiveReopens = 0;
+      return "ok";
+    } catch (err) {
+      if (!isSocketDeadError(err) || !this.isWarmupActive(generation)) throw err;
+      this.consecutiveReopens += 1;
+      if (this.consecutiveReopens > MAX_CONSECUTIVE_REOPENS) {
+        throw new Error(
+          `warmup reconnect exhausted after ${MAX_CONSECUTIVE_REOPENS} consecutive socket deaths`,
+        );
+      }
+      console.warn(
+        `[SessionActor] ${this.publicKey.slice(0, 8)} socket dead during warmup; reopening (${this.consecutiveReopens}/${MAX_CONSECUTIVE_REOPENS})`,
+      );
+      await this.reopenSession();
+      return "reopened";
+    }
+  }
+
+  private async reopenSession(): Promise<number> {
+    if (this.accessToken == null || this.refreshToken == null) {
+      throw new Error("SessionActor cannot reopen without stored credentials");
+    }
+
+    const oldSessionId = this.sessionId;
+    // Drop the dead id before reopen so a failed open does not leave a stale
+    // sessionId that forceClose would try to close again.
+    this.sessionId = null;
+    this.currentToken = null;
+    if (oldSessionId !== null) {
+      await this.bridge.closeSession(oldSessionId).catch(() => {});
+    }
+
+    let lastErr: unknown;
+    for (let attempt = 1; attempt <= MAX_OPEN_ATTEMPTS; attempt++) {
+      try {
+        // Rooms were on the dead socket — resume from Discover/Pulse, not mid-token.
+        this.sessionId = await this.bridge.openSession(
+          this.accessToken,
+          this.refreshToken,
+          this.openOpts,
+        );
+        this.emitState();
+        return this.sessionId;
+      } catch (err) {
+        lastErr = err;
+        if (!isSocketDeadError(err) || attempt >= MAX_OPEN_ATTEMPTS) break;
+        console.warn(
+          `[SessionActor] ${this.publicKey.slice(0, 8)} reopen handshake failed (${attempt}/${MAX_OPEN_ATTEMPTS}): ${
+            err instanceof Error ? err.message : String(err)
+          }; retrying`,
+        );
+        await new Promise<void>((resolve) => setTimeout(resolve, 250 * attempt));
+      }
+    }
+
+    throw lastErr instanceof Error
+      ? lastErr
+      : new Error(String(lastErr ?? "reopenSession failed"));
   }
 
   private isWarmupActive(generation: number): boolean {

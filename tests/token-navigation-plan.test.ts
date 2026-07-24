@@ -4,6 +4,9 @@ import {
   planEnterFromFeed,
   planTokenToToken,
   planLeaveAll,
+  planMinimalViewer,
+  planPageUpdateOnlyViewer,
+  GLOBAL_LIVENESS_ROOMS,
 } from "../src/session/token-navigation-plan";
 
 const T = { pairAddress: "Pair111", tokenAddress: "Token111" };
@@ -59,4 +62,96 @@ test("planLeaveAll leaves token rooms including e-", () => {
   const rooms = planLeaveAll(T).filter((a) => a.op === "leave").map((a) => a.room!);
   assert.equal(rooms.includes("e-Pair111"), true);
   assert.equal(rooms.includes("t:Pair111"), true);
+});
+
+test("planMinimalViewer joins early rooms + e-{pair} and sends meme pageUpdate", () => {
+  const plan = planMinimalViewer(T);
+  assert.equal(plan.length, 5);
+  const joins = plan.filter((a) => a.op === "join").map((a) => a.room!).sort();
+  assert.deepEqual(joins, [
+    "Pair111_refresh",
+    "e-Pair111",
+    "f:Pair111",
+    "t:Pair111",
+  ]);
+  const pu = plan.find((a) => a.op === "pageUpdate");
+  assert.ok(pu);
+  assert.equal(pu.ws, "friends");
+  assert.equal(pu.atMs, 0);
+  assert.deepEqual(pu.pageUpdate, {
+    type: "pageUpdate",
+    page: "meme",
+    subpage: {
+      pairAddress: "Pair111",
+      tokenAddress: "Token111",
+    },
+    chain: "sol",
+  });
+});
+
+test("planPageUpdateOnlyViewer sends only a friends pageUpdate with no cluster token rooms", () => {
+  const plan = planPageUpdateOnlyViewer(T);
+  assert.equal(plan.length, 1);
+  assert.equal(plan.some((a) => a.ws === "cluster"), false);
+  const pu = plan.find((a) => a.op === "pageUpdate");
+  assert.ok(pu);
+  assert.equal(pu.ws, "friends");
+  assert.equal(pu.atMs, 0);
+  assert.deepEqual(pu.pageUpdate, {
+    type: "pageUpdate",
+    page: "meme",
+    subpage: {
+      pairAddress: "Pair111",
+      tokenAddress: "Token111",
+    },
+    chain: "sol",
+  });
+});
+
+test("planPageUpdateOnlyViewer carries robinhood chain into the pageUpdate", () => {
+  const rhToken = {
+    pairAddress: "0xRhPair",
+    tokenAddress: "0xRhToken",
+    chain: "robinhood",
+  };
+  const plan = planPageUpdateOnlyViewer(rhToken);
+  const pu = plan.find((a) => a.op === "pageUpdate");
+  assert.ok(pu);
+  assert.equal((pu.pageUpdate as { chain: string }).chain, "robinhood");
+});
+
+test("GLOBAL_LIVENESS_ROOMS contains the high-traffic global rooms and no token-specific rooms", () => {
+  // These are the global broadcast rooms observed in the HAR (joined at 0ms on
+  // every cluster9 open). They keep the socket non-idle so it is not reaped.
+  for (const need of [
+    "sol_price",
+    "btc_price",
+    "eth_price",
+    "bnb_price",
+    "block_hash",
+    "sol-priority-fee-v2",
+    "connection_monitor",
+    "online-users-count",
+    "lighthouse",
+  ]) {
+    assert.equal(
+      GLOBAL_LIVENESS_ROOMS.includes(need as never),
+      true,
+      `missing ${need}`,
+    );
+  }
+  // Must NOT contain token-specific rooms — these are connection-level.
+  for (const forbidden of ["t:", "f:", "e-", "td:", "s:", "b-", "a:", "kol_tx:", "soc_bub:", "pump-cto:"]) {
+    assert.equal(
+      GLOBAL_LIVENESS_ROOMS.some((r) => r.startsWith(forbidden)),
+      false,
+      `should not contain a ${forbidden} token room`,
+    );
+  }
+  // No duplicates.
+  assert.equal(
+    GLOBAL_LIVENESS_ROOMS.length,
+    new Set(GLOBAL_LIVENESS_ROOMS).size,
+    "duplicate liveness rooms",
+  );
 });

@@ -44,3 +44,16 @@ test("pageUpdateMeme includes pairAddress in subpage and spreads tokenInfo", () 
   assert.equal((payload.subpage as { tokenAddress: string }).tokenAddress, "Token111");
   assert.equal((payload.subpage as { ticker: string }).ticker, "TEST");
 });
+
+test("pageUpdateMeme uses explicit chain (robinhood) instead of default sol", () => {
+  const payload = pageUpdateMeme(
+    { pairAddress: "0xRhPair", tokenAddress: "0xRhToken" },
+    "robinhood",
+  );
+  assert.equal(payload.chain, "robinhood");
+});
+
+test("pageUpdateDiscover and pageUpdatePulse accept explicit chain", () => {
+  assert.equal(pageUpdateDiscover("robinhood").chain, "robinhood");
+  assert.equal(pageUpdatePulse("eth").chain, "eth");
+});

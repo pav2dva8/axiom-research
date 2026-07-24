@@ -7,6 +7,7 @@ import { Keypair } from "@solana/web3.js";
 import bs58 from "bs58";
 
 import { RegisterService } from "../src/ui/register-service";
+import type { RegisterSignupSession } from "../src/ui/register-service";
 import type { AuthTokens, WalletInfo } from "../src/auth";
 import type { ProxyConfig } from "../src/proxy-groups";
 
@@ -23,12 +24,24 @@ function tokens(pk: string): AuthTokens {
   return { accessToken: `a-${pk}`, refreshToken: `r-${pk}`, cookies: `c=${pk}` };
 }
 
+function mockSession(
+  signupAccount: (wallet: WalletInfo) => Promise<AuthTokens>,
+  onClose?: () => void,
+): RegisterSignupSession {
+  return {
+    signupAccount,
+    close: async () => {
+      onClose?.();
+    },
+  };
+}
+
 test("register without proxies writes keys and tokens for amountPerIp", async () => {
   const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "reg-"));
   fs.mkdirSync(path.join(cwd, "accounts", "tokens"), { recursive: true });
   const wallets = [Keypair.generate(), Keypair.generate(), Keypair.generate()].map(walletFromKeypair);
   let wi = 0;
-  const calls: Array<string | undefined> = [];
+  const labels: string[] = [];
   const svc = new RegisterService({
     cwd,
     now: () => new Date(2026, 6, 11),
@@ -38,9 +51,9 @@ test("register without proxies writes keys and tokens for amountPerIp", async ()
       const w = wallets[wi++];
       return { publicKey: w.publicKey, secretKeyBase58: w.secretKeyBase58, wallet: w };
     },
-    signup: async (wallet, agent) => {
-      calls.push(agent === undefined ? "direct" : "proxy");
-      return tokens(wallet.publicKey);
+    openSession: async (ctx) => {
+      labels.push(ctx.label);
+      return mockSession(async (wallet) => tokens(wallet.publicKey));
     },
   });
 
@@ -52,7 +65,7 @@ test("register without proxies writes keys and tokens for amountPerIp", async ()
   assert.equal(lines.length, 2);
   assert.equal(lines[0], wallets[0].secretKeyBase58);
   assert.ok(fs.existsSync(path.join(cwd, "accounts", "tokens", `${wallets[0].publicKey}.json`)));
-  assert.deepEqual(calls, ["direct", "direct"]);
+  assert.deepEqual(labels, ["direct"]);
 });
 
 test("register with proxies runs IPs sequentially and amount per IP", async () => {
@@ -62,64 +75,144 @@ test("register with proxies runs IPs sequentially and amount per IP", async () =
     { id: 1, label: "proxy 1", server: "http://1.1.1.1:1", username: "a", password: "b" },
     { id: 2, label: "proxy 2", server: "http://2.2.2.2:2" },
   ];
-  const agents: string[] = [];
+  const sessionLabels: string[] = [];
+  const signupLabels: string[] = [];
   let n = 0;
   const svc = new RegisterService({
     cwd,
     now: () => new Date(2026, 6, 11),
     sleep: async () => {},
     loadProxies: () => proxies,
-    createAgent: (url) => ({ url }),
     generateWallet: () => {
       const kp = Keypair.generate();
       const w = walletFromKeypair(kp);
       n++;
       return { publicKey: w.publicKey, secretKeyBase58: w.secretKeyBase58, wallet: w };
     },
-    signup: async (_wallet, agent) => {
-      agents.push((agent as any).url);
-      return tokens(`pk${agents.length}`);
+    openSession: async (ctx) => {
+      sessionLabels.push(ctx.label);
+      assert.ok(ctx.proxy);
+      return mockSession(async () => {
+        signupLabels.push(ctx.label);
+        return tokens(`pk${signupLabels.length}`);
+      });
     },
   });
 
   const result = await svc.run({ amountPerIp: 2, delaySec: 0, useProxies: true }, () => {});
   assert.equal(result.succeeded, 4);
   assert.equal(n, 4);
-  assert.equal(agents[0], "http://a:b@1.1.1.1:1");
-  assert.equal(agents[1], "http://a:b@1.1.1.1:1");
-  assert.equal(agents[2], "http://2.2.2.2:2");
-  assert.equal(agents[3], "http://2.2.2.2:2");
+  assert.deepEqual(sessionLabels, ["proxy 1", "proxy 2"]);
+  assert.deepEqual(signupLabels, ["proxy 1", "proxy 1", "proxy 2", "proxy 2"]);
 });
 
-test("signup failure skips remaining slots on that IP", async () => {
+test("signup failure retries then stops after MAX_CONSECUTIVE_FAILURES (no spam across proxies)", async () => {
   const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "reg-"));
   fs.mkdirSync(path.join(cwd, "accounts", "tokens"), { recursive: true });
   const proxies: ProxyConfig[] = [
     { id: 1, label: "proxy 1", server: "http://1.1.1.1:1" },
     { id: 2, label: "proxy 2", server: "http://2.2.2.2:2" },
   ];
-  let attempts = 0;
+  let signupCalls = 0;
+  let sessionsOpened = 0;
   const svc = new RegisterService({
     cwd,
     now: () => new Date(2026, 6, 11),
     sleep: async () => {},
     loadProxies: () => proxies,
-    createAgent: (url) => ({ url }),
     generateWallet: () => {
       const w = walletFromKeypair(Keypair.generate());
       return { publicKey: w.publicKey, secretKeyBase58: w.secretKeyBase58, wallet: w };
     },
-    signup: async () => {
-      attempts++;
-      if (attempts === 1) throw new Error("rate limited");
-      return tokens(`ok${attempts}`);
+    openSession: async () => {
+      sessionsOpened++;
+      return mockSession(async () => {
+        signupCalls++;
+        throw new Error("rate limited");
+      });
     },
   });
 
   const result = await svc.run({ amountPerIp: 3, delaySec: 0, useProxies: true }, () => {});
-  assert.equal(attempts, 4);
-  assert.equal(result.succeeded, 3);
-  assert.equal(result.failed, 1);
+  // Each signup gets 3 tries (1 + 2 retries); 3 consecutive failures stop the
+  // job => 3 signups × 3 tries = 9 signup calls. Only one proxy session opened
+  // because the job stops before reaching proxy 2.
+  assert.equal(signupCalls, 9);
+  assert.equal(sessionsOpened, 1);
+  assert.equal(result.succeeded, 0);
+  assert.equal(result.failed, 3);
+  assert.equal(result.phase, "stopped");
+  assert.match(result.message, /consecutive signup failures/i);
+});
+
+test("transient signup error retries then succeeds", async () => {
+  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "reg-"));
+  fs.mkdirSync(path.join(cwd, "accounts", "tokens"), { recursive: true });
+  let signupCalls = 0;
+  const svc = new RegisterService({
+    cwd,
+    now: () => new Date(2026, 6, 11),
+    sleep: async () => {},
+    loadProxies: () => [],
+    generateWallet: () => {
+      const w = walletFromKeypair(Keypair.generate());
+      return { publicKey: w.publicKey, secretKeyBase58: w.secretKeyBase58, wallet: w };
+    },
+    openSession: async () =>
+      mockSession(async (wallet) => {
+        signupCalls++;
+        if (signupCalls === 1) throw new Error("transient blip");
+        return tokens(wallet.publicKey);
+      }),
+  });
+
+  const result = await svc.run({ amountPerIp: 1, delaySec: 0, useProxies: false }, () => {});
+  assert.equal(signupCalls, 2); // first threw, second succeeded
+  assert.equal(result.succeeded, 1);
+  assert.equal(result.failed, 0);
+  assert.equal(result.phase, "finished");
+});
+
+test("a success resets the consecutive-failure counter (fail, ok, fail, fail, fail stops)", async () => {
+  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "reg-"));
+  fs.mkdirSync(path.join(cwd, "accounts", "tokens"), { recursive: true });
+  // amountPerIp is clamped to REGISTER_AMOUNT_MAX (3), so a direct run does at
+  // most 3 signups. To prove the reset works, use two proxy IPs so we get more
+  // signups total. Pattern across 6 signups (3 per IP):
+  //   IP1: fail, succeed, fail     -> counter ends at 1 (reset by the success)
+  //   IP2: fail, fail, fail        -> counter climbs 2,3 -> STOP at the 3rd
+  // If the reset were broken, IP1's two failures (calls 1 and 3) would already
+  // be "2 consecutive" and IP2 would stop after just one more (call 4), giving
+  // failed=3 too early — but more importantly succeeded would be 0. With the
+  // reset, the success is recorded and the job reaches IP2.
+  const proxies: ProxyConfig[] = [
+    { id: 1, label: "proxy 1", server: "http://1.1.1.1:1" },
+    { id: 2, label: "proxy 2", server: "http://2.2.2.2:2" },
+  ];
+  const perSignupOutcome = ["err", "ok", "err", "err", "err", "err"];
+  let signupIdx = -1;
+  const svc = new RegisterService({
+    cwd,
+    now: () => new Date(2026, 6, 11),
+    sleep: async () => {},
+    loadProxies: () => proxies,
+    generateWallet: () => {
+      const w = walletFromKeypair(Keypair.generate());
+      signupIdx++;
+      return { publicKey: w.publicKey, secretKeyBase58: w.secretKeyBase58, wallet: w };
+    },
+    openSession: async () =>
+      mockSession(async (wallet) => {
+        if (perSignupOutcome[signupIdx] === "ok") return tokens(wallet.publicKey);
+        throw new Error("fail");
+      }),
+  });
+
+  const result = await svc.run({ amountPerIp: 3, delaySec: 0, useProxies: true }, () => {});
+  // The success (signup 2) must be recorded, proving the reset happened.
+  assert.equal(result.succeeded, 1);
+  assert.equal(result.phase, "stopped");
+  assert.match(result.message, /consecutive signup failures/i);
 });
 
 test("write failure after signup stops before next proxy", async () => {
@@ -130,28 +223,28 @@ test("write failure after signup stops before next proxy", async () => {
     { id: 1, label: "proxy 1", server: "http://1.1.1.1:1" },
     { id: 2, label: "proxy 2", server: "http://2.2.2.2:2" },
   ];
-  const signupAgents: string[] = [];
+  const signupLabels: string[] = [];
   const svc = new RegisterService({
     cwd,
     now: () => new Date(2026, 6, 11),
     sleep: async () => {},
     loadProxies: () => proxies,
-    createAgent: (url) => ({ url }),
     generateWallet: () => {
       const w = walletFromKeypair(Keypair.generate());
       return { publicKey: w.publicKey, secretKeyBase58: w.secretKeyBase58, wallet: w };
     },
-    signup: async (wallet, agent) => {
-      signupAgents.push((agent as any).url);
-      return tokens(wallet.publicKey);
-    },
+    openSession: async (ctx) =>
+      mockSession(async (wallet) => {
+        signupLabels.push(ctx.label);
+        return tokens(wallet.publicKey);
+      }),
   });
 
   await assert.rejects(
     () => svc.run({ amountPerIp: 1, delaySec: 0, useProxies: true }, () => {}),
     /EEXIST|ENOTDIR|not a directory/i,
   );
-  assert.deepEqual(signupAgents, ["http://1.1.1.1:1"]);
+  assert.deepEqual(signupLabels, ["proxy 1"]);
   assert.equal(fs.existsSync(path.join(cwd, "2026-07-11_fresh_keys.txt")), false);
 });
 
@@ -170,13 +263,14 @@ test("write failure exposes accumulated counts and output file", async () => {
       const w = wallets[wi++];
       return { publicKey: w.publicKey, secretKeyBase58: w.secretKeyBase58, wallet: w };
     },
-    signup: async (wallet) => {
-      if (wallet.publicKey === wallets[1].publicKey) {
-        fs.rmSync(path.join(cwd, "accounts", "tokens"), { recursive: true, force: true });
-        fs.writeFileSync(path.join(cwd, "accounts", "tokens"), "not a directory");
-      }
-      return tokens(wallet.publicKey);
-    },
+    openSession: async () =>
+      mockSession(async (wallet) => {
+        if (wallet.publicKey === wallets[1].publicKey) {
+          fs.rmSync(path.join(cwd, "accounts", "tokens"), { recursive: true, force: true });
+          fs.writeFileSync(path.join(cwd, "accounts", "tokens"), "not a directory");
+        }
+        return tokens(wallet.publicKey);
+      }),
   });
 
   let thrown: any;
@@ -205,10 +299,11 @@ test("stop halts between attempts", async () => {
       const w = walletFromKeypair(Keypair.generate());
       return { publicKey: w.publicKey, secretKeyBase58: w.secretKeyBase58, wallet: w };
     },
-    signup: async (wallet) => {
-      svc.requestStop();
-      return tokens(wallet.publicKey);
-    },
+    openSession: async () =>
+      mockSession(async (wallet) => {
+        svc.requestStop();
+        return tokens(wallet.publicKey);
+      }),
   });
 
   const result = await svc.run({ amountPerIp: 3, delaySec: 0, useProxies: false }, () => {});
@@ -226,8 +321,8 @@ test("useProxies with empty proxy list throws before starting", async () => {
     generateWallet: () => {
       throw new Error("should not generate");
     },
-    signup: async () => {
-      throw new Error("should not signup");
+    openSession: async () => {
+      throw new Error("should not open session");
     },
   });
 

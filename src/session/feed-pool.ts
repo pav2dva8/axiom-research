@@ -8,6 +8,7 @@ export interface FeedToken {
 type FetchTrending = () => Promise<unknown>;
 
 const DEFAULT_TTL_MS = 30_000;
+const BASE58_ADDR = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -29,6 +30,24 @@ function nestedString(
   const value = record[key];
   if (!isRecord(value)) return undefined;
   return stringAt(value, keys);
+}
+
+function isBase58Address(value: unknown): value is string {
+  return typeof value === "string" && BASE58_ADDR.test(value);
+}
+
+/** Live meme-trending-v2 rows are positional tuples: [pair, mint, ticker, name, ...]. */
+function tokenFromTuple(row: unknown[]): FeedToken | null {
+  if (row.length < 2) return null;
+  if (!isBase58Address(row[0]) || !isBase58Address(row[1])) return null;
+  const ticker = typeof row[2] === "string" && row[2] ? row[2] : undefined;
+  const name = typeof row[3] === "string" && row[3] ? row[3] : undefined;
+  return {
+    pairAddress: row[0],
+    tokenAddress: row[1],
+    ...(ticker ? { ticker } : {}),
+    ...(name ? { name } : {}),
+  };
 }
 
 function tokenFromRecord(record: Record<string, unknown>): FeedToken | null {
@@ -64,6 +83,11 @@ export function parseMemeTrendingPayload(body: unknown): FeedToken[] {
 
   function walk(value: unknown): void {
     if (Array.isArray(value)) {
+      const fromTuple = tokenFromTuple(value);
+      if (fromTuple) {
+        add(fromTuple);
+        return;
+      }
       for (const item of value) walk(item);
       return;
     }

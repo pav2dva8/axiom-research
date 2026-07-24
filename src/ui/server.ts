@@ -82,8 +82,11 @@ function statusPayload() {
     selected: accountManager.getSelectedCount('run'),
     accountsSelected: accountManager.getSelectedCount('accounts'),
     runSelected: accountManager.getSelectedCount('run'),
+    testSelected: accountManager.getSelectedCount('test'),
     activeViewers: viewerService.getActiveCount(),
     keepWarm: accountManager.isKeepWarmRunning(),
+    sessionWarmup: viewerService.isSessionWarmupRunning(),
+    sessionWarmupCount: viewerService.getSessionWarmupCount(),
     deployWatch: isDeployWatchStatusActive(),
     registerRunning: registerService.isRunning(),
   };
@@ -93,9 +96,13 @@ function broadcastStatus(): void {
   broadcast("status", statusPayload());
 }
 
-function proxySafetyGroups(accounts: LoadedAccount[]) {
+function proxySafetyGroups(accounts: LoadedAccount[], scope: "run" | "test" = "run") {
   const accountByPk = new Map(accounts.map((account) => [account.publicKey, account]));
-  return accountManager.listRunProxyGroups().groups.map((group) => ({
+  const groups =
+    scope === "test"
+      ? accountManager.listTestProxyGroups().groups
+      : accountManager.listRunProxyGroups().groups;
+  return groups.map((group) => ({
     accounts: group.accounts
       .map((account) => accountByPk.get(account.publicKey))
       .filter((account): account is LoadedAccount => !!account),
@@ -143,10 +150,11 @@ function abortViewerRunForBan(message: string): void {
   broadcastStatus();
 }
 
-function broadcastViewerProgress(publicKey: string, state: string): void {
+function broadcastViewerProgress(publicKey: string, state: string | null): void {
   broadcast("viewer-progress", {
     publicKey,
     state,
+    clear: state == null,
     connected: viewerService.getActiveCount(),
     total: currentRunTotal,
   });
@@ -179,6 +187,10 @@ viewerService.on("viewer-failed", (pk: string) =>
 );
 viewerService.on("viewer-disconnected", (pk: string) => {
   broadcastViewerProgress(pk, "disconnected");
+  broadcastStatus();
+});
+viewerService.on("viewer-cleared", (pk: string) => {
+  broadcastViewerProgress(pk, null);
   broadcastStatus();
 });
 
@@ -279,6 +291,20 @@ async function handleApi(
       return;
     }
 
+    // GET /api/test/accounts — Test-tab selection/status.
+    if (pathname === "/api/test/accounts" && req.method === "GET") {
+      res.writeHead(200);
+      res.end(JSON.stringify(accountManager.listTestAccounts()));
+      return;
+    }
+
+    // GET /api/test/proxy-groups
+    if (pathname === "/api/test/proxy-groups" && req.method === "GET") {
+      res.writeHead(200);
+      res.end(JSON.stringify(accountManager.listTestProxyGroups()));
+      return;
+    }
+
     // POST /api/accounts/select  { publicKey, selected }
     if (pathname === "/api/accounts/select" && req.method === "POST") {
       const { publicKey, selected } = JSON.parse(await readBody(req));
@@ -346,6 +372,41 @@ async function handleApi(
       broadcastStatus();
       res.writeHead(200);
       res.end(JSON.stringify({ ok: true, selected: accountManager.getSelectedCount('run') }));
+      return;
+    }
+
+    // POST /api/test/select  { publicKey, selected }
+    if (pathname === "/api/test/select" && req.method === "POST") {
+      const { publicKey, selected } = JSON.parse(await readBody(req));
+      if (typeof publicKey !== "string" || typeof selected !== "boolean") {
+        res.writeHead(400);
+        res.end(JSON.stringify({ error: "publicKey + selected required" }));
+        return;
+      }
+      accountManager.setTestSelected(publicKey, selected);
+      broadcast("accounts-changed", {});
+      broadcastStatus();
+      res.writeHead(200);
+      res.end(JSON.stringify({ ok: true }));
+      return;
+    }
+
+    // POST /api/test/selection  { publicKeys: string[] }
+    if (pathname === "/api/test/selection" && req.method === "POST") {
+      const { publicKeys } = JSON.parse(await readBody(req));
+      if (
+        !Array.isArray(publicKeys) ||
+        !publicKeys.every((k) => typeof k === "string")
+      ) {
+        res.writeHead(400);
+        res.end(JSON.stringify({ error: "publicKeys array required" }));
+        return;
+      }
+      accountManager.setTestSelection(publicKeys);
+      broadcast("accounts-changed", {});
+      broadcastStatus();
+      res.writeHead(200);
+      res.end(JSON.stringify({ ok: true, selected: accountManager.getSelectedCount('test') }));
       return;
     }
 
@@ -626,6 +687,139 @@ async function handleApi(
         running: false,
         message: "Keep-logged-in stopping...",
       });
+      broadcast("session-warmup", {
+        running: false,
+        count: 0,
+        message: "Session warmup stopped (keep-warm closed).",
+      });
+      broadcastStatus();
+      res.writeHead(200);
+      res.end(JSON.stringify({ ok: true }));
+      return;
+    }
+
+    // POST /api/session-warmup/start  { publicKeys?: string[] }
+    // Session wander (Discover/Pulse) — separate from keep-logged-in login/refresh.
+    // Requires keep-warm browsers already open.
+    if (pathname === "/api/session-warmup/start" && req.method === "POST") {
+      if (!accountManager.isKeepWarmRunning()) {
+        res.writeHead(400);
+        res.end(JSON.stringify({
+          error: "Start Keep logged in first (opens proxy browsers). Session warmup only wanders on those sessions.",
+        }));
+        return;
+      }
+
+      const body = await readBody(req).catch(() => "");
+      let targets: string[] | undefined;
+      let minGapMs: number | undefined;
+      let maxGapMs: number | undefined;
+      let groupStartDelayMinMs: number | undefined;
+      let groupStartDelayMaxMs: number | undefined;
+      try {
+        if (body) {
+          const parsed = JSON.parse(body);
+          if (Array.isArray(parsed.publicKeys)) targets = parsed.publicKeys;
+          if (typeof parsed.minGapMs === "number" && Number.isFinite(parsed.minGapMs)) {
+            minGapMs = Math.max(0, Math.floor(parsed.minGapMs));
+          }
+          if (typeof parsed.maxGapMs === "number" && Number.isFinite(parsed.maxGapMs)) {
+            maxGapMs = Math.max(0, Math.floor(parsed.maxGapMs));
+          }
+          if (
+            typeof parsed.groupStartDelayMinMs === "number" &&
+            Number.isFinite(parsed.groupStartDelayMinMs)
+          ) {
+            groupStartDelayMinMs = Math.max(0, Math.floor(parsed.groupStartDelayMinMs));
+          }
+          if (
+            typeof parsed.groupStartDelayMaxMs === "number" &&
+            Number.isFinite(parsed.groupStartDelayMaxMs)
+          ) {
+            groupStartDelayMaxMs = Math.max(0, Math.floor(parsed.groupStartDelayMaxMs));
+          }
+        }
+      } catch {}
+
+      const selected = accountManager.loadExplicitRunSelectedAccounts();
+      const pool = (targets && targets.length > 0
+        ? targets.map((pk) => accountManager.loadAccount(pk)).filter((a): a is NonNullable<typeof a> => !!a)
+        : selected
+      ).filter((a) => !!a.refreshToken);
+
+      if (pool.length === 0) {
+        res.writeHead(400);
+        res.end(JSON.stringify({ error: "No run-selected accounts with tokens for session warmup." }));
+        return;
+      }
+
+      try {
+        let groups: {
+          id: number;
+          label: string;
+          session: NonNullable<ReturnType<typeof viewerService.getBrowserSession>>;
+          accounts: typeof pool;
+        }[] = [];
+
+        if (accountManager.hasConfiguredProxies()) {
+          const warm = accountManager.getWarmProxyViewerGroups(pool);
+          if (!warm.ready || warm.groups.length === 0) {
+            res.writeHead(400);
+            res.end(JSON.stringify({
+              error: warm.error || "Keep-warm proxy sessions are not ready for the selected accounts.",
+            }));
+            return;
+          }
+          groups = warm.groups;
+        } else {
+          const session =
+            viewerService.getBrowserSession() || accountManager.getBrowserSession() || null;
+          if (!session) {
+            res.writeHead(400);
+            res.end(JSON.stringify({ error: "No keep-warm browser session available." }));
+            return;
+          }
+          viewerService.setBrowserSession(session);
+          groups = [{
+            id: 0,
+            label: "direct",
+            session,
+            accounts: pool,
+          }];
+        }
+
+        await viewerService.startWarmupForGroups(groups, {
+          ...(minGapMs !== undefined ? { minGapMs } : {}),
+          ...(maxGapMs !== undefined ? { maxGapMs } : {}),
+          ...(groupStartDelayMinMs !== undefined ? { groupStartDelayMinMs } : {}),
+          ...(groupStartDelayMaxMs !== undefined ? { groupStartDelayMaxMs } : {}),
+        });
+        broadcast("session-warmup", {
+          running: true,
+          count: viewerService.getSessionWarmupCount(),
+          message: `Session warmup started for ${viewerService.getSessionWarmupCount()} account(s)`,
+        });
+        broadcastStatus();
+        res.writeHead(200);
+        res.end(JSON.stringify({
+          ok: true,
+          count: viewerService.getSessionWarmupCount(),
+        }));
+      } catch (err: any) {
+        res.writeHead(500);
+        res.end(JSON.stringify({ error: err?.message || String(err) }));
+      }
+      return;
+    }
+
+    // POST /api/session-warmup/stop
+    if (pathname === "/api/session-warmup/stop" && req.method === "POST") {
+      await viewerService.stopWarmup();
+      broadcast("session-warmup", {
+        running: false,
+        count: 0,
+        message: "Session warmup stopped",
+      });
       broadcastStatus();
       res.writeHead(200);
       res.end(JSON.stringify({ ok: true }));
@@ -675,7 +869,7 @@ async function handleApi(
     if (pathname === "/api/resolve" && req.method === "POST") {
       const { input } = JSON.parse(await readBody(req));
       try {
-        const result = resolveTokenInput(input);
+        const result = await resolveTokenInput(input);
         viewerService.setTokenInfo(result.tokenInfo);
         res.writeHead(200);
         res.end(JSON.stringify(result));
@@ -690,7 +884,7 @@ async function handleApi(
       return;
     }
 
-    // POST /api/viewers/watch-deploy-start  { input, minGapMs?, maxGapMs?, groupStartDelayMinMs?, groupStartDelayMaxMs?, bootstrapDisabled? }
+    // POST /api/viewers/watch-deploy-start  { input, minGapMs?, maxGapMs?, groupStartDelayMinMs?, groupStartDelayMaxMs?, bootstrapDisabled?, selectionScope?, navMode? }
     if (pathname === "/api/viewers/watch-deploy-start" && req.method === "POST") {
       if (isDeployWatchBusy()) {
         res.writeHead(409);
@@ -707,12 +901,24 @@ async function handleApi(
         groupStartDelayMaxMs,
         bootstrapDisabled,
         safetyMaxAccounts,
+        selectionScope,
+        navMode,
+        friendsReconnectDelayMs,
       } = body ?? {};
       if (typeof input !== "string" || !input.trim()) {
         res.writeHead(400);
         res.end(JSON.stringify({ error: "input required" }));
         return;
       }
+
+      const scope: "run" | "test" = selectionScope === "test" ? "test" : "run";
+      const connectNavMode: "full" | "minimal" | "page-update" =
+        navMode === "page-update" ? "page-update" : navMode === "minimal" ? "minimal" : "full";
+      const forceSkipBootstrap = connectNavMode !== "full" || bootstrapDisabled === true;
+      const friendsReconnectDelayValid =
+        typeof friendsReconnectDelayMs === "number" &&
+        Number.isFinite(friendsReconnectDelayMs) &&
+        friendsReconnectDelayMs >= 0;
 
       let target;
       try {
@@ -745,10 +951,13 @@ async function handleApi(
         typeof groupStartDelayMaxMs === "number" &&
         Number.isFinite(groupStartDelayMaxMs) &&
         groupStartDelayMaxMs >= 0;
-      const runSafetyMaxAccounts = normalizeSafetyMaxAccounts(
-        safetyMaxAccounts,
-        DEFAULT_RUN_SAFETY_MAX_ACCOUNTS,
-      );
+      const runSafetyMaxAccounts =
+        scope === "test"
+          ? 0
+          : normalizeSafetyMaxAccounts(
+              safetyMaxAccounts,
+              DEFAULT_RUN_SAFETY_MAX_ACCOUNTS,
+            );
 
       broadcastDeployWatchEvent({
         state: "preparing",
@@ -768,7 +977,9 @@ async function handleApi(
         throwIfDeployWatchRequestCanceled(request);
         viewerService.setTokenInfo(tokenInfo);
 
-        accounts = accountManager.loadExplicitRunSelectedAccounts();
+        accounts = scope === "test"
+          ? accountManager.loadExplicitTestSelectedAccounts()
+          : accountManager.loadExplicitRunSelectedAccounts();
         if (accounts.length === 0) {
           broadcastDeployWatchEvent({
             state: "failed",
@@ -790,7 +1001,7 @@ async function handleApi(
         const safety = limitAccountsForRun(
           accounts,
           runSafetyMaxAccounts,
-          proxyMode ? proxySafetyGroups(accounts) : undefined,
+          proxyMode ? proxySafetyGroups(accounts, scope) : undefined,
         );
         accounts = safety.accounts;
         if (safety.limited) {
@@ -829,12 +1040,21 @@ async function handleApi(
         throwIfDeployWatchRequestCanceled(request);
 
         markDeployWatchPhase(request, "starting");
-        viewerService.setTokenInfo(tokenInfo);
+        const startedTokenInfo = {
+          ...tokenInfo,
+          pairAddress: detection.pairAddress,
+          tokenAddress: parsed.ca,
+          chain: detection.chain === "robinhood" ? "robinhood" : tokenInfo.chain,
+        };
+        viewerService.setTokenInfo(startedTokenInfo);
         broadcastDeployWatchEvent({
           state: "starting",
-          message: `Mint detected at slot ${detection.slot}; starting viewers.`,
+          message:
+            detection.chain === "robinhood"
+              ? `Robinhood pool detected at block ${detection.slot}; starting viewers.`
+              : `Mint detected at slot ${detection.slot}; starting viewers.`,
           ca: parsed.ca,
-          pairAddress: parsed.pairAddress,
+          pairAddress: detection.pairAddress,
         }, request);
 
         if (proxyMode) {
@@ -877,12 +1097,16 @@ async function handleApi(
               ...(maxGapValid ? { maxGapMs } : {}),
               ...(groupStartDelayMinValid ? { groupStartDelayMinMs } : {}),
               ...(groupStartDelayMaxValid ? { groupStartDelayMaxMs } : {}),
-              bootstrapDisabled: bootstrapDisabled === true,
+              bootstrapDisabled: forceSkipBootstrap,
+              navMode: connectNavMode,
+              ...(friendsReconnectDelayValid ? { friendsReconnectDelayMs } : {}),
             })
           : await viewerService.connectAll(accounts, {
               ...(minGapValid ? { minGapMs } : {}),
               ...(maxGapValid ? { maxGapMs } : {}),
-              bootstrapDisabled: bootstrapDisabled === true,
+              bootstrapDisabled: forceSkipBootstrap,
+              navMode: connectNavMode,
+              ...(friendsReconnectDelayValid ? { friendsReconnectDelayMs } : {}),
             });
         throwIfDeployWatchRequestCanceled(request);
 
@@ -895,6 +1119,7 @@ async function handleApi(
             selectedTotal: safety.selectedTotal,
             safetyLimited: safety.limited,
             safetyMaxAccounts: safety.maxAccounts,
+            navMode: connectNavMode,
             detectedAt: detection.detectedAt,
             slot: detection.slot,
             source: detection.source,
@@ -942,7 +1167,7 @@ async function handleApi(
       }
     }
 
-    // POST /api/viewers/start  { pairAddress, minGapMs?, maxGapMs?, groupStartDelayMinMs?, groupStartDelayMaxMs?, bootstrapDisabled? }
+    // POST /api/viewers/start  { pairAddress, minGapMs?, maxGapMs?, groupStartDelayMinMs?, groupStartDelayMaxMs?, bootstrapDisabled?, selectionScope?, navMode? }
     if (pathname === "/api/viewers/start" && req.method === "POST") {
       if (isDeployWatchBusy()) {
         res.writeHead(409);
@@ -959,12 +1184,19 @@ async function handleApi(
         groupStartDelayMaxMs,
         bootstrapDisabled,
         safetyMaxAccounts,
+        selectionScope,
+        navMode,
+        friendsReconnectDelayMs,
       } = body ?? {};
       if (typeof pairAddress !== "string" || !pairAddress.trim()) {
         res.writeHead(400);
         res.end(JSON.stringify({ error: "pairAddress required" }));
         return;
       }
+      const scope: "run" | "test" = selectionScope === "test" ? "test" : "run";
+      const connectNavMode: "full" | "minimal" | "page-update" =
+        navMode === "page-update" ? "page-update" : navMode === "minimal" ? "minimal" : "full";
+      const forceSkipBootstrap = connectNavMode !== "full" || bootstrapDisabled === true;
       const minGapValid =
         typeof minGapMs === "number" &&
         Number.isFinite(minGapMs) &&
@@ -981,10 +1213,17 @@ async function handleApi(
         typeof groupStartDelayMaxMs === "number" &&
         Number.isFinite(groupStartDelayMaxMs) &&
         groupStartDelayMaxMs >= 0;
-      const runSafetyMaxAccounts = normalizeSafetyMaxAccounts(
-        safetyMaxAccounts,
-        DEFAULT_RUN_SAFETY_MAX_ACCOUNTS,
-      );
+      const friendsReconnectDelayValid =
+        typeof friendsReconnectDelayMs === "number" &&
+        Number.isFinite(friendsReconnectDelayMs) &&
+        friendsReconnectDelayMs >= 0;
+      const runSafetyMaxAccounts =
+        scope === "test"
+          ? 0
+          : normalizeSafetyMaxAccounts(
+              safetyMaxAccounts,
+              DEFAULT_RUN_SAFETY_MAX_ACCOUNTS,
+            );
 
       // /api/resolve normally sets tokenInfo for the same pair. If somehow
       // missing, build a minimal placeholder — the WS protocol only requires
@@ -1000,10 +1239,13 @@ async function handleApi(
           isMigrated: false,
           supply: 1000000000,
           price: 0,
+          chain: "sol",
         });
       }
 
-      let accounts = accountManager.loadExplicitRunSelectedAccounts();
+      let accounts = scope === "test"
+        ? accountManager.loadExplicitTestSelectedAccounts()
+        : accountManager.loadExplicitRunSelectedAccounts();
       if (accounts.length === 0) {
         res.writeHead(400);
         res.end(
@@ -1018,7 +1260,7 @@ async function handleApi(
       const safety = limitAccountsForRun(
         accounts,
         runSafetyMaxAccounts,
-        accountManager.hasConfiguredProxies() ? proxySafetyGroups(accounts) : undefined,
+        accountManager.hasConfiguredProxies() ? proxySafetyGroups(accounts, scope) : undefined,
       );
       accounts = safety.accounts;
       if (safety.limited) {
@@ -1060,7 +1302,9 @@ async function handleApi(
           ...(maxGapValid ? { maxGapMs } : {}),
           ...(groupStartDelayMinValid ? { groupStartDelayMinMs } : {}),
           ...(groupStartDelayMaxValid ? { groupStartDelayMaxMs } : {}),
-          bootstrapDisabled: bootstrapDisabled === true,
+          bootstrapDisabled: forceSkipBootstrap,
+          navMode: connectNavMode,
+          ...(friendsReconnectDelayValid ? { friendsReconnectDelayMs } : {}),
         });
       } else {
         await ensureBrowserSession();
@@ -1073,7 +1317,9 @@ async function handleApi(
         connected = await viewerService.connectAll(accounts, {
           ...(minGapValid ? { minGapMs } : {}),
           ...(maxGapValid ? { maxGapMs } : {}),
-          bootstrapDisabled: bootstrapDisabled === true,
+          bootstrapDisabled: forceSkipBootstrap,
+          navMode: connectNavMode,
+          ...(friendsReconnectDelayValid ? { friendsReconnectDelayMs } : {}),
         });
       }
 
@@ -1085,6 +1331,7 @@ async function handleApi(
         selectedTotal: safety.selectedTotal,
         safetyLimited: safety.limited,
         safetyMaxAccounts: safety.maxAccounts,
+        navMode: connectNavMode,
       }));
       return;
     }

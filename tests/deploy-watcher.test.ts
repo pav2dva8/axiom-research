@@ -80,6 +80,7 @@ test("getDeployWatchConfig uses defaults and trims env values", () => {
     wsUrl: undefined,
     pollMs: DEFAULT_DEPLOY_WATCH_POLL_MS,
     allowInsecureTls: false,
+    robinhoodRpcUrl: "https://rpc.mainnet.chain.robinhood.com",
   });
 
   assert.deepEqual(
@@ -88,12 +89,14 @@ test("getDeployWatchConfig uses defaults and trims env values", () => {
       SOLANA_WS_URL: " wss://rpc.example ",
       DEPLOY_WATCH_POLL_MS: "100",
       SOLANA_RPC_ALLOW_INSECURE_TLS: "true",
+      ROBINHOOD_RPC_URL: " https://rh.example ",
     }),
     {
       rpcUrl: "https://rpc.example",
       wsUrl: "wss://rpc.example",
       pollMs: 100,
       allowInsecureTls: true,
+      robinhoodRpcUrl: "https://rh.example",
     },
   );
 
@@ -142,12 +145,29 @@ test("parseDeployWatchInput accepts a bare pump CA and derives the pair", () => 
     parsed.pairAddress,
     "Amk61ySm6z9hWSRSEsCKiMMb3i1G8ph89wNP9FzhBzsN",
   );
+  assert.equal(parsed.chain, "sol");
 
   const tokenInfo = buildDeployTokenInfo(parsed);
   assert.equal(tokenInfo.pairAddress, parsed.pairAddress);
   assert.equal(tokenInfo.tokenAddress, parsed.ca);
   assert.equal(tokenInfo.ticker, "TOKEN");
   assert.equal(tokenInfo.protocol, "Pump V1");
+  assert.equal(tokenInfo.chain, "sol");
+});
+
+test("parseDeployWatchInput accepts a bare Robinhood 0x CA", () => {
+  const parsed = parseDeployWatchInput(
+    "0xa7254b5806775bba1efed7ec7b8f50a2d21f786c",
+  );
+  assert.equal(parsed.chain, "robinhood");
+  assert.equal(parsed.ca, "0xa7254b5806775bba1efed7ec7b8f50a2d21f786c");
+  assert.equal(parsed.pairAddress, "");
+  assert.equal(parsed.mint, undefined);
+
+  const tokenInfo = buildDeployTokenInfo(parsed);
+  assert.equal(tokenInfo.chain, "robinhood");
+  assert.equal(tokenInfo.tokenAddress, parsed.ca);
+  assert.equal(tokenInfo.protocol, "Uniswap v3");
 });
 
 test("parseDeployWatchInput accepts a bare CA without requiring a pump suffix", () => {
@@ -174,6 +194,43 @@ test("parseDeployWatchInput rejects links and invalid keys", () => {
     () => parseDeployWatchInput("111111111111111111111111111111111"),
     /Invalid Solana CA/i,
   );
+});
+
+test("DeployWatcher resolves Robinhood pool via getPool polling", async () => {
+  const parsed = parseDeployWatchInput(
+    "0xa7254b5806775bba1efed7ec7b8f50a2d21f786c",
+  );
+  let calls = 0;
+  const watcher = new DeployWatcher(
+    () => {
+      throw new Error("solana connection should not be used");
+    },
+    () => ({
+      async ethCall() {
+        calls += 1;
+        // First full fee sweep empty, second sweep hits on last fee.
+        if (calls < 5) {
+          return "0x0000000000000000000000000000000000000000000000000000000000000000";
+        }
+        return "0x000000000000000000000000219fa6b37bb0c1218e6013a157897822c9799933";
+      },
+      async ethBlockNumber() {
+        return 777;
+      },
+    }),
+  );
+
+  const result = await watcher.waitForDeploy(parsed, {
+    rpcUrl: "http://rpc.local",
+    pollMs: 1,
+    allowInsecureTls: false,
+  });
+
+  assert.equal(result.chain, "robinhood");
+  assert.equal(result.source, "poll");
+  assert.equal(result.pairAddress, "0x219fa6b37bb0c1218e6013a157897822c9799933");
+  assert.equal(result.slot, 777);
+  assert.equal(watcher.isActive(), false);
 });
 
 test("DeployWatcher resolves immediately when mint account already exists", async () => {
@@ -222,7 +279,7 @@ test("DeployWatcher confirms a websocket notification with an HTTP read", async 
     pollMs: 1000,
   });
   await new Promise((resolve) => setTimeout(resolve, 0));
-  fake.fire(1, parsed.mint);
+  fake.fire(1, parsed.mint!);
 
   const result = await promise;
   assert.equal(result.source, "ws");
@@ -278,7 +335,7 @@ test("DeployWatcher cancel during initial HTTP read rejects and suppresses detec
 
   initialRead.resolve({
     context: { slot: 444 },
-    value: fakeAccountInfo(parsed.mint),
+    value: fakeAccountInfo(parsed.mint!),
   });
   await new Promise((resolve) => setTimeout(resolve, 0));
 
@@ -318,7 +375,7 @@ test("DeployWatcher cancel during WS confirmation rejects, unsubscribes, and sup
   });
   await new Promise((resolve) => setTimeout(resolve, 0));
 
-  fake.fire(1, parsed.mint);
+  fake.fire(1, parsed.mint!);
   await new Promise((resolve) => setTimeout(resolve, 0));
   watcher.cancel("Deploy watch canceled by test.");
 
@@ -328,7 +385,7 @@ test("DeployWatcher cancel during WS confirmation rejects, unsubscribes, and sup
 
   confirmationRead.resolve({
     context: { slot: 555 },
-    value: fakeAccountInfo(parsed.mint),
+    value: fakeAccountInfo(parsed.mint!),
   });
   await new Promise((resolve) => setTimeout(resolve, 0));
 

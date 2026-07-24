@@ -11,7 +11,31 @@ export type NavAction = {
 export interface NavTokenRef {
   pairAddress: string;
   tokenAddress: string;
+  /** Chain for the friends pageUpdate. Defaults to "sol" when absent. */
+  chain?: string;
 }
+
+/**
+ * Global, token-independent rooms the real browser joins on every cluster9
+ * connect (seen at 0ms in the HAR). These broadcast frequently (sol_price,
+ * block_hash, sol-priority-fee-v2 emit roughly every second or faster) so
+ * subscribing to them keeps the socket fed with inbound traffic. Without this
+ * ambient traffic, a viewer that joins only its 6 token rooms can go ~60s
+ * with no bytes on the wire and get reaped by a network/proxy idle timer
+ * (the observed 1006 drops). Joining these on every open mirrors the browser
+ * and keeps the connection non-idle without changing token/viewer behavior.
+ */
+export const GLOBAL_LIVENESS_ROOMS = [
+  "sol_price",
+  "btc_price",
+  "eth_price",
+  "bnb_price",
+  "block_hash",
+  "sol-priority-fee-v2",
+  "connection_monitor",
+  "online-users-count",
+  "lighthouse",
+] as const;
 
 const defaultRng = () => Math.random();
 
@@ -28,10 +52,13 @@ function memePageUpdate(atMs: number, token: NavTokenRef): NavAction {
     atMs,
     ws: "friends",
     op: "pageUpdate",
-    pageUpdate: pageUpdateMeme({
-      pairAddress: token.pairAddress,
-      tokenAddress: token.tokenAddress,
-    }),
+    pageUpdate: pageUpdateMeme(
+      {
+        pairAddress: token.pairAddress,
+        tokenAddress: token.tokenAddress,
+      },
+      token.chain ?? "sol",
+    ),
   };
 }
 
@@ -111,6 +138,26 @@ export function planEnterFromFeed(
   plan.push(memePageUpdate(lateAt, token));
 
   return plan.sort((a, b) => a.atMs - b.atMs);
+}
+
+/** Longevity-oriented minimal watch: early token rooms + eye room + meme presence. */
+export function planMinimalViewer(token: NavTokenRef): NavAction[] {
+  const plan: NavAction[] = [];
+  for (const room of enterEarlyRooms(token.pairAddress)) {
+    plan.push(clusterJoin(0, room));
+  }
+  plan.push(clusterJoin(0, `e-${token.pairAddress}`));
+  plan.push(memePageUpdate(0, token));
+  return plan;
+}
+
+/**
+ * Friends pageUpdate only — no cluster token rooms. The cluster socket still
+ * opens (for the liveness rooms joined at connect) but joins no token room.
+ * Use this to isolate whether pageUpdate alone drives the viewer count.
+ */
+export function planPageUpdateOnlyViewer(token: NavTokenRef): NavAction[] {
+  return [memePageUpdate(0, token)];
 }
 
 export function planTokenToToken(

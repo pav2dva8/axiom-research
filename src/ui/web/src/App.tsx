@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState, useCallback } from 'react';
 import { Tabs, TabsList, TabsTrigger, TabsContent } from '@/components/ui/tabs';
 import { RunTab } from '@/components/RunTab';
+import { TestTab } from '@/components/TestTab';
 import { AccountsTab } from '@/components/AccountsTab';
 import { RegisterTab } from '@/components/RegisterTab';
 import { LogPanel, type LogEntry } from '@/components/LogPanel';
@@ -10,8 +11,11 @@ interface Status {
   selected: number;
   accountsSelected?: number;
   runSelected?: number;
+  testSelected?: number;
   activeViewers: number;
   keepWarm: boolean;
+  sessionWarmup?: boolean;
+  sessionWarmupCount?: number;
   deployWatch: boolean;
   registerRunning?: boolean;
 }
@@ -71,6 +75,8 @@ export default function App() {
     selected: 0,
     activeViewers: 0,
     keepWarm: false,
+    sessionWarmup: false,
+    sessionWarmupCount: 0,
     deployWatch: false,
   });
   const [logEntries, setLogEntries] = useState<LogEntry[]>([]);
@@ -136,6 +142,8 @@ export default function App() {
             runSelected: msg.data.runSelected ?? msg.data.selected ?? s.runSelected,
             activeViewers: msg.data.activeViewers ?? s.activeViewers,
             keepWarm: msg.data.keepWarm ?? s.keepWarm,
+            sessionWarmup: msg.data.sessionWarmup ?? s.sessionWarmup,
+            sessionWarmupCount: msg.data.sessionWarmupCount ?? s.sessionWarmupCount,
             deployWatch: deployWatchStatus ?? s.deployWatch,
             registerRunning: msg.data.registerRunning ?? s.registerRunning,
           }));
@@ -149,14 +157,33 @@ export default function App() {
           }
         } else if (msg.type === 'keepwarm') {
           const m: string = msg.data.message ?? '';
-          const type: LogEntry['type'] = /dead token|rate limit|no refresh token|error/i.test(m)
-            ? 'error'
-            : /refreshed|started/i.test(m)
-              ? 'success'
-              : 'info';
-          addLog(`[keep] ${m}`, type);
+          // Skip routine refresh/started heartbeat noise; still surface failures.
+          if (/dead token|rate limit|login failed|error/i.test(m)) {
+            addLog(`[keep] ${m}`, 'error');
+          }
           if (typeof msg.data.running === 'boolean') {
             setStatus((s) => ({ ...s, keepWarm: msg.data.running }));
+          }
+        } else if (msg.type === 'session-warmup') {
+          const m: string = msg.data.message ?? '';
+          addLog(`[warmup] ${m}`, msg.data.running ? 'success' : 'info');
+          if (typeof msg.data.running === 'boolean') {
+            setStatus((s) => ({
+              ...s,
+              sessionWarmup: msg.data.running,
+              sessionWarmupCount: typeof msg.data.count === 'number' ? msg.data.count : s.sessionWarmupCount,
+            }));
+          }
+          // Stop warmup: drop leftover warmup/disconnected chips so rows fall
+          // back to auth status (ok/due) instead of looking force-stopped.
+          if (!msg.data.running) {
+            setViewerProgress((p) => {
+              const states = { ...p.states };
+              for (const [pk, state] of Object.entries(states)) {
+                if (state === 'warmup' || state === 'disconnected') delete states[pk];
+              }
+              return { ...p, states };
+            });
           }
         } else if (msg.type === 'relogin-progress') {
           addLog(msg.data.message, 'info');
@@ -172,11 +199,19 @@ export default function App() {
             groups: Array.isArray(msg.data.groups) ? msg.data.groups : undefined,
           });
         } else if (msg.type === 'viewer-progress') {
-          setViewerProgress((p) => ({
-            total: msg.data.total ?? p.total,
-            states: { ...p.states, [msg.data.publicKey]: msg.data.state as ViewerState },
-            groups: p.groups,
-          }));
+          setViewerProgress((p) => {
+            const states = { ...p.states };
+            if (msg.data.clear || msg.data.state == null) {
+              delete states[msg.data.publicKey];
+            } else {
+              states[msg.data.publicKey] = msg.data.state as ViewerState;
+            }
+            return {
+              total: msg.data.total ?? p.total,
+              states,
+              groups: p.groups,
+            };
+          });
           if (typeof msg.data.connected === 'number') {
             setStatus((s) => ({ ...s, activeViewers: msg.data.connected }));
           }
@@ -213,7 +248,7 @@ export default function App() {
           if (msg.type === 'register-finished') setRegisterRunning(false);
           const m: string = data.message ?? '';
           const type: LogEntry['type'] =
-            msg.type === 'register-finished' && /fail|error/i.test(m)
+            msg.type === 'register-finished' && /fail|error|paused/i.test(m)
               ? 'error'
               : msg.type === 'register-finished'
                 ? 'success'
@@ -233,6 +268,9 @@ export default function App() {
           <TabsTrigger value="run" className="h-7 rounded px-4 text-xs">
             Run
           </TabsTrigger>
+          <TabsTrigger value="test" className="h-7 rounded px-4 text-xs">
+            Test
+          </TabsTrigger>
           <TabsTrigger value="accounts" className="h-7 rounded px-4 text-xs">
             Accounts
           </TabsTrigger>
@@ -242,7 +280,10 @@ export default function App() {
         </TabsList>
         <div className="flex shrink-0 items-center gap-4 font-mono text-xs">
           <span className="text-muted-foreground">
-            run selected <span className="text-foreground">{status.runSelected ?? status.selected}/{status.accounts}</span>
+            run <span className="text-foreground">{status.runSelected ?? status.selected}</span>
+          </span>
+          <span className="text-muted-foreground">
+            test <span className="text-foreground">{status.testSelected ?? 0}</span>
           </span>
           <span className="text-muted-foreground">
             active <span className="text-foreground">{status.activeViewers}</span>
@@ -253,6 +294,19 @@ export default function App() {
       <main className="flex min-h-0 flex-1 flex-col overflow-hidden">
           <TabsContent value="run" forceMount className="m-0 flex-1 overflow-auto p-4 data-[state=inactive]:hidden">
             <RunTab
+              onLog={addLog}
+              refreshTick={accountsRefreshTick}
+              onAccountsChanged={refreshAccounts}
+              viewerProgress={viewerProgress}
+              deployWatch={deployWatch}
+              deployWatchActive={status.deployWatch}
+              keepWarmRunning={status.keepWarm}
+              sessionWarmupRunning={!!status.sessionWarmup}
+              sessionWarmupCount={status.sessionWarmupCount ?? 0}
+            />
+          </TabsContent>
+          <TabsContent value="test" forceMount className="m-0 flex-1 overflow-auto p-4 data-[state=inactive]:hidden">
+            <TestTab
               onLog={addLog}
               refreshTick={accountsRefreshTick}
               onAccountsChanged={refreshAccounts}

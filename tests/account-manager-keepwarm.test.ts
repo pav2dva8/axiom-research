@@ -157,7 +157,7 @@ test("keep-warm reports ETA and does not classify rejected refresh tokens as an 
 
     manager!.startKeepLoggedIn([deadFirstPk, deadSecondPk], { refreshDelayMinMs: 500, refreshDelayMaxMs: 500 }, (message) => {
         seen.push(message);
-        if (/rate limit/i.test(message) || seen.filter((m) => /manual re-login/i.test(m)).length >= 2) {
+        if (/rate limit/i.test(message) || seen.filter((m) => /login after dead refresh failed|trying full login/i.test(m)).length >= 2) {
           clearTimeout(timeout);
           manager!.stopKeepLoggedIn();
           resolve(seen);
@@ -169,7 +169,11 @@ test("keep-warm reports ETA and does not classify rejected refresh tokens as an 
     });
 
     assert.equal(messages.some((message) => /rate limit/i.test(message)), false, messages.join("\n"));
-    assert.equal(messages.filter((message) => /manual re-login/i.test(message)).length, 2, messages.join("\n"));
+    assert.equal(
+      messages.filter((message) => /login after dead refresh failed|trying full login/i.test(message)).length >= 2,
+      true,
+      messages.join("\n"),
+    );
 
     manager.stopKeepLoggedIn();
     await new Promise((resolve) => setTimeout(resolve, 10));
@@ -199,7 +203,7 @@ test("keep-warm reports ETA and does not classify rejected refresh tokens as an 
 
       manager!.startKeepLoggedIn([noCookiePk], {}, (message) => {
         seen.push(message);
-        if (/manual re-login/i.test(message) || /will retry/i.test(message)) {
+        if (/login after dead refresh failed|trying full login/i.test(message) || /will retry/i.test(message)) {
           clearTimeout(timeout);
           manager!.stopKeepLoggedIn();
           resolve(seen);
@@ -210,7 +214,11 @@ test("keep-warm reports ETA and does not classify rejected refresh tokens as an 
       });
     });
 
-    assert.equal(noCookieMessages.some((message) => /manual re-login/i.test(message)), true, noCookieMessages.join("\n"));
+    assert.equal(
+      noCookieMessages.some((message) => /login after dead refresh failed|trying full login/i.test(message)),
+      true,
+      noCookieMessages.join("\n"),
+    );
     assert.equal(noCookieMessages.some((message) => /will retry/i.test(message)), false, noCookieMessages.join("\n"));
 
     manager.stopKeepLoggedIn();
@@ -261,6 +269,64 @@ test("keep-warm reports ETA and does not classify rejected refresh tokens as an 
     assert.equal(networkMessages.some((message) => /manual re-login/i.test(message)), false, networkMessages.join("\n"));
     assert.equal(networkMessages.some((message) => /network.*backing off/i.test(message)), true, networkMessages.join("\n"));
     assert.ok(networkMessages.filter((message) => /will retry/i.test(message)).length <= 3, networkMessages.join("\n"));
+  } finally {
+    manager?.stopKeepLoggedIn();
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    process.chdir(originalCwd);
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test("keep-warm logs in accounts that have no refresh token", async () => {
+  const originalCwd = process.cwd();
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "axiom-keepwarm-login-"));
+  let manager: { stopKeepLoggedIn(): void } | undefined;
+
+  try {
+    process.chdir(tmp);
+
+    const wallet = Keypair.generate();
+    const pk = wallet.publicKey.toBase58();
+    fs.writeFileSync(path.join(tmp, "keys.txt"), `${bs58.encode(wallet.secretKey)}\n`);
+    fs.mkdirSync(path.join(tmp, "accounts", "tokens"), { recursive: true });
+
+    let loginCalls = 0;
+    const { AccountManager } = await import("../src/ui/account-manager");
+    manager = new AccountManager();
+    manager.setBrowserSession({
+      loginAccount: async () => {
+        loginCalls++;
+        return {
+          cookies: "",
+          accessToken: jwtWithExp(Math.floor((Date.now() + 20 * 60_000) / 1000)),
+          refreshToken: "fresh-refresh",
+        };
+      },
+      refreshAccount: async () => {
+        throw new Error("refresh should not run before login");
+      },
+    } as any);
+
+    const loggedInMessage = await new Promise<string>((resolve, reject) => {
+      const timeout = setTimeout(() => reject(new Error("Timed out waiting for login")), 2000);
+      manager!.startKeepLoggedIn([pk], { refreshDelayMinMs: 200, refreshDelayMaxMs: 200 }, (message) => {
+        if (/logged in /.test(message)) {
+          clearTimeout(timeout);
+          manager!.stopKeepLoggedIn();
+          resolve(message);
+        }
+      }).catch((err: unknown) => {
+        clearTimeout(timeout);
+        reject(err);
+      });
+    });
+
+    assert.match(loggedInMessage, /logged in /);
+    assert.equal(loginCalls, 1);
+    assert.equal(
+      fs.existsSync(path.join(tmp, "accounts", "tokens", `${pk}.json`)),
+      true,
+    );
   } finally {
     manager?.stopKeepLoggedIn();
     await new Promise((resolve) => setTimeout(resolve, 10));

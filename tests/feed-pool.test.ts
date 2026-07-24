@@ -33,6 +33,33 @@ test("parseMemeTrendingPayload extracts tokens from common feed shapes", () => {
   ]);
 });
 
+test("parseMemeTrendingPayload reads live meme-trending-v2 tuple rows", () => {
+  const tokens = parseMemeTrendingPayload([
+    [
+      "G21JBCbAdB45chyS7gUKNKdVchNFEt2SvuJnPvgeVWjX",
+      "5VMbcRosto1RT6GZHRucUZEM26XEoTYcmoSbNhq3pump",
+      "FrogCat",
+      "FrogCat",
+      "https://example.com/img.webp",
+      6,
+      "Pump AMM",
+    ],
+    [
+      "27Wij19hyhYGCxN7jQMpumpPairAddr11111111112",
+      "So11111111111111111111111111111111111111112",
+      "ABC",
+      "Alpha",
+    ],
+    ["not-an-address", "also-bad"],
+  ]);
+
+  assert.equal(tokens.length, 2);
+  assert.equal(tokens[0]?.pairAddress, "G21JBCbAdB45chyS7gUKNKdVchNFEt2SvuJnPvgeVWjX");
+  assert.equal(tokens[0]?.tokenAddress, "5VMbcRosto1RT6GZHRucUZEM26XEoTYcmoSbNhq3pump");
+  assert.equal(tokens[0]?.ticker, "FrogCat");
+  assert.equal(tokens[1]?.ticker, "ABC");
+});
+
 test("FeedPool refreshes from fetchTrending and picks a deterministic token", async () => {
   const pool = new FeedPool({
     fetchTrending: async () => [

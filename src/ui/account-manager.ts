@@ -5,6 +5,7 @@
  * Token cache: ./accounts/tokens/{publicKey}.json
  * Account selection: ./accounts/selection.json — refresh/re-login/keep-warm selection.
  * Run selection:     ./accounts/run-selection.json — viewer-only selection.
+ * Test selection:    ./accounts/test-selection.json — Test-tab minimal watch selection.
  *
  * No more index.json, no wallet_*.json. Edit keys.txt to add/remove accounts.
  */
@@ -116,7 +117,7 @@ interface KeepWarmStartOptions extends KeepWarmTimingInput {
 }
 
 interface KeepWarmViewerDirector {
-  startWarmupForGroups(groups: WarmProxyViewerGroup[]): Promise<void>;
+  /** Tear down session-wander actors when keep-warm browsers close. */
   stopWarmup(): Promise<void>;
 }
 
@@ -174,15 +175,16 @@ export interface AccountProxyGroupsPayload {
   groups: AccountProxyGroupRecord[];
 }
 
-const KEYS_FILE = path.join(process.cwd(), 'keys.txt');
-const GOOD_KEYS_FILE = path.join(process.cwd(), 'keys.good.txt');
-const BAD_KEYS_FILE = path.join(process.cwd(), 'keys.bad.txt');
-const ACCOUNTS_DIR = path.join(process.cwd(), 'accounts');
-const TOKENS_DIR = path.join(ACCOUNTS_DIR, 'tokens');
-const SELECTION_FILE = path.join(ACCOUNTS_DIR, 'selection.json');
-const RUN_SELECTION_FILE = path.join(ACCOUNTS_DIR, 'run-selection.json');
-const BANNED_FILE = path.join(ACCOUNTS_DIR, 'banned.json');
-const LEGACY_INDEX = path.join(ACCOUNTS_DIR, 'index.json');
+function keysFile() { return path.join(process.cwd(), 'keys.txt'); }
+function goodKeysFile() { return path.join(process.cwd(), 'keys.good.txt'); }
+function badKeysFile() { return path.join(process.cwd(), 'keys.bad.txt'); }
+function accountsDir() { return path.join(process.cwd(), 'accounts'); }
+function tokensDir() { return path.join(accountsDir(), 'tokens'); }
+function selectionFile() { return path.join(accountsDir(), 'selection.json'); }
+function runSelectionFile() { return path.join(accountsDir(), 'run-selection.json'); }
+function testSelectionFile() { return path.join(accountsDir(), 'test-selection.json'); }
+function bannedFile() { return path.join(accountsDir(), 'banned.json'); }
+function legacyIndex() { return path.join(accountsDir(), 'index.json'); }
 const DEFAULT_REFRESH_THRESHOLD_MS = 3 * 60_000;
 const DEFAULT_REFRESH_DELAY_MIN_MS = 2500;
 const DEFAULT_REFRESH_DELAY_MAX_MS = 3500;
@@ -195,6 +197,23 @@ export function reloginFailureBackoffMs(message: string): number {
 
 export function isBanSignalMessage(message: string): boolean {
   return /weird error/i.test(message);
+}
+
+/**
+ * Tokens to delete when keys.txt reloads.
+ * Keep tokens for wallets not yet imported into keys.txt (e.g. fresh register output).
+ * Only drop tokens for pubkeys that were previously active and are now gone.
+ */
+export function tokenPublicKeysToPrune(
+  tokenPublicKeys: readonly string[],
+  previousKeys: ReadonlySet<string>,
+  currentKeys: ReadonlySet<string> | ReadonlyMap<string, unknown>,
+): string[] {
+  const hasCurrent =
+    typeof (currentKeys as Map<string, unknown>).has === 'function'
+      ? (pk: string) => (currentKeys as Map<string, unknown>).has(pk)
+      : (pk: string) => (currentKeys as Set<string>).has(pk);
+  return tokenPublicKeys.filter((pk) => previousKeys.has(pk) && !hasCurrent(pk));
 }
 
 interface SelectionFile {
@@ -210,7 +229,7 @@ interface BannedAccountsFile {
   accounts: Record<string, BannedAccountRecord>;
 }
 
-type SelectionScope = 'accounts' | 'run';
+type SelectionScope = 'accounts' | 'run' | 'test';
 
 export class AccountManager {
   // Cache: publicKey -> base58 secret. Rebuilt every time keys.txt changes.
@@ -226,8 +245,8 @@ export class AccountManager {
   }
 
   private ensureDirs(): void {
-    if (!fs.existsSync(ACCOUNTS_DIR)) fs.mkdirSync(ACCOUNTS_DIR, { recursive: true });
-    if (!fs.existsSync(TOKENS_DIR)) fs.mkdirSync(TOKENS_DIR, { recursive: true });
+    if (!fs.existsSync(accountsDir())) fs.mkdirSync(accountsDir(), { recursive: true });
+    if (!fs.existsSync(tokensDir())) fs.mkdirSync(tokensDir(), { recursive: true });
   }
 
   /**
@@ -236,13 +255,13 @@ export class AccountManager {
    * their publicKey isn't already represented.
    */
   private migrateLegacy(): void {
-    const legacyWallets = fs.readdirSync(ACCOUNTS_DIR)
+    const legacyWallets = fs.readdirSync(accountsDir())
       .filter(f => /^wallet_\d+\.json$/.test(f))
-      .map(f => path.join(ACCOUNTS_DIR, f));
-    const legacyTokens = fs.readdirSync(ACCOUNTS_DIR)
+      .map(f => path.join(accountsDir(), f));
+    const legacyTokens = fs.readdirSync(accountsDir())
       .filter(f => /^tokens_\d+\.json$/.test(f));
 
-    if (legacyWallets.length === 0 && legacyTokens.length === 0 && !fs.existsSync(LEGACY_INDEX)) {
+    if (legacyWallets.length === 0 && legacyTokens.length === 0 && !fs.existsSync(legacyIndex())) {
       return;
     }
 
@@ -272,9 +291,9 @@ export class AccountManager {
           existingPubkeys.add(pubkey);
         }
 
-        const legacyTokenFile = path.join(ACCOUNTS_DIR, `tokens_${id}.json`);
+        const legacyTokenFile = path.join(accountsDir(), `tokens_${id}.json`);
         if (fs.existsSync(legacyTokenFile)) {
-          const targetTokenFile = path.join(TOKENS_DIR, `${pubkey}.json`);
+          const targetTokenFile = path.join(tokensDir(), `${pubkey}.json`);
           if (!fs.existsSync(targetTokenFile)) {
             fs.copyFileSync(legacyTokenFile, targetTokenFile);
           }
@@ -287,20 +306,20 @@ export class AccountManager {
     }
 
     if (linesToAppend.length > 0) {
-      const existing = fs.existsSync(KEYS_FILE) ? fs.readFileSync(KEYS_FILE, 'utf-8') : '';
+      const existing = fs.existsSync(keysFile()) ? fs.readFileSync(keysFile(), 'utf-8') : '';
       const sep = existing && !existing.endsWith('\n') ? '\n' : '';
-      fs.writeFileSync(KEYS_FILE, existing + sep + linesToAppend.join('\n') + '\n');
+      fs.writeFileSync(keysFile(), existing + sep + linesToAppend.join('\n') + '\n');
       console.log(`[AccountManager] Appended ${linesToAppend.length} legacy key(s) to keys.txt`);
     }
 
     // Drop any orphan tokens_{id}.json that weren't paired with a wallet
     for (const f of legacyTokens) {
-      const p = path.join(ACCOUNTS_DIR, f);
+      const p = path.join(accountsDir(), f);
       if (fs.existsSync(p)) { try { fs.unlinkSync(p); } catch {} }
     }
 
-    if (fs.existsSync(LEGACY_INDEX)) {
-      try { fs.unlinkSync(LEGACY_INDEX); } catch {}
+    if (fs.existsSync(legacyIndex())) {
+      try { fs.unlinkSync(legacyIndex()); } catch {}
     }
 
     console.log('[AccountManager] Legacy migration complete.');
@@ -309,8 +328,8 @@ export class AccountManager {
   // ─── keys.txt handling ─────────────────────────────────────────────────
 
   private readKeysFile(): string[] {
-    if (!fs.existsSync(KEYS_FILE)) return [];
-    return fs.readFileSync(KEYS_FILE, 'utf-8')
+    if (!fs.existsSync(keysFile())) return [];
+    return fs.readFileSync(keysFile(), 'utf-8')
       .split('\n')
       .map(l => l.trim())
       .filter(Boolean)
@@ -320,8 +339,9 @@ export class AccountManager {
   /** Reload key cache if keys.txt changed since last read. */
   private refreshKeys(): void {
     let mtime = 0;
-    try { mtime = fs.statSync(KEYS_FILE).mtimeMs; } catch { mtime = 0; }
+    try { mtime = fs.statSync(keysFile()).mtimeMs; } catch { mtime = 0; }
     if (mtime === this.keysMtime && this.keyCache.size > 0) return;
+    const previousKeys = new Set(this.keyCache.keys());
     this.keysMtime = mtime;
     this.keyCache.clear();
     for (const line of this.readKeysFile()) {
@@ -332,25 +352,31 @@ export class AccountManager {
         console.warn(`[AccountManager] Skipping invalid key line: ${line.slice(0, 8)}...`);
       }
     }
-    this.pruneOrphanTokens();
+    this.pruneTokensForRemovedKeys(previousKeys);
   }
 
-  /** Delete cached tokens for pubkeys no longer in keys.txt. */
-  private pruneOrphanTokens(): void {
-    if (!fs.existsSync(TOKENS_DIR)) return;
-    for (const f of fs.readdirSync(TOKENS_DIR)) {
-      if (!f.endsWith('.json')) continue;
-      const pk = f.replace(/\.json$/, '');
-      if (!this.keyCache.has(pk)) {
-        try { fs.unlinkSync(path.join(TOKENS_DIR, f)); } catch {}
-      }
+  /**
+   * Delete cached tokens only for pubkeys that were in keys.txt and are now gone.
+   * Tokens for wallets that exist only in a fresh-keys file (not yet imported
+   * into keys.txt) must be kept so refresh works after the user merges them.
+   */
+  private pruneTokensForRemovedKeys(previousKeys: Set<string>): void {
+    if (!fs.existsSync(tokensDir())) return;
+    const tokenPublicKeys = fs
+      .readdirSync(tokensDir())
+      .filter((f) => f.endsWith('.json'))
+      .map((f) => f.replace(/\.json$/, ''));
+    for (const pk of tokenPublicKeysToPrune(tokenPublicKeys, previousKeys, this.keyCache)) {
+      try { fs.unlinkSync(path.join(tokensDir(), `${pk}.json`)); } catch {}
     }
   }
 
   // ─── selection.json handling ───────────────────────────────────────────
 
   private selectionPath(scope: SelectionScope): string {
-    return scope === 'run' ? RUN_SELECTION_FILE : SELECTION_FILE;
+    if (scope === 'run') return runSelectionFile();
+    if (scope === 'test') return testSelectionFile();
+    return selectionFile();
   }
 
   private readSelection(scope: SelectionScope = 'accounts'): Set<string> {
@@ -370,9 +396,9 @@ export class AccountManager {
   }
 
   private readBannedAccounts(): BannedAccountsFile {
-    if (!fs.existsSync(BANNED_FILE)) return { accounts: {} };
+    if (!fs.existsSync(bannedFile())) return { accounts: {} };
     try {
-      const parsed = JSON.parse(fs.readFileSync(BANNED_FILE, 'utf-8')) as BannedAccountsFile;
+      const parsed = JSON.parse(fs.readFileSync(bannedFile(), 'utf-8')) as BannedAccountsFile;
       return parsed && typeof parsed.accounts === 'object'
         ? { accounts: parsed.accounts ?? {} }
         : { accounts: {} };
@@ -382,7 +408,7 @@ export class AccountManager {
   }
 
   private writeBannedAccounts(file: BannedAccountsFile): void {
-    fs.writeFileSync(BANNED_FILE, JSON.stringify(file, null, 2));
+    fs.writeFileSync(bannedFile(), JSON.stringify(file, null, 2));
   }
 
   private publicKeyFromKeyLine(line: string): string | null {
@@ -394,13 +420,13 @@ export class AccountManager {
   }
 
   private ensureBannedRemovalBackup(): void {
-    if (this.bannedRemovalBackupPath || !fs.existsSync(KEYS_FILE)) return;
+    if (this.bannedRemovalBackupPath || !fs.existsSync(keysFile())) return;
     const stamp = new Date().toISOString()
       .replace(/[-:]/g, '')
       .replace('T', '-')
       .slice(0, 15);
     const backupPath = path.join(process.cwd(), `keys.backup-before-banned-remove-${stamp}.txt`);
-    fs.copyFileSync(KEYS_FILE, backupPath);
+    fs.copyFileSync(keysFile(), backupPath);
     this.bannedRemovalBackupPath = backupPath;
   }
 
@@ -441,7 +467,7 @@ export class AccountManager {
     const unique = [...new Set(keys)];
     if (unique.length === 0) return;
 
-    const existingRaw = fs.existsSync(BAD_KEYS_FILE) ? fs.readFileSync(BAD_KEYS_FILE, 'utf-8') : '';
+    const existingRaw = fs.existsSync(badKeysFile()) ? fs.readFileSync(badKeysFile(), 'utf-8') : '';
     const existing = new Set(
       existingRaw
         .split(/\r?\n/)
@@ -452,7 +478,7 @@ export class AccountManager {
     if (missing.length === 0) return;
 
     const prefix = existingRaw.length > 0 && !existingRaw.endsWith('\n') ? '\n' : '';
-    fs.writeFileSync(BAD_KEYS_FILE, `${existingRaw}${prefix}${missing.join('\n')}\n`, { mode: 0o600 });
+    fs.writeFileSync(badKeysFile(), `${existingRaw}${prefix}${missing.join('\n')}\n`, { mode: 0o600 });
   }
 
   private removeBannedKeyFromActiveFiles(publicKey: string): void {
@@ -461,8 +487,8 @@ export class AccountManager {
 
     this.ensureBannedRemovalBackup();
     const removed = [
-      ...this.removePublicKeyFromKeyFile(KEYS_FILE, publicKey),
-      ...this.removePublicKeyFromKeyFile(GOOD_KEYS_FILE, publicKey),
+      ...this.removePublicKeyFromKeyFile(keysFile(), publicKey),
+      ...this.removePublicKeyFromKeyFile(goodKeysFile(), publicKey),
     ];
     this.appendBadKeys(removed.length > 0 ? removed : [secret]);
 
@@ -523,6 +549,16 @@ export class AccountManager {
     this.writeSelection(cur, 'run');
   }
 
+  setTestSelected(publicKey: string, selected: boolean): void {
+    this.refreshKeys();
+    if (!this.keyCache.has(publicKey)) return;
+    if (selected && this.isAccountBanned(publicKey)) return;
+    const cur = this.readSelection('test');
+    if (selected && this.isTokenValid(publicKey)) cur.add(publicKey);
+    else cur.delete(publicKey);
+    this.writeSelection(cur, 'test');
+  }
+
   /** Replace the current selection with the given public keys (unknown keys ignored). */
   setSelection(publicKeys: string[]): void {
     this.refreshKeys();
@@ -537,10 +573,17 @@ export class AccountManager {
     this.writeSelection(valid, 'run');
   }
 
+  /** Replace the Test-tab selection with public keys that currently have valid tokens. */
+  setTestSelection(publicKeys: string[]): void {
+    this.refreshKeys();
+    const valid = new Set(publicKeys.filter((pk) => this.keyCache.has(pk) && !this.isAccountBanned(pk) && this.isTokenValid(pk)));
+    this.writeSelection(valid, 'test');
+  }
+
   // ─── tokens cache ──────────────────────────────────────────────────────
 
   private tokenPath(publicKey: string): string {
-    return path.join(TOKENS_DIR, `${publicKey}.json`);
+    return path.join(tokensDir(), `${publicKey}.json`);
   }
 
   private readTokens(publicKey: string): AuthTokens | null {
@@ -623,6 +666,7 @@ export class AccountManager {
       if (!this.keyCache.has(pk)) continue;
       if (this.isAccountBanned(pk)) continue;
       if (scope === 'run' && !this.isTokenValid(pk)) continue;
+      if (scope === 'test' && !this.isTokenValid(pk)) continue;
       count++;
     }
     return count;
@@ -647,7 +691,7 @@ export class AccountManager {
         publicKey: pk,
         hasTokens: !!tokens,
         tokenValid,
-        selected: !banned && selected.has(pk) && (scope !== 'run' || tokenValid),
+        selected: !banned && selected.has(pk) && (scope === 'accounts' || tokenValid),
         banned: !!banned,
         banReason: banned?.reason,
         bannedAt: banned?.bannedAt,
@@ -660,6 +704,10 @@ export class AccountManager {
 
   listRunAccounts(): AccountRecord[] {
     return this.listAccounts('run');
+  }
+
+  listTestAccounts(): AccountRecord[] {
+    return this.listAccounts('test');
   }
 
   listProxyGroups(scope: SelectionScope = 'accounts'): AccountProxyGroupsPayload {
@@ -685,6 +733,10 @@ export class AccountManager {
 
   listRunProxyGroups(): AccountProxyGroupsPayload {
     return this.listProxyGroups('run');
+  }
+
+  listTestProxyGroups(): AccountProxyGroupsPayload {
+    return this.listProxyGroups('test');
   }
 
   loadAccount(publicKey: string): LoadedAccount | null {
@@ -733,6 +785,19 @@ export class AccountManager {
   loadExplicitRunSelectedAccounts(): LoadedAccount[] {
     this.refreshKeys();
     const selected = this.readSelection('run');
+    const out: LoadedAccount[] = [];
+    for (const pk of this.keyCache.keys()) {
+      if (!selected.has(pk) || !this.isTokenValid(pk)) continue;
+      const a = this.loadAccount(pk);
+      if (a) out.push(a);
+    }
+    return out;
+  }
+
+  /** Test-tab selected accounts with valid tokens. Empty selection means no accounts. */
+  loadExplicitTestSelectedAccounts(): LoadedAccount[] {
+    this.refreshKeys();
+    const selected = this.readSelection('test');
     const out: LoadedAccount[] = [];
     for (const pk of this.keyCache.keys()) {
       if (!selected.has(pk) || !this.isTokenValid(pk)) continue;
@@ -1307,7 +1372,7 @@ export class AccountManager {
     return result;
   }
 
-  private getWarmProxyAccountGroups(publicKeys: string[]): WarmProxyAccountGroupsResult {
+  getWarmProxyAccountGroups(publicKeys: string[]): WarmProxyAccountGroupsResult {
     const result: WarmProxyAccountGroupsResult = {
       ready: false,
       groups: [],
@@ -1383,22 +1448,6 @@ export class AccountManager {
     return publicKeys
       .map((publicKey) => this.loadAccount(publicKey))
       .filter((account): account is LoadedAccount => !!account);
-  }
-
-  private async startViewerWarmupForGroup(
-    group: { id: number; label: string; accounts: string[] },
-    session: BrowserSession,
-  ): Promise<void> {
-    const accounts = this.loadedAccountsForPublicKeys(group.accounts);
-    if (accounts.length === 0) return;
-    await this.viewerDirector?.startWarmupForGroups([
-      {
-        id: group.id,
-        label: group.label,
-        session,
-        accounts,
-      },
-    ]);
   }
 
   async warmProxySessionsForAccounts(
@@ -1652,14 +1701,11 @@ export class AccountManager {
   }
 
   /**
-   * Keep selected accounts logged in by refreshing them forever (refresh-only —
-   * never a full re-login, since login has its own stricter limits). Every pass
-   * refreshes each account when it falls into that account's configured
-   * refresh-age window. Proxy mode runs one independent worker per proxy group.
-   * On the wall it backs off ~35s; an account
-   * whose refresh keeps failing is flagged dead (needs a manual re-login) and
-   * skipped. Runs in the background; the returned promise resolves once the loop
-   * has started. Stop with stopKeepLoggedIn() or stopReloginAll().
+   * Keep selected accounts logged in forever.
+   * - No refresh token → full login via the group browser
+   * - Has refresh token and near expiry → refresh
+   * - Refresh rejected as dead token → fall back to login once
+   * Proxy mode runs one independent worker per proxy group.
    */
   async startKeepLoggedIn(
     targets: string[] | undefined,
@@ -1720,7 +1766,6 @@ export class AccountManager {
             (message) => onProgress?.(message, true),
           ));
       this.keepWarmProxySessions.set(group.id, next);
-      await this.startViewerWarmupForGroup(group, next);
       return next;
     };
 
@@ -1750,14 +1795,12 @@ export class AccountManager {
     }
     if (proxyMode) {
       this.keepWarmProxyGroups = new Map(groups.map((group) => [group.id, group]));
-    } else if (browser) {
-      await this.startViewerWarmupForGroup(groups[0], browser);
     }
 
     onProgress?.(
       proxyMode
-        ? `Keep-logged-in started in proxy mode — ${groups.length} group(s), ${this.formatDuration(timing.groupStartDelayMs.min)}-${this.formatDuration(timing.groupStartDelayMs.max)} group stagger, ${this.formatDuration(delayMinMs)}-${this.formatDuration(delayMaxMs)} in-group delay.`
-        : `Keep-logged-in started — refresh-only, ${this.formatDuration(delayMinMs)}-${this.formatDuration(delayMaxMs)} apart.`,
+        ? `Keep-logged-in started in proxy mode — ${groups.length} group(s), login+refresh, ${this.formatDuration(timing.groupStartDelayMs.min)}-${this.formatDuration(timing.groupStartDelayMs.max)} group stagger, ${this.formatDuration(delayMinMs)}-${this.formatDuration(delayMaxMs)} in-group delay.`
+        : `Keep-logged-in started — login when needed, refresh when due, ${this.formatDuration(delayMinMs)}-${this.formatDuration(delayMaxMs)} apart.`,
       true,
     );
 
@@ -1798,22 +1841,26 @@ export class AccountManager {
         const groupAccounts = group.accounts
           .filter((pk) => this.keyCache.has(pk))
           .filter((pk) => !this.keepWarm.dead.has(pk));
+        const needLogin = groupAccounts.filter((pk) => !this.readTokens(pk)?.refreshToken);
         const withRt = groupAccounts.filter((pk) => !!this.readTokens(pk)?.refreshToken);
-        const noRt = groupAccounts.filter((pk) => !this.readTokens(pk)?.refreshToken);
+        const dueRefresh = withRt.filter(isDueForKeepWarm);
+        const jobs: { pk: string; kind: 'login' | 'refresh' }[] = [
+          ...needLogin.map((pk) => ({ pk, kind: 'login' as const })),
+          ...dueRefresh.map((pk) => ({ pk, kind: 'refresh' as const })),
+        ];
 
-        const due = withRt.filter(isDueForKeepWarm);
         if (initialGroupPass) {
-          if (noRt.length > 0) {
-            onProgress?.(`${groupPrefix}${noRt.length} account(s) have no refresh token — they need a manual re-login and won't be kept warm.`, true);
+          if (needLogin.length > 0) {
+            onProgress?.(`${groupPrefix}${needLogin.length} account(s) have no refresh token — will login.`, true);
           }
-          const skippedFresh = withRt.length - due.length;
+          const skippedFresh = withRt.length - dueRefresh.length;
           if (skippedFresh > 0) {
             onProgress?.(`${groupPrefix}${skippedFresh} account(s) already fresh — skipping until near expiry.`, true);
           }
           initialGroupPass = false;
         }
 
-        if (due.length === 0) {
+        if (jobs.length === 0) {
           await this.sleepUnlessStopped(5000);
           continue;
         }
@@ -1826,55 +1873,102 @@ export class AccountManager {
           continue;
         }
 
-        for (let i = 0; i < due.length; i++) {
-          const pk = due[i];
+        for (let i = 0; i < jobs.length; i++) {
+          const { pk, kind } = jobs[i];
           if (!this.keepWarm.running) break;
-          const result = await this.refreshAccountDetailed(pk, groupBrowser, { exclusive: !proxyMode })
-            .catch((err: any) => this.classifyRefreshError(err));
 
-          if (result.ok) {
-            consecutiveNetworkFails = 0;
-            this.keepWarm.fails.delete(pk);
-            onProgress?.(
-              `${groupPrefix}refreshed ${pk.slice(0, 8)} (${i + 1}/${due.length}; ${this.formatRefreshEta(due.length - i - 1, options.refreshDelayMs.min, options.refreshDelayMs.max)})`,
-              true,
-            );
-          } else if (isBanSignalMessage(result.message)) {
-            consecutiveNetworkFails = 0;
-            this.keepWarm.fails.delete(pk);
-            const ban = this.recordBanSignal(pk, result.message);
-            opts.onBanSignal?.(ban);
-            onProgress?.(`${groupPrefix}${pk.slice(0, 8)} BAN signal — marked banned locally and stopped all account automation.`, false);
-            break;
-          } else if (result.deadToken) {
-            consecutiveNetworkFails = 0;
-            this.keepWarm.fails.delete(pk);
-            this.keepWarm.dead.add(pk);
-            onProgress?.(`${groupPrefix}${pk.slice(0, 8)} can't be refreshed${this.formatRefreshFailureDetail(result)} — needs manual re-login. Skipping.`, true);
-          } else if (result.throttled) {
-            consecutiveNetworkFails = 0;
-            const cooldownMs = result.retryAfter != null ? Math.max(35_000, result.retryAfter * 1000) : 35_000;
-            cooldownUntil = Date.now() + cooldownMs;
-            onProgress?.(`${groupPrefix}hit the refresh rate limit${this.formatRefreshFailureDetail(result)} — cooling this group for ${this.formatDuration(cooldownMs)}...`, true);
-            break;
-          } else if (result.status === 0) {
-            consecutiveNetworkFails++;
-            onProgress?.(`${groupPrefix}refresh failed for ${pk.slice(0, 8)}${this.formatRefreshFailureDetail(result)} (will retry)`, true);
-            if (consecutiveNetworkFails >= 3) {
-              onProgress?.(`${groupPrefix}browser/network refresh failures (status=0) — backing off this group for 30s...`, true);
-              cooldownUntil = Date.now() + 30_000;
+          if (kind === 'login') {
+            try {
+              await this.reloginAccount(pk, groupBrowser);
               consecutiveNetworkFails = 0;
-              break;
+              this.keepWarm.fails.delete(pk);
+              onProgress?.(
+                `${groupPrefix}logged in ${pk.slice(0, 8)} (${i + 1}/${jobs.length}; ${this.formatRefreshEta(jobs.length - i - 1, options.refreshDelayMs.min, options.refreshDelayMs.max)})`,
+                true,
+              );
+            } catch (err: any) {
+              const message = String(err?.message || err || '');
+              if (isBanSignalMessage(message)) {
+                consecutiveNetworkFails = 0;
+                this.keepWarm.fails.delete(pk);
+                const ban = this.recordBanSignal(pk, message);
+                opts.onBanSignal?.(ban);
+                onProgress?.(`${groupPrefix}${pk.slice(0, 8)} BAN signal — marked banned locally and stopped all account automation.`, false);
+                break;
+              }
+              const f = (this.keepWarm.fails.get(pk) ?? 0) + 1;
+              this.keepWarm.fails.set(pk, f);
+              if (f >= 3) {
+                this.keepWarm.dead.add(pk);
+                onProgress?.(`${groupPrefix}${pk.slice(0, 8)} login failed ${f}x (${message}) — skipping.`, true);
+              } else {
+                onProgress?.(`${groupPrefix}login failed for ${pk.slice(0, 8)} (${message}) (will retry)`, true);
+              }
             }
           } else {
-            consecutiveNetworkFails = 0;
-            const f = (this.keepWarm.fails.get(pk) ?? 0) + 1;
-            this.keepWarm.fails.set(pk, f);
-            onProgress?.(`${groupPrefix}refresh failed for ${pk.slice(0, 8)}${this.formatRefreshFailureDetail(result)} (will retry)`, true);
+            const result = await this.refreshAccountDetailed(pk, groupBrowser, { exclusive: !proxyMode })
+              .catch((err: any) => this.classifyRefreshError(err));
+
+            if (result.ok) {
+              consecutiveNetworkFails = 0;
+              this.keepWarm.fails.delete(pk);
+              onProgress?.(
+                `${groupPrefix}refreshed ${pk.slice(0, 8)} (${i + 1}/${jobs.length}; ${this.formatRefreshEta(jobs.length - i - 1, options.refreshDelayMs.min, options.refreshDelayMs.max)})`,
+                true,
+              );
+            } else if (isBanSignalMessage(result.message)) {
+              consecutiveNetworkFails = 0;
+              this.keepWarm.fails.delete(pk);
+              const ban = this.recordBanSignal(pk, result.message);
+              opts.onBanSignal?.(ban);
+              onProgress?.(`${groupPrefix}${pk.slice(0, 8)} BAN signal — marked banned locally and stopped all account automation.`, false);
+              break;
+            } else if (result.deadToken) {
+              consecutiveNetworkFails = 0;
+              onProgress?.(`${groupPrefix}${pk.slice(0, 8)} refresh rejected — trying full login...`, true);
+              try {
+                await this.reloginAccount(pk, groupBrowser);
+                this.keepWarm.fails.delete(pk);
+                onProgress?.(
+                  `${groupPrefix}logged in ${pk.slice(0, 8)} after dead refresh (${i + 1}/${jobs.length})`,
+                  true,
+                );
+              } catch (err: any) {
+                const message = String(err?.message || err || '');
+                if (isBanSignalMessage(message)) {
+                  const ban = this.recordBanSignal(pk, message);
+                  opts.onBanSignal?.(ban);
+                  onProgress?.(`${groupPrefix}${pk.slice(0, 8)} BAN signal — marked banned locally and stopped all account automation.`, false);
+                  break;
+                }
+                this.keepWarm.dead.add(pk);
+                onProgress?.(`${groupPrefix}${pk.slice(0, 8)} login after dead refresh failed (${message}) — skipping.`, true);
+              }
+            } else if (result.throttled) {
+              consecutiveNetworkFails = 0;
+              const cooldownMs = result.retryAfter != null ? Math.max(35_000, result.retryAfter * 1000) : 35_000;
+              cooldownUntil = Date.now() + cooldownMs;
+              onProgress?.(`${groupPrefix}hit the refresh rate limit${this.formatRefreshFailureDetail(result)} — cooling this group for ${this.formatDuration(cooldownMs)}...`, true);
+              break;
+            } else if (result.status === 0) {
+              consecutiveNetworkFails++;
+              onProgress?.(`${groupPrefix}refresh failed for ${pk.slice(0, 8)}${this.formatRefreshFailureDetail(result)} (will retry)`, true);
+              if (consecutiveNetworkFails >= 3) {
+                onProgress?.(`${groupPrefix}browser/network refresh failures (status=0) — backing off this group for 30s...`, true);
+                cooldownUntil = Date.now() + 30_000;
+                consecutiveNetworkFails = 0;
+                break;
+              }
+            } else {
+              consecutiveNetworkFails = 0;
+              const f = (this.keepWarm.fails.get(pk) ?? 0) + 1;
+              this.keepWarm.fails.set(pk, f);
+              onProgress?.(`${groupPrefix}refresh failed for ${pk.slice(0, 8)}${this.formatRefreshFailureDetail(result)} (will retry)`, true);
+            }
           }
 
           if (!this.keepWarm.running) break;
-          if (i < due.length - 1) {
+          if (i < jobs.length - 1) {
             await this.sleepUnlessStopped(this.nextRefreshDelayMs(options.refreshDelayMs.min, options.refreshDelayMs.max));
           }
         }

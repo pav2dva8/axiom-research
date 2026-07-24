@@ -18,3 +18,31 @@ Verification:
 
 Concerns:
 - Existing dirty-tree changes remain in several files and were intentionally excluded from the Task 6 commit.
+
+### Review Finding Fix: connectAll actor deploy path
+
+Status: complete.
+
+Implemented:
+- Changed direct `ViewerService.connectAll()` deploys to call the same actor-aware `deployAccount()` path used by `connectGroups()`.
+- Skipped legacy cluster priming for managed browser sessions so warmed direct sessions are not sent through `connectViewer()`.
+- Added a regression test for `startWarmupForGroups()` followed by direct-session `connectAll()` that asserts deploy navigation is used and legacy `connectViewer()` is not called.
+
+Verification:
+- RED: `node --test --import tsx tests/viewer-service-warmup.test.ts` failed with `0 !== 1` after legacy `connectViewer` was attempted.
+- GREEN: `node --test --import tsx tests/viewer-service-warmup.test.ts` passed 2/2.
+- Requested warmup suite: `node --test --import tsx tests/viewer-service-warmup.test.ts` passed 2/2.
+- Build: `npm run build` passed.
+
+Commit:
+- `3fe4b70 fix: route direct viewer connects through warmup actors`
+
+### Residual Fix: reuse keep-warm browser in ensureBrowserSession
+
+Status: complete.
+
+Implemented:
+- Before opening a new browser in `ensureBrowserSession`, reuse `accountManager.getBrowserSession()` when present (direct keep-warm already opened Chrome), set it on `viewerService`, and return it.
+
+Verification:
+- Build: `npm run build` passed.

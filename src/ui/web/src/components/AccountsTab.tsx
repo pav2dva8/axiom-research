@@ -50,7 +50,6 @@ function countdown(expiresAt: number | undefined, now: number): { text: string; 
 export function AccountsTab({ onLog, refreshTick, onChanged, keepWarmRunning }: Props) {
   const [accounts, setAccounts] = useState<Account[]>([]);
   const [loading, setLoading] = useState(true);
-  const [bulkRunning, setBulkRunning] = useState(false);
   const [pendingKey, setPendingKey] = useState<string | null>(null);
   const [now, setNow] = useState(() => Date.now());
   const [keepWarmSettings, setKeepWarmSettings] = useState({
@@ -167,52 +166,6 @@ export function AccountsTab({ onLog, refreshTick, onChanged, keepWarmRunning }: 
     }
   }
 
-  async function reloginSelected() {
-    setBulkRunning(true);
-    onLog('Re-logging in selected accounts...', 'info');
-    try {
-      const selected = accounts.filter((a) => a.selected).map((a) => a.publicKey);
-      const res = await fetch('/api/accounts/relogin', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ publicKeys: selected }),
-      });
-      const data = await res.json();
-      onLog(`Re-logged in ${data.success}/${data.total} accounts`, 'success');
-    } catch (err: any) {
-      onLog(`Error: ${err.message}`, 'error');
-    } finally {
-      setBulkRunning(false);
-      fetchAccounts();
-    }
-  }
-
-  async function refreshSelected() {
-    setBulkRunning(true);
-    onLog('Refreshing due selected accounts...', 'info');
-    try {
-      const selected = accounts.filter((a) => a.selected).map((a) => a.publicKey);
-      const res = await fetch('/api/accounts/refresh', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ publicKeys: selected }),
-      });
-      const data = await res.json();
-      const skippedFresh = Number(data.skippedFresh ?? 0);
-      onLog(
-        skippedFresh > 0
-          ? `Refreshed ${data.success}/${data.total} accounts; skipped ${skippedFresh} fresh`
-          : `Refreshed ${data.success}/${data.total} accounts`,
-        data.success > 0 || skippedFresh > 0 ? 'success' : 'info',
-      );
-    } catch (err: any) {
-      onLog(`Error: ${err.message}`, 'error');
-    } finally {
-      setBulkRunning(false);
-      fetchAccounts();
-    }
-  }
-
   async function startKeepWarm() {
     const selected = accounts.filter((a) => a.selected).map((a) => a.publicKey);
     if (selected.length === 0) {
@@ -248,12 +201,6 @@ export function AccountsTab({ onLog, refreshTick, onChanged, keepWarmRunning }: 
     } catch (err: any) {
       onLog(`Error: ${err.message}`, 'error');
     }
-  }
-
-  async function stopRelogin() {
-    await fetch('/api/accounts/relogin/stop', { method: 'POST' });
-    onLog('Stopping...', 'info');
-    setBulkRunning(false);
   }
 
   function copyKey(k: string) {
@@ -299,72 +246,39 @@ export function AccountsTab({ onLog, refreshTick, onChanged, keepWarmRunning }: 
             <Button
               size="sm"
               onClick={startKeepWarm}
-              disabled={selectedCount === 0 || bulkRunning}
-              title="Refresh selected accounts when they enter the configured refresh-age window, then keep them logged in indefinitely. Uses proxies.txt automatically when present."
+              disabled={selectedCount === 0}
+              title="Login accounts that need it, refresh when near expiry, keep them logged in. Uses proxies.txt when present."
             >
               <RefreshCw className="mr-2 h-3.5 w-3.5" />
               Keep logged in ({selectedCount})
             </Button>
           )}
         </div>
-        <div className="flex flex-wrap items-center justify-between gap-2">
-          <div className="flex flex-wrap items-center gap-2">
-            <Button
-              size="sm"
-              variant="outline"
-              onClick={() => selectByStatus((a) => a.tokenValid)}
-              disabled={loggedInCount === 0 || bulkRunning}
-            >
-              Logged in ({loggedInCount})
-            </Button>
-            <Button
-              size="sm"
-              variant="outline"
-              onClick={() => selectByStatus((a) => a.hasTokens && !a.tokenValid && !a.banned)}
-              disabled={needsRefreshCount === 0 || bulkRunning}
-            >
-              Needs refresh ({needsRefreshCount})
-            </Button>
-            <Button
-              size="sm"
-              variant="outline"
-              onClick={() => selectByStatus((a) => !a.tokenValid && !a.hasTokens && !a.banned)}
-              disabled={needsLoginCount === 0 || bulkRunning}
-            >
-              Needs login ({needsLoginCount})
-            </Button>
-          </div>
-          <div className="flex flex-wrap items-center gap-2">
-            {!bulkRunning ? (
-              <>
-                <Button
-                  size="sm"
-                  variant="outline"
-                  onClick={refreshSelected}
-                  disabled={selectedCount === 0 || keepWarmRunning}
-                  title="One-off refresh of selected accounts that are due or within 3 minutes of expiry (no Turnstile), paced 2.5-3.5s apart. Disabled while keep-warm is running."
-                >
-                  <RefreshCw className="mr-2 h-3.5 w-3.5" />
-                  Refresh selected
-                </Button>
-                <Button
-                  size="sm"
-                  variant="secondary"
-                  onClick={reloginSelected}
-                  disabled={selectedCount === 0 || keepWarmRunning}
-                  title="Full re-login: Turnstile + sign nonce + verify. Disabled while keep-logged-in is running (use the per-row button for a single dead account)."
-                >
-                  <RefreshCw className="mr-2 h-3.5 w-3.5" />
-                  Re-login selected
-                </Button>
-              </>
-            ) : (
-              <Button size="sm" variant="destructive" onClick={stopRelogin}>
-                <Square className="mr-2 h-3.5 w-3.5" />
-                Stop
-              </Button>
-            )}
-          </div>
+        <div className="flex flex-wrap items-center gap-2">
+          <Button
+            size="sm"
+            variant="outline"
+            onClick={() => selectByStatus((a) => a.tokenValid)}
+            disabled={loggedInCount === 0}
+          >
+            Logged in ({loggedInCount})
+          </Button>
+          <Button
+            size="sm"
+            variant="outline"
+            onClick={() => selectByStatus((a) => a.hasTokens && !a.tokenValid && !a.banned)}
+            disabled={needsRefreshCount === 0}
+          >
+            Needs refresh ({needsRefreshCount})
+          </Button>
+          <Button
+            size="sm"
+            variant="outline"
+            onClick={() => selectByStatus((a) => !a.tokenValid && !a.hasTokens && !a.banned)}
+            disabled={needsLoginCount === 0}
+          >
+            Needs login ({needsLoginCount})
+          </Button>
         </div>
         <div className="grid grid-cols-1 gap-2 text-xs sm:grid-cols-3">
           <label className="flex flex-col gap-1 text-muted-foreground">
@@ -375,7 +289,7 @@ export function AccountsTab({ onLog, refreshTick, onChanged, keepWarmRunning }: 
                 min={0}
                 step={1}
                 value={keepWarmSettings.groupStartMinSec}
-                disabled={keepWarmRunning || bulkRunning}
+                disabled={keepWarmRunning}
                 onChange={(event) => updateKeepWarmSetting('groupStartMinSec', event.target.value)}
                 className="h-8"
               />
@@ -385,7 +299,7 @@ export function AccountsTab({ onLog, refreshTick, onChanged, keepWarmRunning }: 
                 min={0}
                 step={1}
                 value={keepWarmSettings.groupStartMaxSec}
-                disabled={keepWarmRunning || bulkRunning}
+                disabled={keepWarmRunning}
                 onChange={(event) => updateKeepWarmSetting('groupStartMaxSec', event.target.value)}
                 className="h-8"
               />
@@ -399,7 +313,7 @@ export function AccountsTab({ onLog, refreshTick, onChanged, keepWarmRunning }: 
                 min={0.5}
                 step={0.5}
                 value={keepWarmSettings.refreshDelayMinSec}
-                disabled={keepWarmRunning || bulkRunning}
+                disabled={keepWarmRunning}
                 onChange={(event) => updateKeepWarmSetting('refreshDelayMinSec', event.target.value)}
                 className="h-8"
               />
@@ -409,7 +323,7 @@ export function AccountsTab({ onLog, refreshTick, onChanged, keepWarmRunning }: 
                 min={0.5}
                 step={0.5}
                 value={keepWarmSettings.refreshDelayMaxSec}
-                disabled={keepWarmRunning || bulkRunning}
+                disabled={keepWarmRunning}
                 onChange={(event) => updateKeepWarmSetting('refreshDelayMaxSec', event.target.value)}
                 className="h-8"
               />
@@ -423,7 +337,7 @@ export function AccountsTab({ onLog, refreshTick, onChanged, keepWarmRunning }: 
                 min={1}
                 step={1}
                 value={keepWarmSettings.refreshAgeMinMin}
-                disabled={keepWarmRunning || bulkRunning}
+                disabled={keepWarmRunning}
                 onChange={(event) => updateKeepWarmSetting('refreshAgeMinMin', event.target.value)}
                 className="h-8"
               />
@@ -433,7 +347,7 @@ export function AccountsTab({ onLog, refreshTick, onChanged, keepWarmRunning }: 
                 min={1}
                 step={1}
                 value={keepWarmSettings.refreshAgeMaxMin}
-                disabled={keepWarmRunning || bulkRunning}
+                disabled={keepWarmRunning}
                 onChange={(event) => updateKeepWarmSetting('refreshAgeMaxMin', event.target.value)}
                 className="h-8"
               />
@@ -519,7 +433,7 @@ export function AccountsTab({ onLog, refreshTick, onChanged, keepWarmRunning }: 
                       size="icon"
                       variant="ghost"
                       onClick={() => reloginRow(a.publicKey)}
-                      disabled={pendingKey !== null || bulkRunning}
+                      disabled={pendingKey !== null || keepWarmRunning}
                       aria-label="Re-login"
                     >
                       {pendingKey === a.publicKey ? (

@@ -29,6 +29,7 @@ test("normalizeTokenInfo accepts nested Axiom pair metadata", () => {
     isMigrated: true,
     supply: 12345,
     price: 0.001,
+    chain: "sol",
   });
 });
 

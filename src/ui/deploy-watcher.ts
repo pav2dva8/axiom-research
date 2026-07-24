@@ -13,6 +13,14 @@ import {
 } from "@solana/web3.js";
 import { derivePumpPair } from "../pump-pair";
 import type { TokenInfo } from "./viewer-service";
+import {
+  DEFAULT_ROBINHOOD_RPC_URL,
+  createHttpRobinhoodRpcClient,
+  findUniswapV3WethPool,
+  isRobinhoodCaInput,
+  normalizeHexAddress,
+  type RobinhoodRpcClient,
+} from "./robinhood-deploy-watch";
 
 export const DEFAULT_SOLANA_RPC_URL = "https://api.mainnet-beta.solana.com";
 export const DEFAULT_DEPLOY_WATCH_POLL_MS = 250;
@@ -22,12 +30,17 @@ export interface DeployWatchConfig {
   wsUrl?: string;
   pollMs: number;
   allowInsecureTls: boolean;
+  /** Robinhood eth JSON-RPC. Defaults to public mainnet endpoint. */
+  robinhoodRpcUrl?: string;
 }
 
 export interface ParsedDeployWatchInput {
   ca: string;
-  mint: PublicKey;
+  /** Known ahead for Sol pump; empty until detected for Robinhood. */
   pairAddress: string;
+  chain: "sol" | "robinhood";
+  /** Solana mint pubkey; absent for Robinhood. */
+  mint?: PublicKey;
 }
 
 export type DeployWatchSource = "initial" | "ws" | "poll";
@@ -53,6 +66,7 @@ export interface DeployWatchDetection {
   detectedAt: number;
   slot: number;
   source: DeployWatchSource;
+  chain: "sol" | "robinhood";
 }
 
 export interface DeployWatchConnection {
@@ -71,6 +85,10 @@ export interface DeployWatchConnection {
 export type DeployWatchConnectionFactory = (
   config: DeployWatchConfig,
 ) => DeployWatchConnection;
+
+export type RobinhoodRpcClientFactory = (
+  config: DeployWatchConfig,
+) => RobinhoodRpcClient;
 
 export class DeployWatchCanceledError extends Error {
   constructor(message = "Deploy watch canceled.") {
@@ -97,6 +115,7 @@ const DEPLOY_WATCH_ENV_KEYS = new Set([
   "SOLANA_WS_URL",
   "DEPLOY_WATCH_POLL_MS",
   "SOLANA_RPC_ALLOW_INSECURE_TLS",
+  "ROBINHOOD_RPC_URL",
 ]);
 
 function parseEnvValue(value: string): string {
@@ -152,6 +171,7 @@ export function getDeployWatchConfig(
 ): DeployWatchConfig {
   const rawRpc = env.SOLANA_RPC_URL?.trim();
   const rawWs = env.SOLANA_WS_URL?.trim();
+  const rawRobinhoodRpc = env.ROBINHOOD_RPC_URL?.trim();
   const rawPoll = Number(env.DEPLOY_WATCH_POLL_MS);
   const pollMs =
     Number.isFinite(rawPoll) && rawPoll >= 0
@@ -163,16 +183,31 @@ export function getDeployWatchConfig(
     wsUrl: rawWs || undefined,
     pollMs,
     allowInsecureTls: isTruthyEnv(env.SOLANA_RPC_ALLOW_INSECURE_TLS),
+    robinhoodRpcUrl: rawRobinhoodRpc || DEFAULT_ROBINHOOD_RPC_URL,
   };
 }
 
 export function isBareCaInput(input: string): boolean {
-  return BASE58_ADDRESS.test(input.trim());
+  const value = input.trim();
+  return BASE58_ADDRESS.test(value) || isRobinhoodCaInput(value);
 }
 
 export function parseDeployWatchInput(input: string): ParsedDeployWatchInput {
   const value = input.trim();
-  if (!value || !BASE58_ADDRESS.test(value)) {
+  if (!value) {
+    throw new Error("Watch deploy requires a bare token CA, not an axiom.trade link.");
+  }
+
+  if (isRobinhoodCaInput(value)) {
+    const ca = normalizeHexAddress(value);
+    return {
+      ca,
+      pairAddress: "",
+      chain: "robinhood",
+    };
+  }
+
+  if (!BASE58_ADDRESS.test(value)) {
     throw new Error("Watch deploy requires a bare token CA, not an axiom.trade link.");
   }
 
@@ -188,10 +223,24 @@ export function parseDeployWatchInput(input: string): ParsedDeployWatchInput {
     throw new Error("Could not derive pump pair from CA.");
   }
 
-  return { ca: mint.toBase58(), mint, pairAddress };
+  return { ca: mint.toBase58(), mint, pairAddress, chain: "sol" };
 }
 
 export function buildDeployTokenInfo(parsed: ParsedDeployWatchInput): TokenInfo {
+  if (parsed.chain === "robinhood") {
+    return {
+      pairAddress: parsed.pairAddress || parsed.ca,
+      tokenAddress: parsed.ca,
+      ticker: "TOKEN",
+      name: "Token",
+      protocol: "Uniswap v3",
+      isMigrated: false,
+      supply: 1000000000,
+      price: 0,
+      chain: "robinhood",
+    };
+  }
+
   return {
     pairAddress: parsed.pairAddress,
     tokenAddress: parsed.ca,
@@ -201,6 +250,7 @@ export function buildDeployTokenInfo(parsed: ParsedDeployWatchInput): TokenInfo 
     isMigrated: false,
     supply: 1000000000,
     price: 0,
+    chain: "sol",
   };
 }
 
@@ -221,6 +271,10 @@ export class DeployWatcher extends EventEmitter {
 
   constructor(
     private readonly createConnection: DeployWatchConnectionFactory = createSolanaConnection,
+    private readonly createRobinhoodRpc: RobinhoodRpcClientFactory = (config) =>
+      createHttpRobinhoodRpcClient(
+        config.robinhoodRpcUrl || DEFAULT_ROBINHOOD_RPC_URL,
+      ),
   ) {
     super();
   }
@@ -248,11 +302,162 @@ export class DeployWatcher extends EventEmitter {
     parsed: ParsedDeployWatchInput,
     config: DeployWatchConfig = getDeployWatchConfig(),
   ): Promise<DeployWatchDetection> {
+    if (parsed.chain === "robinhood") {
+      return this.waitForRobinhoodPool(parsed, config);
+    }
+    return this.waitForSolanaMint(parsed, config);
+  }
+
+  private async waitForRobinhoodPool(
+    parsed: ParsedDeployWatchInput,
+    config: DeployWatchConfig,
+  ): Promise<DeployWatchDetection> {
     if (this.active) {
       throw new Error("A deploy watch is already active.");
     }
 
+    const rpc = this.createRobinhoodRpc(config);
+    const active: ActiveWatch = {
+      ca: parsed.ca,
+      pairAddress: parsed.pairAddress,
+      canceled: false,
+      settled: false,
+      subscriptionId: null,
+      timer: null,
+      cleanupPromise: null,
+      cleanup: async () => {},
+      settle: async () => {},
+    };
+    this.active = active;
+
+    const readPool = async (
+      source: DeployWatchSource,
+    ): Promise<DeployWatchDetection | null> => {
+      const hit = await findUniswapV3WethPool(parsed.ca, rpc);
+      if (!hit) return null;
+      return {
+        ca: parsed.ca,
+        pairAddress: hit.pool,
+        detectedAt: Date.now(),
+        slot: hit.blockNumber,
+        source,
+        chain: "robinhood",
+      };
+    };
+
+    return await new Promise<DeployWatchDetection>((resolve, reject) => {
+      const cleanup = (): Promise<void> => {
+        if (active.cleanupPromise) return active.cleanupPromise;
+        active.cleanupPromise = (async () => {
+          if (active.timer) {
+            clearInterval(active.timer);
+            active.timer = null;
+          }
+        })();
+        return active.cleanupPromise;
+      };
+
+      const settle = async (
+        value: DeployWatchDetection | Error,
+      ): Promise<void> => {
+        if (active.settled) return;
+        active.settled = true;
+        await cleanup();
+
+        if (value instanceof Error) {
+          if (value instanceof DeployWatchCanceledError) {
+            this.emitWatch({
+              state: "canceled",
+              message: value.message,
+              ca: active.ca,
+              pairAddress: active.pairAddress || undefined,
+            });
+          } else {
+            this.emitWatch({
+              state: "failed",
+              message: value.message,
+              ca: active.ca,
+              pairAddress: active.pairAddress || undefined,
+            });
+          }
+          if (this.active === active) this.active = null;
+          reject(value);
+          return;
+        }
+
+        active.pairAddress = value.pairAddress;
+        if (this.active === active) this.active = null;
+        resolve(value);
+      };
+
+      active.cleanup = cleanup;
+      active.settle = settle;
+
+      const confirm = async (source: DeployWatchSource): Promise<void> => {
+        if (active.canceled || active.settled) return;
+        const detection = await readPool(source);
+        if (!detection || active.canceled || active.settled) return;
+        this.emitWatch({
+          state: "detected",
+          message: `Robinhood V3 pool detected at block ${detection.slot}.`,
+          ca: parsed.ca,
+          pairAddress: detection.pairAddress,
+        });
+        await settle(detection);
+      };
+
+      const start = async (): Promise<void> => {
+        try {
+          const initial = await readPool("initial");
+          if (active.canceled || active.settled) return;
+          if (initial) {
+            this.emitWatch({
+              state: "detected",
+              message: `Robinhood V3 pool detected at block ${initial.slot}.`,
+              ca: parsed.ca,
+              pairAddress: initial.pairAddress,
+            });
+            await settle(initial);
+            return;
+          }
+
+          this.emitWatch({
+            state: "watching",
+            message: `Watching Robinhood Uniswap V3 WETH pool for ${parsed.ca}.`,
+            ca: parsed.ca,
+          });
+
+          active.timer = setInterval(() => {
+            confirm("poll").catch((err) => {
+              settle(err instanceof Error ? err : new Error(String(err))).catch(
+                () => {},
+              );
+            });
+          }, config.pollMs);
+        } catch (err) {
+          await settle(err instanceof Error ? err : new Error(String(err)));
+        }
+      };
+
+      start().catch((err) => {
+        settle(err instanceof Error ? err : new Error(String(err))).catch(() => {});
+      });
+    });
+  }
+
+  private async waitForSolanaMint(
+    parsed: ParsedDeployWatchInput,
+    config: DeployWatchConfig,
+  ): Promise<DeployWatchDetection> {
+    if (this.active) {
+      throw new Error("A deploy watch is already active.");
+    }
+    if (!parsed.mint) {
+      throw new Error("Solana deploy watch requires a mint pubkey.");
+    }
+
     const connection = this.createConnection(config);
+    const mint = parsed.mint;
     const active: ActiveWatch = {
       ca: parsed.ca,
       pairAddress: parsed.pairAddress,
@@ -270,7 +475,7 @@ export class DeployWatcher extends EventEmitter {
       source: DeployWatchSource,
     ): Promise<DeployWatchDetection | null> => {
       const result = await connection.getAccountInfoAndContext(
-        parsed.mint,
+        mint,
         "processed",
       );
       if (!result.value) return null;
@@ -281,6 +486,7 @@ export class DeployWatcher extends EventEmitter {
         detectedAt: Date.now(),
         slot: result.context.slot,
         source,
+        chain: "sol",
       };
     };
 
@@ -393,7 +599,7 @@ export class DeployWatcher extends EventEmitter {
           if (config.wsUrl) {
             try {
               active.subscriptionId = connection.onAccountChange(
-                parsed.mint,
+                mint,
                 (_accountInfo: AccountInfo<Buffer>, _context: Context) => {
                   confirm("ws").catch((err) => {
                     settle(err instanceof Error ? err : new Error(String(err))).catch(

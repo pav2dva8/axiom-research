@@ -100,7 +100,7 @@ async function handleStartViewers(): Promise<void> {
   const tokenInfo = await viewerService.fetchTokenInfo(pairAddress);
   viewerService.setTokenInfo(tokenInfo ?? {
     pairAddress, tokenAddress: '', ticker: 'TOKEN', name: 'Token',
-    protocol: 'Pump V1', isMigrated: false, supply: 1000000000, price: 0,
+    protocol: 'Pump V1', isMigrated: false, supply: 1000000000, price: 0, chain: 'sol',
   });
 
   print(`\n${colors.yellow}Connecting ${accounts.length} viewers (jittered)...${colors.reset}\n`);

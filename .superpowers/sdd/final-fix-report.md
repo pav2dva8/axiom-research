@@ -20,3 +20,25 @@ Date: 2026-07-11
 ## Commits
 
 - `42178ae fix(register): preserve write-failure progress`
+
+---
+
+# Whole-Branch Final Fix Report
+
+Date: 2026-07-12
+
+## What changed
+
+- Fixed token navigation planners so meme page updates use `pageUpdateMeme()` and include `subpage.pairAddress` plus `tokenAddress`.
+- Refreshed `FeedPool` through its TTL gate before each SessionActor warmup token pick.
+- Made `disconnectSlowly()` remove actor-backed viewers and emit `viewer-disconnected` even when `returnToWarmup()` throws.
+- Added regression coverage for all three review findings.
+
+## Test output
+
+- `npx tsx --test tests/token-navigation-plan.test.ts tests/session-actor.test.ts tests/viewer-service-warmup.test.ts`: PASS, 10 tests passed. Observed existing `punycode` deprecation warning.
+- `npm run build`: PASS.
+
+## Commits
+
+- `a423a0c fix: repair warmup navigation regressions`
